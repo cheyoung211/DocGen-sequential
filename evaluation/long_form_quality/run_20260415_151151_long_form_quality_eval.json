@@ -1,0 +1,492 @@
+[
+  {
+    "doc_dir": "outputs/batch_test/run_20260415_151151/long_context_planning/sample_003",
+    "core_metric_summary": {
+      "section_coherence_score": 0.4900751196298229,
+      "topic_consistency_score": 0.08647999749682525,
+      "length_adequacy_score": 0.29687685548034676,
+      "content_coverage_score": 1.0,
+      "required_section_coverage_score": null
+    },
+    "automatic_evaluation_methods": {
+      "section_coherence": {
+        "score": 0.4900751196298229,
+        "pairwise": [
+          {
+            "from": "intro",
+            "to": "background",
+            "similarity": 0.4711851207891439
+          },
+          {
+            "from": "background",
+            "to": "materials",
+            "similarity": 0.3292562650464335
+          },
+          {
+            "from": "materials",
+            "to": "process_overview",
+            "similarity": 0.7873760247612807
+          },
+          {
+            "from": "process_overview",
+            "to": "preparation",
+            "similarity": 0.229815277645473
+          },
+          {
+            "from": "preparation",
+            "to": "boning_techniques",
+            "similarity": 0.27284199383660684
+          },
+          {
+            "from": "boning_techniques",
+            "to": "fitting",
+            "similarity": 0.6891146253884226
+          },
+          {
+            "from": "fitting",
+            "to": "maintenance",
+            "similarity": 0.6509365299413999
+          }
+        ]
+      },
+      "global_fact_consistency": {
+        "score": null,
+        "message": "No global_facts in plan.",
+        "details": []
+      },
+      "content_coverage": {
+        "score": 1.0,
+        "covered_topics": 1,
+        "total_topics": 1,
+        "details": [
+          {
+            "topic": "usage",
+            "covered": true,
+            "matched_keywords": [
+              "use",
+              "usage",
+              "how to",
+              "technique"
+            ]
+          }
+        ]
+      },
+      "length_adequacy": {
+        "score": 0.29687685548034676,
+        "total_words": 8421,
+        "target_range": [
+          1200,
+          2500
+        ],
+        "within_target": false,
+        "words_per_section": {
+          "intro": 614,
+          "background": 1747,
+          "materials": 545,
+          "process_overview": 681,
+          "preparation": 1746,
+          "boning_techniques": 816,
+          "fitting": 1657,
+          "maintenance": 615
+        }
+      },
+      "required_section_coverage": {
+        "score": null,
+        "message": "No required sections provided.",
+        "required_sections": [],
+        "matched_sections": [],
+        "missing_sections": []
+      }
+    },
+    "factor": "long_context_planning",
+    "sample_id": "sample_003"
+  },
+  {
+    "doc_dir": "outputs/batch_test/run_20260415_151151/constraint_binding/sample_004",
+    "core_metric_summary": {
+      "section_coherence_score": 0.32903063635951035,
+      "topic_consistency_score": 0.08765400277173095,
+      "length_adequacy_score": 0.35250987027636776,
+      "content_coverage_score": 1.0,
+      "required_section_coverage_score": null
+    },
+    "automatic_evaluation_methods": {
+      "section_coherence": {
+        "score": 0.32903063635951035,
+        "pairwise": [
+          {
+            "from": "overview",
+            "to": "benefits",
+            "similarity": 0.35131323901181494
+          },
+          {
+            "from": "benefits",
+            "to": "techniques",
+            "similarity": 0.315788214411255
+          },
+          {
+            "from": "techniques",
+            "to": "comparison",
+            "similarity": 0.21500561607229846
+          },
+          {
+            "from": "comparison",
+            "to": "case_studies",
+            "similarity": 0.3617366473680053
+          },
+          {
+            "from": "case_studies",
+            "to": "summary",
+            "similarity": 0.4013094649341783
+          }
+        ]
+      },
+      "global_fact_consistency": {
+        "score": null,
+        "message": "No global_facts in plan.",
+        "details": []
+      },
+      "content_coverage": {
+        "score": 1.0,
+        "covered_topics": 1,
+        "total_topics": 1,
+        "details": [
+          {
+            "topic": "usage",
+            "covered": true,
+            "matched_keywords": [
+              "use",
+              "usage",
+              "how to",
+              "beginner",
+              "technique"
+            ]
+          }
+        ]
+      },
+      "length_adequacy": {
+        "score": 0.35250987027636776,
+        "total_words": 7092,
+        "target_range": [
+          1200,
+          2500
+        ],
+        "within_target": false,
+        "words_per_section": {
+          "overview": 1720,
+          "benefits": 1311,
+          "techniques": 122,
+          "comparison": 1810,
+          "case_studies": 463,
+          "summary": 1666
+        }
+      },
+      "required_section_coverage": {
+        "score": null,
+        "message": "No required sections provided.",
+        "required_sections": [],
+        "matched_sections": [],
+        "missing_sections": []
+      }
+    },
+    "factor": "constraint_binding",
+    "sample_id": "sample_004"
+  },
+  {
+    "doc_dir": "outputs/batch_test/run_20260415_151151/cross_section_dependency/sample_000",
+    "core_metric_summary": {
+      "section_coherence_score": 0.46472445795957446,
+      "topic_consistency_score": 0.07232218210743771,
+      "length_adequacy_score": 0.34573364679850643,
+      "content_coverage_score": 1.0,
+      "required_section_coverage_score": null
+    },
+    "automatic_evaluation_methods": {
+      "section_coherence": {
+        "score": 0.46472445795957446,
+        "pairwise": [
+          {
+            "from": "intro",
+            "to": "strategies_overview",
+            "similarity": 0.6037164823865332
+          },
+          {
+            "from": "strategies_overview",
+            "to": "physical_factors",
+            "similarity": 0.35320595131962895
+          },
+          {
+            "from": "physical_factors",
+            "to": "mental_factors",
+            "similarity": 0.844020794539364
+          },
+          {
+            "from": "mental_factors",
+            "to": "case_studies",
+            "similarity": 0.09340153522801403
+          },
+          {
+            "from": "case_studies",
+            "to": "training_approaches",
+            "similarity": 0.07675808469436977
+          },
+          {
+            "from": "training_approaches",
+            "to": "conclusion",
+            "similarity": 0.8172438995895368
+          }
+        ]
+      },
+      "global_fact_consistency": {
+        "score": null,
+        "message": "No global_facts in plan.",
+        "details": []
+      },
+      "content_coverage": {
+        "score": 1.0,
+        "covered_topics": 1,
+        "total_topics": 1,
+        "details": [
+          {
+            "topic": "usage",
+            "covered": true,
+            "matched_keywords": [
+              "use",
+              "play",
+              "beginner",
+              "technique"
+            ]
+          }
+        ]
+      },
+      "length_adequacy": {
+        "score": 0.34573364679850643,
+        "total_words": 7231,
+        "target_range": [
+          1200,
+          2500
+        ],
+        "within_target": false,
+        "words_per_section": {
+          "intro": 1671,
+          "strategies_overview": 1623,
+          "physical_factors": 545,
+          "mental_factors": 698,
+          "case_studies": 1557,
+          "training_approaches": 635,
+          "conclusion": 502
+        }
+      },
+      "required_section_coverage": {
+        "score": null,
+        "message": "No required sections provided.",
+        "required_sections": [],
+        "matched_sections": [],
+        "missing_sections": []
+      }
+    },
+    "factor": "cross_section_dependency",
+    "sample_id": "sample_000"
+  },
+  {
+    "doc_dir": "outputs/batch_test/run_20260415_151151/multimodal_grounding/sample_001",
+    "core_metric_summary": {
+      "section_coherence_score": 0.8402373392497372,
+      "topic_consistency_score": 0.03667817153324864,
+      "length_adequacy_score": 0.5118755118755118,
+      "content_coverage_score": 1.0,
+      "required_section_coverage_score": null
+    },
+    "automatic_evaluation_methods": {
+      "section_coherence": {
+        "score": 0.8402373392497372,
+        "pairwise": [
+          {
+            "from": "intro",
+            "to": "background",
+            "similarity": 0.5588446287413031
+          },
+          {
+            "from": "background",
+            "to": "materials",
+            "similarity": 0.8611251880104297
+          },
+          {
+            "from": "materials",
+            "to": "techniques",
+            "similarity": 0.9119756223190117
+          },
+          {
+            "from": "techniques",
+            "to": "tips_tricks",
+            "similarity": 0.9038765352843587
+          },
+          {
+            "from": "tips_tricks",
+            "to": "examples",
+            "similarity": 0.929997768420478
+          },
+          {
+            "from": "examples",
+            "to": "conclusion",
+            "similarity": 0.8756042927228416
+          }
+        ]
+      },
+      "global_fact_consistency": {
+        "score": null,
+        "message": "No global_facts in plan.",
+        "details": []
+      },
+      "content_coverage": {
+        "score": 1.0,
+        "covered_topics": 1,
+        "total_topics": 1,
+        "details": [
+          {
+            "topic": "usage",
+            "covered": true,
+            "matched_keywords": [
+              "use",
+              "how to",
+              "beginner",
+              "technique"
+            ]
+          }
+        ]
+      },
+      "length_adequacy": {
+        "score": 0.5118755118755118,
+        "total_words": 4884,
+        "target_range": [
+          1200,
+          2500
+        ],
+        "within_target": false,
+        "words_per_section": {
+          "intro": 1713,
+          "background": 417,
+          "materials": 529,
+          "techniques": 461,
+          "tips_tricks": 606,
+          "examples": 667,
+          "conclusion": 491
+        }
+      },
+      "required_section_coverage": {
+        "score": null,
+        "message": "No required sections provided.",
+        "required_sections": [],
+        "matched_sections": [],
+        "missing_sections": []
+      }
+    },
+    "factor": "multimodal_grounding",
+    "sample_id": "sample_001"
+  },
+  {
+    "doc_dir": "outputs/batch_test/run_20260415_151151/reference_consistency/sample_002",
+    "core_metric_summary": {
+      "section_coherence_score": 0.6817899188727684,
+      "topic_consistency_score": 0.1688435638376051,
+      "length_adequacy_score": 0.37610952309312473,
+      "content_coverage_score": 1.0,
+      "required_section_coverage_score": null
+    },
+    "automatic_evaluation_methods": {
+      "section_coherence": {
+        "score": 0.6817899188727684,
+        "pairwise": [
+          {
+            "from": "intro",
+            "to": "background",
+            "similarity": 0.22123742959954276
+          },
+          {
+            "from": "background",
+            "to": "loot_system",
+            "similarity": 0.8796002028197151
+          },
+          {
+            "from": "loot_system",
+            "to": "ninja_looting",
+            "similarity": 0.9011141069983863
+          },
+          {
+            "from": "ninja_looting",
+            "to": "implications",
+            "similarity": 0.841888669965584
+          },
+          {
+            "from": "implications",
+            "to": "case_study",
+            "similarity": 0.8691499513139472
+          },
+          {
+            "from": "case_study",
+            "to": "conclusion",
+            "similarity": 0.3777491525394353
+          }
+        ]
+      },
+      "global_fact_consistency": {
+        "score": null,
+        "message": "No global_facts in plan.",
+        "details": []
+      },
+      "content_coverage": {
+        "score": 1.0,
+        "covered_topics": 2,
+        "total_topics": 2,
+        "details": [
+          {
+            "topic": "structure",
+            "covered": true,
+            "matched_keywords": [
+              "structure",
+              "component",
+              "string"
+            ]
+          },
+          {
+            "topic": "usage",
+            "covered": true,
+            "matched_keywords": [
+              "use",
+              "how to",
+              "play",
+              "beginner"
+            ]
+          }
+        ]
+      },
+      "length_adequacy": {
+        "score": 0.37610952309312473,
+        "total_words": 6647,
+        "target_range": [
+          1200,
+          2500
+        ],
+        "within_target": false,
+        "words_per_section": {
+          "intro": 1700,
+          "background": 830,
+          "loot_system": 501,
+          "ninja_looting": 608,
+          "implications": 639,
+          "case_study": 702,
+          "conclusion": 1667
+        }
+      },
+      "required_section_coverage": {
+        "score": null,
+        "message": "No required sections provided.",
+        "required_sections": [],
+        "matched_sections": [],
+        "missing_sections": []
+      }
+    },
+    "factor": "reference_consistency",
+    "sample_id": "sample_002"
+  }
+]

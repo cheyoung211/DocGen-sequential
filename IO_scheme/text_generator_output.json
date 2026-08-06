@@ -1,0 +1,24 @@
+{
+  "request_id": "req_20260119_001",
+  "section_id": "results",
+  "content_blocks": [
+    {
+      "type": "paragraph",
+      "text": "We evaluated three preprocessing configurations—normal, underprocessed, and overprocessed—on internal IR benchmarks."
+    },
+    {
+      "type": "paragraph",
+      "text": "Normal preprocessing consistently achieved higher nDCG@50 and nDCG@100, indicating better ranking quality, while precision@50 occasionally favored overprocessed settings for smaller categories."
+    },
+    {
+      "type": "table_ref",
+      "table_id": "tab_metrics",
+      "ref_text": "Table~\\ref{tab:tab_metrics} summarizes the detailed metrics."
+    }
+  ],
+  "provenance": {
+    "retrieved_source_ids": ["exp_log_2024Q4"],
+    "comments": "Summarized from internal experiments."
+  },
+  "warnings": []
+}

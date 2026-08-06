@@ -1,0 +1,14 @@
+[
+  {
+    "file": "outputs/generations/req20260410_140116/main.tex",
+    "compile_success": false,
+    "error_count": 0,
+    "warning_count": 0,
+    "error_types": [],
+    "structure_ok": false,
+    "missing_files": [
+      "figures/animal_figure_1.png",
+      "figures/animal_figure_2.png"
+    ]
+  }
+]

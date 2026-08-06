@@ -1,0 +1,21 @@
+{
+  "request_id": "req_20260119_001",
+  "language": "en",
+  "doc_type": "report",
+  "audience": "internal",
+  "user_query": "Write an internal report comparing normal vs under/over preprocessing for IR metrics.",
+  "template": {
+    "name": "internal_report_v1",
+    "constraints": {
+      "max_pages": 6,
+      "two_column": false
+    }
+  },
+  "inputs": [
+    {
+      "type": "file",
+      "name": "metrics.csv",
+      "path": "data/metrics.csv"
+    }
+  ]
+}

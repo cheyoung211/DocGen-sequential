@@ -1,0 +1,81 @@
+# Configuration for the LaTeX-focused, evaluation-only benchmark dataset.
+#
+# This dataset is for test-time / inference-time evaluation of the document
+# generation system only. It is not used for model training, and no
+# train/validation/test splits are produced (see build_dataset.py).
+#
+# Run with:
+#   python -m src.dataset.build_dataset --config configs/dataset_v1.yaml --output-dir data --seed 42
+
+benchmark_version: v1
+target_total: 120
+seed: 42
+
+# When false (default), only the manual_seed adapter runs and the build is
+# fully offline and deterministic. When true, the openstax / nasa_metadata /
+# fred_metadata adapters are also queried (best-effort, gracefully skipped on
+# network or credential failure) to enrich the seed pool with real source
+# metadata before instruction generation. arxiv_metadata / sec_metadata /
+# world_bank_metadata are stubs regardless of this flag (see their modules).
+network_sources_enabled: false
+
+domains:
+  mathematics:
+    count: 30
+    enabled_sources:
+      - manual_seed
+      - openstax
+      - arxiv_metadata
+
+  statistics_ml:
+    count: 30
+    enabled_sources:
+      - manual_seed
+      - openstax
+      - arxiv_metadata
+
+  scientific_engineering:
+    count: 30
+    enabled_sources:
+      - manual_seed
+      - nasa_metadata
+      - arxiv_metadata
+
+  financial_economic:
+    count: 30
+    enabled_sources:
+      - manual_seed
+      - sec_metadata
+      - fred_metadata
+      - world_bank_metadata
+
+difficulty_distribution:
+  basic: 0.3333
+  intermediate: 0.3333
+  advanced: 0.3334
+
+quality_thresholds:
+  specificity: 0.8
+  evaluability: 0.85
+  latex_relevance: 0.8
+  long_form_suitability: 0.8
+  constraint_clarity: 0.85
+  source_safety: 1.0
+
+# Debug-only subset for smoke-testing consumers of the dataset. Never a
+# training split.
+dev_debug_size: 12
+
+# HTTP behavior for source_adapters/base.py when network_sources_enabled is true.
+http:
+  timeout_seconds: 15
+  max_retries: 4
+  backoff_seconds: 1.0
+  cache_dir: data/raw_sources
+  user_agent: "docgen-benchmark-builder/1.0 (+internal research use)"
+
+output:
+  benchmark_dirname: benchmark
+  seeds_dirname: normalized_seeds
+  metadata_dirname: metadata
+  raw_sources_dirname: raw_sources

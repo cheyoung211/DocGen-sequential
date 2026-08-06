@@ -1,0 +1,1127 @@
+[
+  {
+    "factor": null,
+    "sample_id": "sample_000",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_000",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_001",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_001",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_002",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_002",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_003",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_003",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_004",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_004",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_005",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_005",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_006",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_006",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_007",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_007",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_008",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_008",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_009",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_009",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_010",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_010",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_011",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_011",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_013",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_013",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_015",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_015",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_016",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_016",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_017",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_017",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_018",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_018",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_019",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_019",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": true,
+      "message": "Table-text alignment evaluated.",
+      "num_tables": 1,
+      "average_table_text_alignment_score": 0.6984807002942905,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test_07281829/basic/sample_019",
+          "table_id": "sec_7_table_1",
+          "table_path": "outputs/batch_test_07281829/basic/sample_019/sections/sec_7.tex",
+          "table_caption": "Comparison of common sales channels for selling a dress.",
+          "best_section": "sec_7",
+          "alignment_score": 0.6984807002942905
+        }
+      ]
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_020",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_020",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_021",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_021",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_022",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_022",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_023",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_023",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": true,
+      "message": "Table-text alignment evaluated.",
+      "num_tables": 1,
+      "average_table_text_alignment_score": 0.8532021038974718,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test_07281829/basic/sample_023",
+          "table_id": "sec_2_table_1",
+          "table_path": "outputs/batch_test_07281829/basic/sample_023/sections/sec_2.tex",
+          "table_caption": "Data summary",
+          "best_section": "sec_2",
+          "alignment_score": 0.8532021038974718
+        }
+      ]
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_024",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_024",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_025",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_025",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_026",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_026",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_027",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_027",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_028",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_028",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_029",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_029",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_030",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_030",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_031",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_031",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_032",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_032",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_033",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_033",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_034",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_034",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_035",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_035",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_036",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_036",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_037",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_037",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_038",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_038",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_039",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_039",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_040",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_040",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_041",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_041",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_042",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_042",
+    "figure_alignment": {
+      "figure_alignment_available": true,
+      "message": "Figure-caption alignment evaluated.",
+      "num_figures": 1,
+      "average_clip_score": 34.06916427612305,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test_07281829/basic/sample_042",
+          "figure_id": "fig:dynamic_vs_static_timing",
+          "image_path": "/data1/home/chelsy211/document_generation_api/outputs/batch_test_07281829/basic/sample_042/assets/fig_1.png",
+          "caption": "Dynamic stretching is best used before exercise, while static stretching is best used after exercise.",
+          "clip_score": 34.06916427612305
+        }
+      ]
+    },
+    "table_text_alignment": {
+      "table_alignment_available": true,
+      "message": "Table-text alignment evaluated.",
+      "num_tables": 1,
+      "average_table_text_alignment_score": 0.8377349407402472,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test_07281829/basic/sample_042",
+          "table_id": "sec_4_table_1",
+          "table_path": "outputs/batch_test_07281829/basic/sample_042/sections/sec_4.tex",
+          "table_caption": "Sample stretches for a beginner-friendly warm-up and cooldown routine.",
+          "best_section": "sec_4",
+          "alignment_score": 0.8377349407402472
+        }
+      ]
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_043",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_043",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_046",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_046",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_047",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_047",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_048",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_048",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_049",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_049",
+    "figure_alignment": {
+      "figure_alignment_available": true,
+      "message": "Figure-caption alignment evaluated.",
+      "num_figures": 1,
+      "average_clip_score": 28.258657455444336,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test_07281829/basic/sample_049",
+          "figure_id": "fig:moneygram_money_order_layout",
+          "image_path": "/data1/home/chelsy211/document_generation_api/outputs/batch_test_07281829/basic/sample_049/assets/fig_1.png",
+          "caption": "Annotated layout of a Moneygram money order showing the main fields to complete.",
+          "clip_score": 28.258657455444336
+        }
+      ]
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_050",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_050",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_051",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_051",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_052",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_052",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_054",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_054",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_055",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_055",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_056",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_056",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_057",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_057",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_058",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_058",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": true,
+      "message": "Table-text alignment evaluated.",
+      "num_tables": 1,
+      "average_table_text_alignment_score": 0.9317406608286418,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test_07281829/basic/sample_058",
+          "table_id": "sec_2_table_1",
+          "table_path": "outputs/batch_test_07281829/basic/sample_058/sections/sec_2.tex",
+          "table_caption": "Data summary",
+          "best_section": "sec_2",
+          "alignment_score": 0.9317406608286418
+        }
+      ]
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_059",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_059",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": true,
+      "message": "Table-text alignment evaluated.",
+      "num_tables": 1,
+      "average_table_text_alignment_score": 0.946111535714713,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test_07281829/basic/sample_059",
+          "table_id": "sec_6_table_1",
+          "table_path": "outputs/batch_test_07281829/basic/sample_059/sections/sec_6.tex",
+          "table_caption": "Data summary",
+          "best_section": "sec_6",
+          "alignment_score": 0.946111535714713
+        }
+      ]
+    }
+  },
+  {
+    "factor": null,
+    "sample_id": "sample_060",
+    "doc_dir": "outputs/batch_test_07281829/basic/sample_060",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  }
+]

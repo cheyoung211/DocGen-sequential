@@ -1,0 +1,156 @@
+[
+  {
+    "factor": "long_context_planning",
+    "sample_id": "sample_003",
+    "doc_dir": "outputs/batch_test/run_20260415_151151/long_context_planning/sample_003",
+    "figure_alignment": {
+      "figure_alignment_available": true,
+      "message": "Figure-caption alignment evaluated.",
+      "num_figures": 5,
+      "average_clip_score": 25.49718475341797,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test/run_20260415_151151/long_context_planning/sample_003",
+          "figure_id": "fig:fig_materials",
+          "image_path": "/data1/home/chelsy211/document_generation/outputs/batch_test/run_20260415_151151/long_context_planning/sample_003/figures/fig_materials.png",
+          "caption": "Illustrate the materials needed for boning a holster.",
+          "clip_score": 29.625194549560547
+        },
+        {
+          "doc_dir": "outputs/batch_test/run_20260415_151151/long_context_planning/sample_003",
+          "figure_id": "fig:fig_process_overview",
+          "image_path": "/data1/home/chelsy211/document_generation/outputs/batch_test/run_20260415_151151/long_context_planning/sample_003/figures/fig_process_overview.png",
+          "caption": "Outline the general steps involved in boning a holster.",
+          "clip_score": 26.024017333984375
+        },
+        {
+          "doc_dir": "outputs/batch_test/run_20260415_151151/long_context_planning/sample_003",
+          "figure_id": "fig:fig_preparation",
+          "image_path": "/data1/home/chelsy211/document_generation/outputs/batch_test/run_20260415_151151/long_context_planning/sample_003/figures/fig_preparation.png",
+          "caption": "Show the preparation steps for boning a holster.",
+          "clip_score": 25.962295532226562
+        },
+        {
+          "doc_dir": "outputs/batch_test/run_20260415_151151/long_context_planning/sample_003",
+          "figure_id": "fig:fig_boning_techniques",
+          "image_path": "/data1/home/chelsy211/document_generation/outputs/batch_test/run_20260415_151151/long_context_planning/sample_003/figures/fig_boning_techniques.png",
+          "caption": "Demonstrate different boning techniques.",
+          "clip_score": 20.123291015625
+        },
+        {
+          "doc_dir": "outputs/batch_test/run_20260415_151151/long_context_planning/sample_003",
+          "figure_id": "fig:fig_fitting",
+          "image_path": "/data1/home/chelsy211/document_generation/outputs/batch_test/run_20260415_151151/long_context_planning/sample_003/figures/fig_fitting.png",
+          "caption": "Illustrate the fitting process for the boned holster.",
+          "clip_score": 25.75112533569336
+        }
+      ]
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": "constraint_binding",
+    "sample_id": "sample_004",
+    "doc_dir": "outputs/batch_test/run_20260415_151151/constraint_binding/sample_004",
+    "figure_alignment": {
+      "figure_alignment_available": true,
+      "message": "Figure-caption alignment evaluated.",
+      "num_figures": 1,
+      "average_clip_score": 22.246814727783203,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test/run_20260415_151151/constraint_binding/sample_004",
+          "figure_id": "fig:hair_dusting_technique",
+          "image_path": "/data1/home/chelsy211/document_generation/outputs/batch_test/run_20260415_151151/constraint_binding/sample_004/figures/hair_dusting_technique.png",
+          "caption": "Illustration of the dusting technique, providing clear visual guidance on how to perform this method effectively.",
+          "clip_score": 22.246814727783203
+        }
+      ]
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": "cross_section_dependency",
+    "sample_id": "sample_000",
+    "doc_dir": "outputs/batch_test/run_20260415_151151/cross_section_dependency/sample_000",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": "multimodal_grounding",
+    "sample_id": "sample_001",
+    "doc_dir": "outputs/batch_test/run_20260415_151151/multimodal_grounding/sample_001",
+    "figure_alignment": {
+      "figure_alignment_available": true,
+      "message": "Figure-caption alignment evaluated.",
+      "num_figures": 2,
+      "average_clip_score": 27.205689430236816,
+      "results": [
+        {
+          "doc_dir": "outputs/batch_test/run_20260415_151151/multimodal_grounding/sample_001",
+          "figure_id": "fig:fig_technique_steps",
+          "image_path": "/data1/home/chelsy211/document_generation/outputs/batch_test/run_20260415_151151/multimodal_grounding/sample_001/figures/fig_technique_steps.png",
+          "caption": "Illustrate the process of laddering jeans.",
+          "clip_score": 24.883895874023438
+        },
+        {
+          "doc_dir": "outputs/batch_test/run_20260415_151151/multimodal_grounding/sample_001",
+          "figure_id": "fig:fig_examples",
+          "image_path": "/data1/home/chelsy211/document_generation/outputs/batch_test/run_20260415_151151/multimodal_grounding/sample_001/figures/fig_examples.png",
+          "caption": "Display various styles of laddered jeans.",
+          "clip_score": 29.527482986450195
+        }
+      ]
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  },
+  {
+    "factor": "reference_consistency",
+    "sample_id": "sample_002",
+    "doc_dir": "outputs/batch_test/run_20260415_151151/reference_consistency/sample_002",
+    "figure_alignment": {
+      "figure_alignment_available": false,
+      "message": "No figures found in this document.",
+      "num_figures": 0,
+      "average_clip_score": null,
+      "results": []
+    },
+    "table_text_alignment": {
+      "table_alignment_available": false,
+      "message": "No tables found in this document.",
+      "num_tables": 0,
+      "average_table_text_alignment_score": null,
+      "results": []
+    }
+  }
+]

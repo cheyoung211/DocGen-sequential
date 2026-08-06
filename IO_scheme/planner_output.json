@@ -1,0 +1,37 @@
+{
+  "request_id": "req_20260119_001",
+  "doc_outline": [
+    {
+      "section_id": "intro",
+      "title": "Introduction",
+      "needs_text": true,
+      "needs_retrieval": false,
+      "needs_tables": false,
+      "needs_figures": false,
+      "style": { "tone": "formal", "length": "short" }
+    },
+    {
+      "section_id": "results",
+      "title": "Results",
+      "needs_text": true,
+      "needs_retrieval": true,
+      "needs_tables": true,
+      "needs_figures": false,
+      "table_specs": [
+        {
+          "table_id": "tab_metrics",
+          "goal": "Summarize ranking and precision metrics across preprocessing settings.",
+          "source": "inputs",
+          "group_by": ["processing", "dataset"],
+          "metrics": ["precision@50","precision@100","nDCG@50","nDCG@100","pairwise_F1@50","pairwise_F1@100"],
+          "highlight": { "mode": "max_per_metric_within_dataset" }
+        }
+      ]
+    }
+  ],
+  "global_requirements": {
+    "citation_style": "numeric",
+    "latex_packages": ["booktabs", "siunitx"],
+    "figure_format": "png"
+  }
+}

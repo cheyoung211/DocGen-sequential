@@ -1,0 +1,13 @@
+{
+  "request_id": "req_20260119_001",
+  "figure_spec": {
+    "figure_id": "fig_pipeline",
+    "goal": "Overview diagram of the multi-agent LaTeX document generation system.",
+    "style": "minimal, black and white, no text",
+    "preferred_format": "png"
+  },
+  "context": {
+    "section_id": "method",
+    "section_summary": "The system consists of planner, text generator, table generator, image generator, and LaTeX integrator agents."
+  }
+}

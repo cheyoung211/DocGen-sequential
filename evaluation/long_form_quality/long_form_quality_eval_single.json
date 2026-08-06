@@ -1,0 +1,57 @@
+{
+  "doc_dir": "outputs/outputs_single_llm/run_20260325_132956/constraint_binding/sample_001",
+  "core_metric_summary": {
+    "section_coherence_score": 0.21484284463164313,
+    "length_adequacy_score": 0.21,
+    "content_coverage_score": null
+  },
+  "details": {
+    "section_coherence": {
+      "score": 0.21484284463164313,
+      "pairwise": [
+        {
+          "from": "Introduction/Preamble",
+          "to": "Overview",
+          "similarity": 0.0
+        },
+        {
+          "from": "Overview",
+          "to": "Steps to Dust Your Hair",
+          "similarity": 0.5505470553429698
+        },
+        {
+          "from": "Steps to Dust Your Hair",
+          "to": "Tools Needed",
+          "similarity": 0.4366283398373971
+        },
+        {
+          "from": "Tools Needed",
+          "to": "Figure Placeholder",
+          "similarity": 0.08703882797784891
+        },
+        {
+          "from": "Figure Placeholder",
+          "to": "Summary",
+          "similarity": 0.0
+        }
+      ]
+    },
+    "content_coverage": {
+      "score": null,
+      "details": []
+    },
+    "length_adequacy": {
+      "score": 0.21,
+      "total_words": 252,
+      "within_target": false
+    },
+    "detected_sections": [
+      "Introduction/Preamble",
+      "Overview",
+      "Steps to Dust Your Hair",
+      "Tools Needed",
+      "Figure Placeholder",
+      "Summary"
+    ]
+  }
+}

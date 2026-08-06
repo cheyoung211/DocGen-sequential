@@ -1,0 +1,73 @@
+[
+  {
+    "file": "outputs/batch_test/run_20260415_151151/long_context_planning/sample_003/main.tex",
+    "compile_success": false,
+    "error_count": 0,
+    "warning_count": 0,
+    "error_types": [],
+    "structure_ok": false,
+    "missing_files": [
+      "figures/fig_materials.png",
+      "figures/fig_process_overview.png",
+      "figures/fig_preparation.png",
+      "figures/fig_boning_techniques.png",
+      "figures/fig_fitting.png"
+    ],
+    "factor": "long_context_planning",
+    "sample_id": "sample_003",
+    "rel_path": "long_context_planning/sample_003/main.tex"
+  },
+  {
+    "file": "outputs/batch_test/run_20260415_151151/constraint_binding/sample_004/main.tex",
+    "compile_success": false,
+    "error_count": 0,
+    "warning_count": 0,
+    "error_types": [],
+    "structure_ok": false,
+    "missing_files": [
+      "figures/hair_dusting_technique.png"
+    ],
+    "factor": "constraint_binding",
+    "sample_id": "sample_004",
+    "rel_path": "constraint_binding/sample_004/main.tex"
+  },
+  {
+    "file": "outputs/batch_test/run_20260415_151151/cross_section_dependency/sample_000/main.tex",
+    "compile_success": false,
+    "error_count": 0,
+    "warning_count": 0,
+    "error_types": [],
+    "structure_ok": true,
+    "missing_files": [],
+    "factor": "cross_section_dependency",
+    "sample_id": "sample_000",
+    "rel_path": "cross_section_dependency/sample_000/main.tex"
+  },
+  {
+    "file": "outputs/batch_test/run_20260415_151151/multimodal_grounding/sample_001/main.tex",
+    "compile_success": false,
+    "error_count": 0,
+    "warning_count": 0,
+    "error_types": [],
+    "structure_ok": false,
+    "missing_files": [
+      "figures/fig_technique_steps.png",
+      "figures/fig_examples.png"
+    ],
+    "factor": "multimodal_grounding",
+    "sample_id": "sample_001",
+    "rel_path": "multimodal_grounding/sample_001/main.tex"
+  },
+  {
+    "file": "outputs/batch_test/run_20260415_151151/reference_consistency/sample_002/main.tex",
+    "compile_success": false,
+    "error_count": 0,
+    "warning_count": 0,
+    "error_types": [],
+    "structure_ok": true,
+    "missing_files": [],
+    "factor": "reference_consistency",
+    "sample_id": "sample_002",
+    "rel_path": "reference_consistency/sample_002/main.tex"
+  }
+]

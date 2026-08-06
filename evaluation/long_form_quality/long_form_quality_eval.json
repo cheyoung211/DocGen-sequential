@@ -1,0 +1,65 @@
+{
+  "doc_dir": "outputs/generations/req20260410_140116",
+  "core_metric_summary": {
+    "section_coherence_score": 0.7197187849527019,
+    "topic_consistency_score": 0.2792121218120276,
+    "length_adequacy_score": 0.753465943339361,
+    "content_coverage_score": null,
+    "required_section_coverage_score": null
+  },
+  "automatic_evaluation_methods": {
+    "section_coherence": {
+      "score": 0.7197187849527019,
+      "pairwise": [
+        {
+          "from": "introduction",
+          "to": "representative_animals",
+          "similarity": 0.8891214467888889
+        },
+        {
+          "from": "representative_animals",
+          "to": "conservation_status",
+          "similarity": 0.6245459127467525
+        },
+        {
+          "from": "conservation_status",
+          "to": "conclusion",
+          "similarity": 0.6454889953224643
+        }
+      ]
+    },
+    "global_fact_consistency": {
+      "score": null,
+      "message": "No global_facts in plan.",
+      "details": []
+    },
+    "content_coverage": {
+      "score": null,
+      "covered_topics": 0,
+      "total_topics": 0,
+      "details": []
+    },
+    "length_adequacy": {
+      "score": 0.753465943339361,
+      "total_words": 3318,
+      "target_range": [
+        1200,
+        2500
+      ],
+      "within_target": false,
+      "words_per_section": {
+        "introduction": 522,
+        "representative_animals": 455,
+        "conservation_status": 1786,
+        "conclusion": 555
+      }
+    },
+    "required_section_coverage": {
+      "score": null,
+      "message": "No required sections provided.",
+      "required_sections": [],
+      "matched_sections": [],
+      "missing_sections": []
+    }
+  }
+}

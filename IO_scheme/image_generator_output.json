@@ -1,0 +1,12 @@
+{
+  "request_id": "req_20260119_001",
+  "figure_id": "fig_pipeline",
+  "image_path": "figures/fig_pipeline.png",
+  "latex_label": "fig:fig_pipeline",
+  "caption": "Overview of the multi-agent system for LaTeX document generation.",
+  "meta": {
+    "placement": "t",
+    "width_fraction": 0.9
+  },
+  "warnings": []
+}

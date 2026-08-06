@@ -1,0 +1,14 @@
+{
+  "project_dir": "outputs/req_20260119_001/",
+  "main_tex": "outputs/req_20260119_001/main.tex",
+  "artifacts": {
+    "sections": ["sections/intro.tex", "sections/results.tex"],
+    "tables": ["tables/tab_metrics.tex"],
+    "figures": ["figures/fig_pipeline.png"]
+  },
+  "compile": {
+    "attempted": true,
+    "success": true,
+    "log_path": "outputs/req_20260119_001/compile.log"
+  }
+}

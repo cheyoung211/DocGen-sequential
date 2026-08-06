@@ -1,0 +1,12 @@
+{
+  "request_id": "req_20260119_001",
+  "table_id": "tab_metrics",
+  "latex_label": "tab:tab_metrics",
+  "caption": "Retrieval metrics across different preprocessing settings.",
+  "latex_code": "\\begin{table}[t]\n\\centering\n\\small\n\\begin{tabular}{lcccccc}\n\\toprule\nProcessing & p@50 & p@100 & nDCG@50 & nDCG@100 & F1@50 & F1@100 \\\\\n\\midrule\nNormal & \\textbf{0.20} & 0.18 & \\textbf{0.25} & \\textbf{0.27} & \\textbf{0.41} & \\textbf{0.43} \\\\\nUnder & 0.18 & 0.17 & 0.22 & 0.24 & 0.39 & 0.40 \\\\\nOver & 0.19 & \\textbf{0.19} & 0.23 & 0.25 & 0.40 & 0.41 \\\\\n\\bottomrule\n\\end{tabular}\n\\caption{Retrieval metrics across different preprocessing settings.}\n\\label{tab:tab_metrics}\n\\end{table}",
+  "provenance": {
+    "input_files": ["data/metrics.csv"],
+    "highlight_rule": "max_per_metric_within_dataset"
+  },
+  "warnings": []
+}
