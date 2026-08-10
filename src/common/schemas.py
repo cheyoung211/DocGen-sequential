@@ -237,7 +237,6 @@ class ContentBlock(BaseModel):
     title: Optional[str] = None
     content: str = Field(..., alias="text")
     asset_id: Optional[str] = None
-    label: Optional[str] = None
     caption: Optional[str] = None
     assets: List[str] = Field(default_factory=list, description="Related LaTeX asset IDs")
     metadata: Dict[str, Any] = Field(default_factory=dict)

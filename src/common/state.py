@@ -93,15 +93,23 @@ class LatexComponent(str, Enum):
     TABULARX = "tabularx"
     LONGTABLE = "longtable"
     MINIPAGE = "minipage"
-    WRAPFIGURE = "wrapfigure"
     FIGURE_FLOAT = "figure"
 
 
 class FigureLayout(str, Enum):
-    """Permitted layouts for a single registered figure."""
+    """Permitted layouts for a single registered figure.
+
+    ``wrapfigure`` (text wrapped around the figure) used to be a third
+    option here, but wrapfig only lays out correctly when there's enough
+    surrounding paragraph text to wrap around the figure's full height --
+    nothing in the pipeline checks that before committing to the layout, so
+    a short trailing paragraph next to a large figure silently overflows
+    past the paragraph and collides with whatever comes next. Disabled
+    outright rather than patched, since detecting "enough trailing text"
+    reliably needs more than a blueprint-time heuristic.
+    """
 
     FLOAT = "figure"
-    WRAP = "wrapfigure"
     MINIPAGE = "minipage"
 
 
@@ -126,7 +134,6 @@ class LayoutBlock(BaseModel):
     id: str
     kind: LayoutBlockKind
     component: LatexComponent = LatexComponent.PLAIN
-    node_id: Optional[str] = None
     title: Optional[str] = None
     instructions: str = ""
     asset_id: Optional[str] = None
@@ -190,6 +197,54 @@ class FigureRegistryEntry(BaseModel):
     last_updated: datetime = Field(default_factory=datetime.now)
 
 
+# Only kinds that render as a genuinely numbered LaTeX object (a
+# ``\newtheorem``-backed environment or counter, a numbered ``equation``, a
+# captioned ``table``) get a default label. ``\ref``/``\Cref`` to an
+# unnumbered tcolorbox callout (key_takeaway/warning/case_study/comparison)
+# would just silently print whatever the nearest *other* counter happens to
+# be -- wrong output, not merely a missing label -- so those are left out
+# rather than given a label that would render incorrectly.
+_LABEL_PREFIX_BY_KIND: Dict[LayoutBlockKind, str] = {
+    LayoutBlockKind.THEOREM: "thm",
+    LayoutBlockKind.DEFINITION: "def",
+    LayoutBlockKind.EQUATION: "eq",
+    LayoutBlockKind.TABLE: "tab",
+    LayoutBlockKind.NOTATION_TABLE: "tab",
+}
+
+
+def default_block_label(kind: LayoutBlockKind, block_id: str) -> Optional[str]:
+    """The deterministic label a block gets if it doesn't supply its own.
+
+    ``block_id`` is already guaranteed unique (``PlannerAgent._validate_blueprint``
+    rejects duplicate block IDs), so ``{prefix}:{block_id}`` is a label that's
+    knowable the moment the blueprint exists -- before any section is drafted.
+    """
+    prefix = _LABEL_PREFIX_BY_KIND.get(kind)
+    return f"{prefix}:{block_id}" if prefix else None
+
+
+class LabelRegistryEntry(BaseModel):
+    """One citable label and what it refers to.
+
+    Built once, eagerly, in ``DocumentGraph.set_blueprint`` -- every id it's
+    derived from (section_id, block_id, figure_id) is already fixed by the
+    blueprint, so the full set of valid labels is knowable before any section
+    is drafted. Later sections are handed this registry (see
+    ``TextAgent._build_prompt_from_node``) so a cross-reference cites
+    something that actually exists, instead of guessing at a label name a
+    different section's independent model call happened to pick -- the
+    `thm:taylor_convergence` incident this was added for was exactly that: a
+    label no section ever actually defined.
+    """
+
+    label: str
+    kind: str  # "section", a LayoutBlockKind value, or "figure"
+    section_id: str
+    block_id: Optional[str] = None
+    description: str
+
+
 class DocumentNode(BaseModel):
     """An individual semantic content node in a document graph."""
 
@@ -220,6 +275,7 @@ class DocumentGraph(BaseModel):
     references: Dict[str, List[str]] = Field(default_factory=dict)
     blueprint: Optional[DocumentBlueprint] = None
     figure_registry: Dict[str, FigureRegistryEntry] = Field(default_factory=dict)
+    label_registry: Dict[str, LabelRegistryEntry] = Field(default_factory=dict)
 
     def add_node(self, node: DocumentNode) -> None:
         self.nodes[node.id] = node
@@ -259,7 +315,8 @@ class DocumentGraph(BaseModel):
         node.last_updated = datetime.now()
 
     def set_blueprint(self, blueprint: DocumentBlueprint) -> None:
-        """Attach a layout plan and reserve each figure's single render slot."""
+        """Attach a layout plan, reserve each figure's single render slot, and
+        (re)build the label registry from it."""
         self.blueprint = blueprint
         for figure_id, placement in blueprint.figure_slots.items():
             entry = self.figure_registry.get(figure_id)
@@ -282,6 +339,41 @@ class DocumentGraph(BaseModel):
             entry.caption = placement.caption or entry.caption
             entry.required = placement.required
             entry.last_updated = datetime.now()
+
+        # Entirely derived from the blueprint (section/block/figure ids never
+        # change after planning), so a full rebuild on every call is correct
+        # -- unlike figure_registry above, there's no accumulated rendering
+        # state (placement_count, asset_path, ...) to preserve across a
+        # re-compose.
+        self.label_registry = {}
+        for section in blueprint.sections:
+            section_label = f"sec:{section.section_id}"
+            self.label_registry[section_label] = LabelRegistryEntry(
+                label=section_label,
+                kind="section",
+                section_id=section.section_id,
+                description=section.title,
+            )
+            for block in section.blocks:
+                label = default_block_label(block.kind, block.id)
+                if label is None:
+                    continue
+                self.label_registry[label] = LabelRegistryEntry(
+                    label=label,
+                    kind=block.kind.value,
+                    section_id=section.section_id,
+                    block_id=block.id,
+                    description=block.title or block.instructions[:80],
+                )
+        for figure_id, placement in blueprint.figure_slots.items():
+            label = placement.label or f"fig:{figure_id}"
+            self.label_registry[label] = LabelRegistryEntry(
+                label=label,
+                kind="figure",
+                section_id=placement.owner_section,
+                block_id=figure_id,
+                description=placement.caption or figure_id,
+            )
 
     def register_figure_asset(
         self,

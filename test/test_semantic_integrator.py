@@ -124,7 +124,12 @@ class SemanticIntegratorTest(unittest.TestCase):
                 self.assertGreaterEqual(rendered.count(r"\begin{tcolorbox}"), 4)
                 self.assertIn(r"\begin{minipage}", rendered)
                 self.assertIn(r"\begin{tabularx}", rendered)
-                self.assertIn(r"\[", rendered)
+                # Bare-formula EQUATION blocks render as a numbered, labeled
+                # `equation` environment (not the older unnumbered `\[...\]`)
+                # so "Eq. (N)"-style cross-references have something real to
+                # point at.
+                self.assertIn(r"\begin{equation}", rendered)
+                self.assertIn(r"\label{eq:equation}", rendered)
                 self.assertEqual(rendered.count(r"\includegraphics"), 1)
                 self.assertIn(r"\usepackage{tcolorbox}", preamble)
                 self.assertIn(r"\usepackage{tabularx}", preamble)

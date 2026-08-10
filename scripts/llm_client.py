@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
+from typing import Optional, Type
 
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 # Load OPENAI_API_KEY / GEMINI_API_KEY from a .env file in the working
 # directory (or any parent), if present. override=True so a stale key left
@@ -30,6 +31,29 @@ def _infer_provider(model_name: str) -> str:
     if lowered.startswith("gemini"):
         return "gemini"
     return "openai"
+
+
+def _pydantic_schema_for_gemini(response_model: Type[BaseModel]) -> dict:
+    """Convert a pydantic model's JSON schema into Gemini's accepted subset.
+
+    Gemini's ``response_schema`` rejects any dict containing an
+    ``additionalProperties`` key outright (400 "Unknown name
+    'additional_properties'") -- passing the pydantic *class* straight to the
+    SDK triggers this, because its own model-to-schema conversion carries
+    that key through from any model using ``ConfigDict(extra="forbid")``.
+    Gemini's schema is closed-by-default (no arbitrary extra keys) without
+    the flag, so it's safe to just strip it recursively rather than maintain
+    a second, Gemini-specific set of models.
+    """
+
+    def _strip(node):
+        if isinstance(node, dict):
+            return {k: _strip(v) for k, v in node.items() if k != "additionalProperties"}
+        if isinstance(node, list):
+            return [_strip(v) for v in node]
+        return node
+
+    return _strip(response_model.model_json_schema())
 
 
 def _repair_bare_latex_backslashes(text: str) -> str:
@@ -95,7 +119,10 @@ class LLMClient:
         model_name: str = DEFAULT_MODEL,
         *,
         api_key: Optional[str] = None,
-        timeout: float = 90.0,
+        # Reasoning-family models (gpt-5, o-series, ...) routinely take over
+        # a minute per call -- a 300s ceiling gives them room without
+        # papering over a genuinely stuck request forever.
+        timeout: float = 300.0,
         max_retries: int = 2,
         max_new_tokens: int = 4096,
     ) -> None:
@@ -159,34 +186,138 @@ class LLMClient:
             return self._generate_gemini(system_prompt, user_prompt, temperature, top_p, target_max_tokens)
         return self._generate_openai(system_prompt, user_prompt, temperature, top_p, target_max_tokens)
 
-    def _generate_openai(
-        self, system_prompt: str, user_prompt: str, temperature: float, top_p: float, target_max_tokens: int
-    ) -> str:
-        from openai import APIConnectionError, APIStatusError, APITimeoutError
+    def supports_structured_output(self) -> bool:
+        """Whether ``generate_structured`` has a native implementation for this provider.
 
-        request_kwargs = {
+        Only OpenAI and Gemini have one today. Any other provider (a local/
+        OpenAI-compatible endpoint such as Qwen behind vLLM, for example)
+        isn't guaranteed to honor a strict JSON schema the same way, so
+        callers should fall back to prompt-only ``generate`` instead of
+        assuming this works everywhere.
+        """
+        return self.provider in ("openai", "gemini")
+
+    def generate_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        *,
+        schema_name: str,
+        temperature: float = 0.3,
+        top_p: float = 0.9,
+        max_new_tokens: Optional[int] = None,
+    ) -> str:
+        """Generate text that is guaranteed (by the provider) to validate against ``response_model``.
+
+        Returns the raw JSON text -- callers still parse/validate it
+        themselves, same as ``generate`` + ``extract_json_block``. Only
+        implemented for providers where the API itself enforces the schema
+        (see ``supports_structured_output``); call ``generate`` instead for
+        anything else.
+        """
+        if not self.supports_structured_output():
+            raise NotImplementedError(
+                f"generate_structured() has no implementation for provider '{self.provider}'; "
+                "use generate() and validate the parsed JSON yourself."
+            )
+
+        target_max_tokens = max_new_tokens or self.max_new_tokens
+        if target_max_tokens <= 0:
+            raise ValueError("max_new_tokens must be greater than zero.")
+
+        if self.provider == "gemini":
+            return self._generate_gemini_structured(
+                system_prompt, user_prompt, response_model, temperature, top_p, target_max_tokens
+            )
+        return self._generate_openai_structured(
+            system_prompt, user_prompt, response_model, schema_name, temperature, top_p, target_max_tokens
+        )
+
+    def _generate_openai_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        schema_name: str,
+        temperature: float,
+        top_p: float,
+        target_max_tokens: int,
+    ) -> str:
+        response = self._create_openai_response({
             "model": self.model_name,
             "instructions": system_prompt,
             "input": user_prompt,
             "temperature": temperature,
             "top_p": top_p,
             "max_output_tokens": target_max_tokens,
-            # Do not retain generated documents as server-side API state.
             "store": False,
-        }
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "schema": response_model.model_json_schema(),
+                    "strict": True,
+                }
+            },
+        })
+        return self._text_from_openai_response(response)
 
-        # Reasoning-family models (o-series, gpt-5, ...) reject sampling
-        # parameters like temperature/top_p outright with a 400 rather than
-        # silently ignoring them, and which parameters are rejected varies by
-        # model and changes over time. Hardcoding a model-name allowlist would
-        # go stale, so instead: drop whichever parameter the API says it
-        # doesn't support and retry, until the call succeeds or a rejection
-        # can't be resolved by dropping a parameter.
+    def _generate_gemini_structured(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        temperature: float,
+        top_p: float,
+        target_max_tokens: int,
+    ) -> str:
+        from google.genai import types
+        from google.genai.errors import APIError
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_output_tokens=target_max_tokens,
+                    response_mime_type="application/json",
+                    response_schema=_pydantic_schema_for_gemini(response_model),
+                ),
+            )
+            if response.candidates and response.candidates[0].finish_reason == "MAX_TOKENS":
+                raise RuntimeError(
+                    "Gemini response was truncated by max_output_tokens; increase the token budget."
+                )
+        except APIError as exc:
+            raise RuntimeError(f"Gemini API returned an error: {exc}") from exc
+
+        text = (response.text or "").strip()
+        if not text:
+            raise RuntimeError("Gemini returned no text output for this request.")
+        return text
+
+    def _create_openai_response(self, request_kwargs: dict):
+        """Call ``responses.create``, dropping any parameter the API rejects.
+
+        Reasoning-family models (o-series, gpt-5, ...) reject sampling
+        parameters like temperature/top_p outright with a 400 rather than
+        silently ignoring them, and which parameters are rejected varies by
+        model and changes over time. Hardcoding a model-name allowlist would
+        go stale, so instead: drop whichever parameter the API says it
+        doesn't support and retry, until the call succeeds or a rejection
+        can't be resolved by dropping a parameter.
+        """
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+
         droppable_params = {"temperature", "top_p"}
-        response = None
-        while response is None:
+        request_kwargs = dict(request_kwargs)
+        while True:
             try:
-                response = self.client.responses.create(**request_kwargs)
+                return self.client.responses.create(**request_kwargs)
             except APIStatusError as exc:
                 rejected_param = None
                 if exc.status_code == 400 and isinstance(exc.body, dict):
@@ -204,15 +335,31 @@ class LLMClient:
             except APIConnectionError as exc:
                 raise RuntimeError("Could not connect to the OpenAI API.") from exc
 
+    @staticmethod
+    def _text_from_openai_response(response) -> str:
         if response.status == "incomplete" and response.incomplete_details.reason == "max_output_tokens":
             raise RuntimeError(
                 "OpenAI response was truncated by max_output_tokens; increase the token budget."
             )
-
         text = response.output_text.strip()
         if not text:
             raise RuntimeError("OpenAI returned no text output for this request.")
         return text
+
+    def _generate_openai(
+        self, system_prompt: str, user_prompt: str, temperature: float, top_p: float, target_max_tokens: int
+    ) -> str:
+        response = self._create_openai_response({
+            "model": self.model_name,
+            "instructions": system_prompt,
+            "input": user_prompt,
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_output_tokens": target_max_tokens,
+            # Do not retain generated documents as server-side API state.
+            "store": False,
+        })
+        return self._text_from_openai_response(response)
 
     def _generate_gemini(
         self, system_prompt: str, user_prompt: str, temperature: float, top_p: float, target_max_tokens: int

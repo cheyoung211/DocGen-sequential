@@ -22,6 +22,7 @@ from src.common.state import (
     LayoutBlock,
     LayoutBlockKind,
     SectionLayout,
+    default_block_label,
 )
 
 
@@ -32,7 +33,6 @@ SAFE_PACKAGES = {
     "tabularx",
     "longtable",
     "tcolorbox",
-    "wrapfig",
     "caption",
     "hyperref",
     "cleveref",
@@ -58,7 +58,6 @@ PACKAGE_ORDER = (
     "tabularx",
     "longtable",
     "tcolorbox",
-    "wrapfig",
     "caption",
     "enumitem",
     "siunitx",
@@ -147,6 +146,77 @@ ALLOWED_ENVIRONMENTS = {
     },
 }
 ENVIRONMENT_TOKEN = re.compile(r"\\(?P<action>begin|end)\s*\{(?P<name>[A-Za-z*]+)\}")
+
+
+def validate_fragment_environments(block_type: SemanticBlockType, content: str, block_id: Optional[str]) -> str:
+    """Reject a LaTeX command/environment a block's ``type`` isn't allowed to use.
+
+    Pulled out of ``LatexIntegratorAgent._validate_fragment`` so TextAgent can
+    run the exact same check right after generating a block -- instead of
+    only discovering the violation here, in the composer, after the content
+    is already persisted and the per-node retry loop has moved on. Only the
+    part of ``_validate_fragment`` that doesn't need the composer's
+    document-wide label registry lives here; label-uniqueness checking stays
+    on the instance method.
+
+    Returns the normalized (``\\r\\n`` -> ``\\n``) content so callers that
+    still need to scan it (for labels, say) don't have to normalize twice.
+    """
+    normalized = content.replace("\r\n", "\n")
+    if "\x00" in normalized:
+        raise ValueError(f"Block '{block_id}' contains a null byte.")
+    if FORBIDDEN_LATEX_COMMANDS.search(normalized):
+        raise ValueError(
+            f"Block '{block_id}' contains a document-level or unsafe LaTeX command."
+        )
+
+    allowed = ALLOWED_ENVIRONMENTS.get(block_type, set())
+    stack: List[str] = []
+    for token in ENVIRONMENT_TOKEN.finditer(normalized):
+        name = token.group("name")
+        if name in FORBIDDEN_LAYOUT_ENVIRONMENTS or name not in allowed:
+            raise ValueError(
+                f"Block '{block_id}' may not use LaTeX environment '{name}'."
+            )
+        if token.group("action") == "begin":
+            stack.append(name)
+        elif not stack or stack.pop() != name:
+            raise ValueError(
+                f"Block '{block_id}' has an unbalanced LaTeX environment '{name}'."
+            )
+    if stack:
+        raise ValueError(
+            f"Block '{block_id}' has unclosed LaTeX environment(s): {', '.join(stack)}."
+        )
+    return normalized
+
+
+_TITLE_UNSAFE_CHAR = re.compile(r"\\")
+
+
+def validate_plain_title(title: Optional[str], source: str) -> None:
+    """Reject a backslash (a LaTeX command) in a title-like field.
+
+    Titles (document/section/block titles, table & figure captions) are
+    rendered through ``LatexIntegratorAgent._escape_latex`` -- a blunt,
+    command-blind escaper that assumes the string is plain text and turns
+    every backslash into a literal, visible "\\textbackslash{}". A title
+    that legitimately needs math notation (``\\pi``, ``\\theta``, ...) has no
+    way to survive that; the fix is to catch it here, before rendering,
+    rather than let it print as mangled text with no error at all.
+
+    A bare ``$`` (e.g. a dollar figure in a finance-domain title like "$500
+    Cost Overrun") is deliberately not flagged here: ``_escape_latex``
+    already turns it into a literal, correctly-rendered dollar sign, so it
+    isn't actually broken -- only a backslash command is.
+    """
+    if title and _TITLE_UNSAFE_CHAR.search(title):
+        raise ValueError(
+            f"{source} title {title!r} contains a LaTeX command (backslash), which "
+            "renders as literal text, not a LaTeX command -- titles must be plain text."
+        )
+
+
 LABEL_TOKEN = re.compile(r"\\label\s*\{(?P<label>[^{}]+)\}")
 VALID_LABEL = re.compile(r"[A-Za-z0-9:._-]+")
 # A '|' not preceded by a backslash: the actual column delimiter in a Markdown
@@ -157,6 +227,116 @@ VALID_LABEL = re.compile(r"[A-Za-z0-9:._-]+")
 # table, since str.split("|") alone treats it as an extra column boundary.
 UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
 VALID_GRAPHICS_PATH = re.compile(r"[A-Za-z0-9_./-]+")
+
+# The one sanctioned way a block's content may already contain a hand-placed
+# label: a TABLE block pasting in the complete environment
+# pandas_csv_to_latex_table returned (see text_agent.SYSTEM_PROMPT), which
+# necessarily carries the caller-supplied `label` argument since that tool
+# renders its own table wrapper the composer never touches.
+_TOOL_RENDERED_TABLE_ENV = re.compile(r"\\begin\s*\{(?:table|longtable)\}")
+
+
+def validate_no_manual_labels(block_type: SemanticBlockType, content: str, block_id: Optional[str]) -> None:
+    """Reject a block that writes its own ``\\label{}`` instead of citing one.
+
+    Labels for theorem/definition/equation/table/notation_table/section are
+    assigned automatically by the composer -- text_agent.SYSTEM_PROMPT tells
+    the model this explicitly -- but nothing used to enforce it, so a
+    violation only surfaced (if at all) as a "Duplicate LaTeX label" crash in
+    the composer, with no retry, whenever two independently-drafted sections
+    happened to invent the same label string for what each considered the
+    "same" equation (the ``eq:energy_balance`` incident: two different
+    sections both wrote ``\\label{eq:energy_balance}`` for their own copy of
+    the same physical relation). Running this right after generation (see
+    ``validate_fragment_environments`` for the same reasoning) turns that
+    into a retryable error instead, and also catches the many cases that
+    never collide but still silently diverge from the label the
+    cross-reference registry already promised other sections.
+    """
+    if block_type == SemanticBlockType.TABLE and _TOOL_RENDERED_TABLE_ENV.search(content):
+        return
+    if LABEL_TOKEN.search(content):
+        raise ValueError(
+            f"Block '{block_id}' must not write its own \\label{{}} -- labels are "
+            "assigned automatically by the composer. Cite an existing one from "
+            "\"Available cross-reference labels\" instead of declaring a new one."
+        )
+
+
+def _split_markdown_row(row: str) -> List[str]:
+    """Split one Markdown table row on unescaped '|', restoring '\\|' to a
+    literal '|' in each cell -- see UNESCAPED_PIPE for why this must not be
+    a plain ``row.split("|")``."""
+    return [cell.replace(r"\|", "|").strip() for cell in UNESCAPED_PIPE.split(row)]
+
+
+def _split_leading_markdown_table(content: str) -> "tuple[List[str], str]":
+    """Split the leading contiguous run of non-blank lines (the table) from
+    any trailing prose that follows a blank line in the same block.
+
+    A model was observed writing a valid Markdown table and then, in the
+    same block, appending an explanatory paragraph directly below it with a
+    blank line in between (a `comparison` block explaining its own table)
+    instead of using a separate `paragraph` block. The old implementation
+    folded every non-blank line in the *entire* content into the table, so
+    that trailing paragraph became a "row" with however many columns as it
+    happened to contain unescaped '|' characters (almost always a mismatch
+    against the header) -- a parser boundary bug, not a model mistake. Only
+    the leading run up to the first blank line is table data.
+    """
+    lines = content.splitlines()
+    table_lines: List[str] = []
+    index = 0
+    while index < len(lines) and lines[index].strip():
+        table_lines.append(lines[index].strip().strip("|"))
+        index += 1
+    remainder = "\n".join(lines[index:]).strip()
+    return table_lines, remainder
+
+
+def is_markdown_table(content: str) -> bool:
+    table_lines, _ = _split_leading_markdown_table(content)
+    return (
+        len(table_lines) >= 2
+        and "|" in table_lines[0]
+        and bool(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?", table_lines[1]))
+    )
+
+
+def validate_markdown_table_columns(content: str, block_id: Optional[str]) -> None:
+    """Reject a Markdown table whose data rows don't all have the header's
+    column count.
+
+    Pulled out of the composer's table renderer so TextAgent can run the
+    same check right after generation (see ``validate_fragment_environments``
+    for the same reasoning): a ragged table -- almost always an unescaped
+    '|' inside a cell, e.g. conditional-probability notation like
+    'E[Y|X=x]' written without '\\mid' -- used to only be discovered in the
+    composer, where nothing retries and the error kills the whole document
+    even though every other section already drafted correctly. Only checks
+    the leading contiguous table block (see ``_split_leading_markdown_table``
+    for why); trailing prose in the same block is not table data.
+    """
+    table_lines, _ = _split_leading_markdown_table(content)
+    if not is_markdown_table(content):
+        return
+    raw_rows = [line for index, line in enumerate(table_lines) if index != 1]
+    rows = [_split_markdown_row(row) for row in raw_rows]
+    column_count = len(rows[0])
+    if column_count == 0:
+        raise ValueError(f"Markdown table header has no columns: {raw_rows[0]!r}")
+    bad_rows = [(i, row, raw) for i, (row, raw) in enumerate(zip(rows, raw_rows)) if len(row) != column_count]
+    if bad_rows:
+        details = "; ".join(
+            f"row {i} has {len(row)} column(s) (raw text: {raw!r})" for i, row, raw in bad_rows
+        )
+        raise ValueError(
+            f"Block '{block_id}': Markdown table rows must all have the same number of "
+            f"columns as the header ({column_count} column(s), from header {raw_rows[0]!r}); "
+            f"{details}. The most common cause is a raw, unescaped '|' inside a cell -- for "
+            r"example conditional-probability or set-builder notation written as 'P(A|B)' "
+            r"instead of 'P(A \mid B)'. Escape an unavoidable literal pipe as '\|', or avoid it."
+        )
 VALID_WIDTH = re.compile(r"(?:0?\.\d+|1(?:\.0+)?)\\(?:textwidth|linewidth|columnwidth)")
 
 # --- Pre-compile validation constants ---
@@ -560,7 +740,8 @@ class LatexIntegratorAgent:
             level = "section"
         if level == "chapter" and blueprint.document_class == "article":
             level = "section"
-        return rf"\{level}{{{self._escape_latex(layout.title)}}}"
+        label = self._safe_label(f"sec:{layout.section_id}", f"section '{layout.section_id}'")
+        return rf"\{level}{{{self._escape_latex(layout.title)}}}" + "\n" + rf"\label{{{label}}}"
 
     def _render_semantic_block(self, layout: LayoutBlock, block: ContentBlock) -> str:
         """Render one validated semantic block using the planned presentation.
@@ -579,7 +760,7 @@ class LatexIntegratorAgent:
         if block.type == SemanticBlockType.NOTATION_TABLE:
             return self._render_table(layout, block, default_caption="Notation")
         if block.type == SemanticBlockType.EQUATION:
-            return self._render_equation(block.content)
+            return self._render_equation(layout, block)
         if block.type == SemanticBlockType.FIGURE_REFERENCE:
             return self._sanitize_prose(block.content)
         if block.type == SemanticBlockType.THEOREM:
@@ -599,8 +780,28 @@ class LatexIntegratorAgent:
             SemanticBlockType.WARNING: "colback=red!5!white,colframe=red!60!black",
             SemanticBlockType.CASE_STUDY: "colback=gray!5!white,colframe=black!55",
         }[block.type]
+
+        # A tcolorbox has no LaTeX numbering of its own -- a \label{} placed
+        # in one with no counter behind it would silently print whatever the
+        # nearest *other* counter happens to be (usually the section number),
+        # not a number unique to this definition. \refstepcounter{definition}
+        # (declared in _write_preamble alongside the block-kind package scan
+        # that turns it on) gives \label{} something real to capture, the
+        # same way DEFINITION is the only tcolorbox-rendered kind
+        # default_block_label() offers a label for at all.
+        counter_prefix = ""
+        if block.type == SemanticBlockType.DEFINITION:
+            custom_title = block.title or layout.title
+            title = f"Definition~\\thedefinition: {title}" if custom_title else "Definition~\\thedefinition"
+            label = self._safe_label(
+                default_block_label(LayoutBlockKind.DEFINITION, layout.id),
+                f"definition block '{layout.id}'",
+            )
+            counter_prefix = f"\\refstepcounter{{definition}}\\label{{{label}}}\n"
+
         box = (
-            f"\\begin{{tcolorbox}}[{style},title={{{title}}},fonttitle=\\bfseries]\n"
+            counter_prefix
+            + f"\\begin{{tcolorbox}}[{style},title={{{title}}},fonttitle=\\bfseries]\n"
             f"{body}\n"
             "\\end{tcolorbox}"
         )
@@ -624,33 +825,10 @@ class LatexIntegratorAgent:
 
     def _validate_fragment(self, block: ContentBlock) -> None:
         """Reject LaTeX that would escape the semantic-block rendering boundary."""
-        content = block.content.replace("\r\n", "\n")
-        if "\x00" in content:
-            raise ValueError(f"Block '{block.block_id}' contains a null byte.")
-        if FORBIDDEN_LATEX_COMMANDS.search(content):
-            raise ValueError(
-                f"Block '{block.block_id}' contains a document-level or unsafe LaTeX command."
-            )
-
-        allowed = ALLOWED_ENVIRONMENTS.get(block.type, set())
-        stack: List[str] = []
-        for token in ENVIRONMENT_TOKEN.finditer(content):
-            name = token.group("name")
-            if name in FORBIDDEN_LAYOUT_ENVIRONMENTS or name not in allowed:
-                raise ValueError(
-                    f"Block '{block.block_id}' may not use LaTeX environment '{name}'."
-                )
-            if token.group("action") == "begin":
-                stack.append(name)
-            elif not stack or stack.pop() != name:
-                raise ValueError(
-                    f"Block '{block.block_id}' has an unbalanced LaTeX environment '{name}'."
-                )
-        if stack:
-            raise ValueError(
-                f"Block '{block.block_id}' has unclosed LaTeX environment(s): {', '.join(stack)}."
-            )
-
+        content = validate_fragment_environments(block.type, block.content, block.block_id)
+        validate_no_manual_labels(block.type, content, block.block_id)
+        if block.type in (SemanticBlockType.TABLE, SemanticBlockType.NOTATION_TABLE, SemanticBlockType.COMPARISON):
+            validate_markdown_table_columns(content, block.block_id)
         for label_match in LABEL_TOKEN.finditer(content):
             self._validate_label(label_match.group("label"), f"block '{block.block_id}'")
 
@@ -679,7 +857,7 @@ class LatexIntegratorAgent:
 
     def _render_table(self, layout: LayoutBlock, block: ContentBlock, default_caption: str = "Data summary") -> str:
         content = block.content.strip()
-        if self._is_markdown_table(content):
+        if is_markdown_table(content):
             content = self._markdown_table_to_tabularx(content)
 
         # A specialist tool may return a complete table environment.  It has
@@ -700,7 +878,10 @@ class LatexIntegratorAgent:
             return content
 
         title = self._escape_latex(block.caption or block.title or layout.title or default_caption)
-        label = self._safe_label(block.label or f"tab:{layout.id}", f"table block '{layout.id}'")
+        label = self._safe_label(
+            default_block_label(layout.kind, layout.id),
+            f"table block '{layout.id}'",
+        )
         float_options = self._safe_float_options(block.metadata.get("float_options", "htbp"))
         return (
             f"\\begin{{table}}[{float_options}]\n"
@@ -711,41 +892,21 @@ class LatexIntegratorAgent:
             "\\end{table}"
         )
 
-    @staticmethod
-    def _is_markdown_table(content: str) -> bool:
-        rows = [line.strip() for line in content.splitlines() if line.strip()]
-        return (
-            len(rows) >= 2
-            and "|" in rows[0]
-            and bool(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?", rows[1]))
-        )
-
-    @staticmethod
-    def _split_markdown_row(row: str) -> List[str]:
-        """Split one Markdown table row on unescaped '|', restoring '\\|' to a
-        literal '|' in each cell -- see UNESCAPED_PIPE for why this must not
-        be a plain ``row.split("|")``."""
-        return [cell.replace(r"\|", "|").strip() for cell in UNESCAPED_PIPE.split(row)]
-
     def _markdown_table_to_tabularx(self, content: str) -> str:
-        lines = [line.strip().strip("|") for line in content.splitlines() if line.strip()]
-        raw_rows = [line for index, line in enumerate(lines) if index != 1]
-        rows = [self._split_markdown_row(row) for row in raw_rows]
+        """Render the leading Markdown table in ``content`` as a ``tabularx``.
+
+        Only the leading contiguous block of lines is table data (see
+        ``_split_leading_markdown_table``); anything after the first blank
+        line is trailing prose the model wrote in the same block (e.g. a
+        `comparison` block explaining its own table) and is appended below
+        the table as an ordinary sanitized paragraph instead of being
+        misparsed as a malformed row.
+        """
+        validate_markdown_table_columns(content, None)
+        table_lines, remainder = _split_leading_markdown_table(content)
+        raw_rows = [line for index, line in enumerate(table_lines) if index != 1]
+        rows = [_split_markdown_row(row) for row in raw_rows]
         column_count = len(rows[0])
-        if column_count == 0:
-            raise ValueError(f"Markdown table header has no columns: {raw_rows[0]!r}")
-        bad_rows = [(i, row, raw) for i, (row, raw) in enumerate(zip(rows, raw_rows)) if len(row) != column_count]
-        if bad_rows:
-            details = "; ".join(
-                f"row {i} has {len(row)} column(s) (raw text: {raw!r})" for i, row, raw in bad_rows
-            )
-            raise ValueError(
-                f"Markdown table rows must all have the same number of columns as the "
-                f"header ({column_count} column(s), from header {raw_rows[0]!r}); {details}. "
-                r"The most common cause is a raw, unescaped '|' inside a cell -- for example "
-                r"conditional-probability or set-builder notation written as 'P(A|B)' instead "
-                r"of 'P(A \mid B)'. Escape an unavoidable literal pipe as '\|', or avoid it."
-            )
         column_spec = "@{}" + "l" + "X" * (column_count - 1) + "@{}"
         rendered = [f"\\begin{{tabularx}}{{\\linewidth}}{{{column_spec}}}", r"\toprule"]
         rendered.append(" & ".join(rf"\textbf{{{self._sanitize_prose(cell)}}}" for cell in rows[0]) + r" \\")
@@ -753,6 +914,8 @@ class LatexIntegratorAgent:
         for row in rows[1:]:
             rendered.append(" & ".join(self._sanitize_prose(cell) for cell in row) + r" \\")
         rendered.extend([r"\bottomrule", r"\end{tabularx}"])
+        if remainder:
+            rendered.extend(["", self._sanitize_prose(remainder)])
         return "\n".join(rendered)
 
     def _single_column_table(self, content: str) -> str:
@@ -761,10 +924,36 @@ class LatexIntegratorAgent:
             [r"\begin{tabularx}{\linewidth}{@{}X@{}}", r"\toprule", safe_content + r"\\", r"\bottomrule", r"\end{tabularx}"]
         )
 
-    def _render_equation(self, content: str) -> str:
-        equation = content.strip()
+    def _render_equation(self, layout: LayoutBlock, block: ContentBlock) -> str:
+        """Render an EQUATION block, numbered and labeled by default.
+
+        A model-supplied complete environment (``\\begin{align}...``) is the
+        model's own explicit structural choice for a multi-line derivation,
+        but ``validate_no_manual_labels`` now forbids it from writing its own
+        ``\\label{}`` inside that environment (labels are composer-owned) --
+        so the default label is inserted here, right after the opening
+        ``\\begin{...}`` line, the same way the bare-formula case below gets
+        one. Without this, ``DocumentGraph.label_registry`` would still
+        promise ``eq:<block_id>`` exists (it doesn't distinguish bare from
+        complete-environment equations), but nothing would ever actually
+        emit it, leaving any cross-reference to it undefined at compile
+        time. An already-``\\[...\\]``-wrapped body is left unlabeled by
+        design: it's amsmath's *unnumbered* display math, so a label on it
+        wouldn't refer to anything meaningful.
+        """
+        equation = block.content.strip()
         if ENVIRONMENT_TOKEN.search(equation):
-            return equation
+            label = self._safe_label(
+                default_block_label(LayoutBlockKind.EQUATION, layout.id),
+                f"equation block '{layout.id}'",
+            )
+            begin_match = re.search(r"\\begin\{[A-Za-z*]+\}[^\n]*", equation)
+            insert_at = begin_match.end()
+            return (
+                equation[:insert_at]
+                + f"\n\\label{{{label}}}"
+                + equation[insert_at:]
+            )
         if equation.startswith(r"\[") and equation.endswith(r"\]"):
             return equation
         if equation.startswith("$$") and equation.endswith("$$"):
@@ -773,9 +962,13 @@ class LatexIntegratorAgent:
             equation = equation[1:-1].strip()
         if "$" in equation:
             raise ValueError(
-                f"Equation block contains a stray '$' outside its single math body: {content!r}"
+                f"Equation block contains a stray '$' outside its single math body: {block.content!r}"
             )
-        return f"\\[\n{equation}\n\\]"
+        label = self._safe_label(
+            default_block_label(LayoutBlockKind.EQUATION, layout.id),
+            f"equation block '{layout.id}'",
+        )
+        return f"\\begin{{equation}}\n{equation}\n\\label{{{label}}}\n\\end{{equation}}"
 
     def _render_theorem(self, layout: LayoutBlock, block: ContentBlock) -> str:
         """Render a THEOREM block as a numbered amsthm ``theorem`` environment.
@@ -790,7 +983,11 @@ class LatexIntegratorAgent:
         body = self._sanitize_prose(block.content)
         title = block.title or layout.title
         opt_title = f"[{self._escape_latex(title)}]" if title else ""
-        return f"\\begin{{theorem}}{opt_title}\n{body}\n\\end{{theorem}}"
+        label = self._safe_label(
+            default_block_label(LayoutBlockKind.THEOREM, layout.id),
+            f"theorem block '{layout.id}'",
+        )
+        return f"\\begin{{theorem}}{opt_title}\n\\label{{{label}}}\n{body}\n\\end{{theorem}}"
 
     def _render_proof_sketch(self, block: ContentBlock) -> str:
         """Render a PROOF_SKETCH block as amsthm's built-in ``proof`` environment,
@@ -800,7 +997,7 @@ class LatexIntegratorAgent:
         return f"\\begin{{proof}}[Proof Sketch]\n{body}\n\\end{{proof}}"
 
     def _render_comparison(self, layout: LayoutBlock, title: str, content: str) -> str:
-        if self._is_markdown_table(content):
+        if is_markdown_table(content):
             body = self._markdown_table_to_tabularx(content)
         elif ENVIRONMENT_TOKEN.search(content):
             body = content.strip()
@@ -832,6 +1029,13 @@ class LatexIntegratorAgent:
         ``\\ref``/``\\Cref``/``\\label`` is copied verbatim -- it is a label
         key, not prose, so escaping characters like '_' inside it would
         silently break the reference.
+
+        ``$$...$$`` (display math) is treated the same as ``$...$``: a run of
+        two ``$`` is one toggle, not two independent ones. Toggling twice was
+        the bug -- ``$$`` flipped ``inline_math`` on and immediately back off,
+        so everything up to the closing ``$$`` was treated as plain prose and
+        had its ``^``/``_``/braces escaped into literal glyphs instead of
+        being left as math.
         """
         output: List[str] = []
         text = content.replace("\r\n", "\n").strip()
@@ -871,6 +1075,13 @@ class LatexIntegratorAgent:
                 index += 1
                 continue
             if char == "$":
+                if index + 1 < len(text) and text[index + 1] == "$":
+                    inline_math = not inline_math
+                    output.append("$$")
+                    awaiting_command_argument = False
+                    pending_raw_argument = False
+                    index += 2
+                    continue
                 inline_math = not inline_math
                 output.append(char)
                 awaiting_command_argument = False
@@ -992,15 +1203,6 @@ class LatexIntegratorAgent:
         # Claim directly before emitting the sole \includegraphics command.
         graph.claim_figure_placement(figure_id, section_id)
 
-        if placement.layout == FigureLayout.WRAP:
-            return (
-                f"\\begin{{wrapfigure}}{{r}}{{{width}}}\n"
-                "\\centering\n"
-                f"\\includegraphics[width=\\linewidth]{{{path}}}\n"
-                f"\\caption{{{caption}}}\n"
-                f"\\label{{{label}}}\n"
-                "\\end{wrapfigure}"
-            )
         if placement.layout == FigureLayout.MINIPAGE:
             return (
                 "\\begin{center}\n"
@@ -1043,6 +1245,19 @@ class LatexIntegratorAgent:
             # _render_theorem); PROOF_SKETCH blocks use amsthm's built-in
             # `proof` environment directly and need no separate declaration.
             lines.append(r"\newtheorem{theorem}{Theorem}[section]")
+        if any(
+            block.kind == LayoutBlockKind.DEFINITION
+            for section in blueprint.sections
+            for block in section.blocks
+        ):
+            # \newtheorem is a core LaTeX2e command, not amsthm-specific, so
+            # this doesn't need "amsthm" in packages -- it exists purely to
+            # give \refstepcounter{definition} (see _render_semantic_block) a
+            # real, [section]-scoped counter to increment, so \label{def:...}
+            # on a definition tcolorbox captures an actual "Definition N"
+            # instead of silently reusing whatever the nearest other counter
+            # (usually the section number) happens to be.
+            lines.append(r"\newtheorem{definition}{Definition}[section]")
         if document_class in CHAPTER_FORCES_PAGE_BREAK_CLASSES and any(
             section.level.lower() == "chapter" for section in blueprint.sections
         ):
@@ -1106,9 +1321,7 @@ class LatexIntegratorAgent:
                 if block.kind == LayoutBlockKind.LIST:
                     packages.add("enumitem")
         for placement in blueprint.figure_slots.values():
-            if placement.layout == FigureLayout.WRAP:
-                packages.add("wrapfig")
-            elif placement.layout == FigureLayout.MINIPAGE:
+            if placement.layout == FigureLayout.MINIPAGE:
                 packages.add("caption")
         if blueprint.layout_policy.get("insert_float_barrier_after_section", False):
             packages.add("placeins")

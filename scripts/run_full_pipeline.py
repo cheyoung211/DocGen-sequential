@@ -123,6 +123,30 @@ class DocGenPipeline:
                     self.image_agent.process_figure_node(node.id, graph, request_id, output_dir=str(self.output_base))
                 # Tables are handled inside TextAgent via tools
 
+        # Phase 3 reads each SECTION/SUBSECTION's persisted blocks.json and each
+        # FIGURE's registered asset off disk -- if a node never reached DRAFTED
+        # (its content agent kept failing every iteration, most often because a
+        # blueprint instruction asks for something its block kind structurally
+        # can't render, e.g. a numbered/labeled equation inside a `definition`
+        # block), that artifact was never written. Failing loudly here, with
+        # every unfinished node's last error, beats the alternative: silently
+        # falling into Phase 3 and hitting a FileNotFoundError several stack
+        # frames deep in LatexIntegratorAgent that doesn't say which content
+        # agent actually failed or why.
+        unfinished = [
+            node for node in graph.nodes.values()
+            if node.type in (NodeType.SECTION, NodeType.SUBSECTION, NodeType.FIGURE)
+            and node.status != NodeStatus.DRAFTED
+        ]
+        if unfinished:
+            details = "; ".join(
+                f"{node.id} ({node.status.value}: {node.last_error})" for node in unfinished
+            )
+            raise RuntimeError(
+                f"{len(unfinished)} node(s) never finished drafting after {max_iterations} "
+                f"iteration(s), cannot start LaTeX integration: {details}"
+            )
+
         # 3. Integration & Self-Correcting Compilation
         print("[Pipeline] Phase 3: Integrating Assets and Compiling...")
         # success = self.integrator.integrate_and_compile(graph, str(project_dir))
