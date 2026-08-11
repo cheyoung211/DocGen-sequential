@@ -8,3 +8,4 @@ dataset2/
 data/
 outputs/
 .git.bak/
+evaluation/foundation_metrics/
