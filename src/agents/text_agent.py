@@ -34,12 +34,108 @@ def _classify_generation_error(exc: Exception) -> str:
     if isinstance(exc, ValidationError):
         return "schema_validation_error"
     if isinstance(exc, ValueError):
-        # Covers _validate_semantic_blocks' own raises (id/type mismatch,
-        # empty content, ...) and the LaTeX fragment validators it calls
-        # (validate_fragment_environments/validate_no_manual_labels/
-        # validate_markdown_table_columns) -- the dominant failure mode here.
+        # Covers _validate_blocks_against_layout's own raises (id/order
+        # mismatch, not-a-JSON-array, ...) and SemanticBlockErrors (the
+        # per-block content violations collected from validate_fragment_
+        # environments/validate_no_manual_labels/validate_markdown_table_
+        # columns/validate_plain_title/figure checks) -- the dominant
+        # failure mode here.
         return "content_validation_error"
     return "generation_error"
+
+
+class SemanticBlockError(ValueError):
+    """One block's content violates a specific, named contract rule.
+
+    ``code`` is a stable key into ``REMEDIATION_HINTS`` and into
+    ``TextAgent.enabled_validators`` -- it is what lets a retry attempt (a)
+    target a deterministic, rule-specific fix instead of a generic "try
+    again", and (b) let an ablation run disable one named check without
+    touching the others.
+    """
+
+    def __init__(self, code: str, block_id: Optional[str], message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.block_id = block_id
+
+
+class SemanticBlockErrors(ValueError):
+    """Aggregates every block-level failure from one validation pass.
+
+    Also carries every ``ContentBlock`` that *did* parse (``blocks``, both
+    passing and failing) so a caller can keep the blocks that passed instead
+    of discarding a whole attempt over one bad block -- see
+    ``TextAgent.process_node``'s progressive narrowing.
+    """
+
+    def __init__(self, blocks: List["ContentBlock"], errors: List[SemanticBlockError]) -> None:
+        self.blocks = blocks
+        self.errors = errors
+        summary = "; ".join(f"[{error.block_id}:{error.code}] {error}" for error in errors)
+        super().__init__(f"{len(errors)} block(s) failed validation: {summary}")
+
+
+# Every entry here is a *content-quality* verifier that TextAgent runs on top
+# of the structural contract (block id/order, required type, non-empty
+# content -- always enforced, never toggleable, since the composer's
+# single-sole-input contract depends on them and disabling them would break
+# the pipeline rather than test anything). Meant to be flipped off per-code
+# for verifier ablation experiments, e.g. TextAgent(enabled_validators=
+# {"table_columns": False}) to measure how much that one check actually
+# contributes to recovery/compile success.
+DEFAULT_ENABLED_VALIDATORS: Dict[str, bool] = {
+    "forbidden_environment": True,
+    "manual_label": True,
+    "table_columns": True,
+    "plain_title": True,
+    "figure_content": True,
+}
+
+# One deterministic, rule-specific remediation instruction per SemanticBlockError
+# code. Looked up by _build_prompt_from_node and injected next to that block's
+# own error message, instead of the one hard-coded, equation-shaped hint every
+# failure used to get regardless of what actually went wrong.
+REMEDIATION_HINTS: Dict[str, str] = {
+    "type_mismatch": (
+        "Set \"type\" to exactly the required_type listed for this block_id -- "
+        "do not substitute a different (even related) type."
+    ),
+    "empty_content": '"content" must not be blank -- write the actual block content.',
+    "forbidden_environment": (
+        "Use only the LaTeX commands/environments this block type allows (see "
+        "<Content rules by block type>). Prose-only types (paragraph, "
+        "key_takeaway, warning, case_study, definition, theorem, proof_sketch) "
+        "may not contain a numbered/labeled display-math or box environment, "
+        "even if the instructions ask for something \"numbered\" or \"labeled\" -- "
+        "write it as inline math ($...$) instead; a numbered, cross-referenceable "
+        "version belongs in a dedicated `equation` block only."
+    ),
+    "manual_label": (
+        "Do not write your own \\label{...}. Cite one of the exact strings from "
+        "\"Available cross-reference labels\" instead of inventing a new label."
+    ),
+    "table_columns": (
+        "Every row of the Markdown table, including the header separator row, "
+        "must have the same number of '|'-delimited columns as the header. A "
+        "raw '|' inside a cell is read as an extra column -- use '\\mid' for a "
+        "conditional-probability or set-builder bar, or '\\|' for a literal pipe."
+    ),
+    "plain_title": (
+        '"title" is plain text only -- remove the backslash/LaTeX command from '
+        'it. Put math notation in "content" instead, inside $...$.'
+    ),
+    "figure_asset_mismatch": (
+        "This figure_reference block's \"asset_id\" must be exactly the "
+        "asset_id given for this block_id in the request -- do not invent or "
+        "guess a different one."
+    ),
+    "figure_forbidden_content": (
+        "A figure_reference block must not contain \\begin{figure} or "
+        "\\includegraphics -- reference the figure in a plain sentence only; "
+        "the Composer places the image."
+    ),
+}
 
 SYSTEM_PROMPT = r"""
 You are a senior technical writer in a blueprint-driven LaTeX document system.
@@ -223,8 +319,22 @@ SEMANTIC_TYPE_BY_LAYOUT_KIND = {
 class TextAgent:
     """Generate and persist strict semantic blocks for one section node."""
 
-    def __init__(self, llm_client: Optional[LLMClient] = None) -> None:
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        enabled_validators: Optional[Dict[str, bool]] = None,
+    ) -> None:
         self.llm = llm_client or LLMClient()
+        unknown = set(enabled_validators or {}) - set(DEFAULT_ENABLED_VALIDATORS)
+        if unknown:
+            raise ValueError(
+                f"Unknown enabled_validators code(s): {sorted(unknown)}. "
+                f"Valid codes: {sorted(DEFAULT_ENABLED_VALIDATORS)}."
+            )
+        self.enabled_validators: Dict[str, bool] = {
+            **DEFAULT_ENABLED_VALIDATORS,
+            **(enabled_validators or {}),
+        }
 
     def process_node(
         self,
@@ -253,6 +363,17 @@ class TextAgent:
         next attempt's prompt, gives the model a chance to actually correct
         course (e.g. fall back to inline math) instead of repeating the same
         mistake for free.
+
+        Each attempt only asks the model to (re)generate whatever is still
+        ``pending`` -- every other node's block starts out pending, but once
+        a block passes validation it is accepted and never regenerated
+        again. A structural failure (bad JSON, wrong ids/order/count for
+        what was actually requested) can't be pinned on one block, so it
+        leaves the whole pending set unchanged for a full retry; a
+        ``SemanticBlockErrors`` failure narrows pending down to exactly the
+        blocks that are still wrong, keeps the ones that passed, and gives
+        the next attempt a per-block, rule-specific fix instruction instead
+        of one generic notice for the whole section.
         """
         node = graph.nodes.get(node_id)
         if node is None:
@@ -273,39 +394,76 @@ class TextAgent:
             producer_model=self.llm.model_name,
             outer_iteration=outer_iteration,
         )
+
+        accepted: Dict[str, ContentBlock] = {}
+        pending_ids = {block.id for block in layout_blocks}
+        block_errors: Dict[str, SemanticBlockError] = {}
         last_error: Optional[str] = None
+        used_tools: List[ToolResponse] = []
+
         for attempt in range(1, max_attempts + 1):
+            pending_layout_blocks = [block for block in layout_blocks if block.id in pending_ids]
             try:
                 raw_response = self.llm.generate(
                     system_prompt=SYSTEM_PROMPT,
                     user_prompt=self._build_prompt_from_node(
-                        node, graph, layout_blocks, previous_error=last_error
+                        node,
+                        graph,
+                        pending_layout_blocks,
+                        accepted_blocks=accepted,
+                        block_errors=block_errors,
+                        previous_error=last_error,
                     ),
                     temperature=0.3,
                     max_new_tokens=4096,
                     usage_sink=usage_sink,
                 )
                 data = json.loads(self.llm.extract_json_block(raw_response))
-                blocks = self._validate_semantic_blocks(data.get("content_blocks"), layout_blocks)
-                used_tools = self._execute_tools(data.get("tool_requests", []))
+                new_blocks = self._validate_blocks_against_layout(
+                    data.get("content_blocks"), pending_layout_blocks
+                )
+                used_tools.extend(self._execute_tools(data.get("tool_requests", [])))
+                for block in new_blocks:
+                    accepted[block.block_id] = block
+                pending_ids = set()
+                block_errors = {}
+            except SemanticBlockErrors as exc:
+                failing_ids = {error.block_id for error in exc.errors}
+                block_errors = {error.block_id: error for error in exc.errors}
+                for block in exc.blocks:
+                    if block.block_id not in failing_ids:
+                        accepted[block.block_id] = block
+                pending_ids = failing_ids
+                last_error = str(exc)
+                tracker.record_failure(attempt, _classify_generation_error(exc), str(exc))
+                print(
+                    f"[TextAgent] Attempt {attempt}/{max_attempts} for '{node_id}': "
+                    f"{len(failing_ids)} block(s) still failing: {sorted(failing_ids)}"
+                )
+            except Exception as exc:
+                # Can't be attributed to a specific block (bad JSON, wrong
+                # ids/order/count for what was requested, tool failure, ...),
+                # so the whole pending set is retried unchanged next attempt.
+                last_error = str(exc)
+                block_errors = {}
+                tracker.record_failure(attempt, _classify_generation_error(exc), str(exc))
+                print(f"[TextAgent] Attempt {attempt}/{max_attempts} failed for '{node_id}': {exc}")
 
+            if not pending_ids:
+                ordered_blocks = [accepted[block.id] for block in layout_blocks]
                 output = TextAgentOutput(
                     request_id=request_id,
                     section_id=node_id,
-                    blocks=blocks,
+                    blocks=ordered_blocks,
                     used_tools=used_tools,
                 )
                 self._write_semantic_artifacts(sections_dir, node_id, output)
 
-                draft_content = self._render_draft_with_anchors(blocks)
+                draft_content = self._render_draft_with_anchors(ordered_blocks)
                 graph.update_node_status(node_id, NodeStatus.DRAFTED, content=draft_content)
                 tracker.record_success(attempt, resulting_artifact_id=f"{node_id}.blocks.json")
                 print(f"[TextAgent] Saved semantic blocks for section: {node_id}")
                 return output
-            except Exception as exc:
-                last_error = str(exc)
-                tracker.record_failure(attempt, _classify_generation_error(exc), str(exc))
-                print(f"[TextAgent] Attempt {attempt}/{max_attempts} failed for '{node_id}': {exc}")
 
         tracker.record_exhausted()
         graph.update_node_status(node_id, NodeStatus.ERROR, error=last_error)
@@ -331,8 +489,13 @@ class TextAgent:
         node: Any,
         graph: DocumentGraph,
         layout_blocks: List[LayoutBlock],
+        accepted_blocks: Optional[Dict[str, ContentBlock]] = None,
+        block_errors: Optional[Dict[str, SemanticBlockError]] = None,
         previous_error: Optional[str] = None,
     ) -> str:
+        accepted_blocks = accepted_blocks or {}
+        block_errors = block_errors or {}
+
         parent_id = next((parent for parent, children in graph.hierarchy.items() if node.id in children), None)
         parent_context = graph.nodes[parent_id].title if parent_id in graph.nodes else "Root level"
         figure_context = []
@@ -372,19 +535,53 @@ class TextAgent:
             for label, entry in graph.label_registry.items()
             if entry.kind != "figure"
         ]
-        retry_notice = (
-            f"""
-Your previous attempt for this section was rejected: {previous_error}
-Fix this specific problem in your next response. If a block's required_type
-only allows prose (paragraph, key_takeaway, definition, warning, case_study),
-do not wrap a value in a numbered/labeled display-equation environment there
-even if the instructions ask for one to be "numbered" or "labeled" -- write
-it as inline math ($...$) instead; a numbered, cross-referenceable version
-belongs in a dedicated `equation` block only.
-"""
-            if previous_error
-            else ""
-        )
+
+        if block_errors:
+            # Attributable failures: each block gets its own error text plus
+            # the deterministic fix for exactly that rule, instead of one
+            # generic notice covering every possible cause at once.
+            hint_lines = [
+                f"- Block '{block_id}': {error}\n"
+                f"  How to fix: {REMEDIATION_HINTS.get(error.code, 'Fix this specific problem.')}"
+                for block_id, error in block_errors.items()
+            ]
+            retry_notice = (
+                "The block(s) below were rejected in your previous attempt. "
+                "Regenerate ONLY these blocks (listed in 'Required semantic "
+                "blocks' below), fixing exactly the problem described for "
+                "each -- do not change anything else about them:\n"
+                + "\n".join(hint_lines)
+                + "\n\n"
+            )
+        elif previous_error:
+            # Structural failure: couldn't be pinned on one block, so this is
+            # the same whole-set retry as before, with one general hint.
+            retry_notice = (
+                f"Your previous attempt for this section was rejected: {previous_error}\n"
+                "Fix this specific problem in your next response. If a block's "
+                "required_type only allows prose (paragraph, key_takeaway, "
+                "definition, warning, case_study, theorem, proof_sketch), do "
+                "not wrap a value in a numbered/labeled display-equation "
+                "environment there even if the instructions ask for one to be "
+                '"numbered" or "labeled" -- write it as inline math ($...$) '
+                "instead; a numbered, cross-referenceable version belongs in "
+                "a dedicated `equation` block only.\n\n"
+            )
+        else:
+            retry_notice = ""
+
+        accepted_summary = ""
+        if accepted_blocks:
+            accepted_lines = [
+                f"- '{block_id}' ({block.type.value}): {block.content.strip()[:80]}..."
+                for block_id, block in accepted_blocks.items()
+            ]
+            accepted_summary = (
+                "\nAlready-approved blocks in this section (already finished "
+                "and written to the document -- for context only, do not "
+                "regenerate these):\n" + "\n".join(accepted_lines) + "\n"
+            )
+
         return f"""
 {retry_notice}Section node:
 - ID: {node.id}
@@ -394,7 +591,7 @@ belongs in a dedicated `equation` block only.
 - Required tools: {json.dumps(node.spec.get('required_tools', []), ensure_ascii=False)}
 - Parent context: {parent_context}
 - Prior completed context: {graph.get_full_context(node.id)}
-
+{accepted_summary}
 Required semantic blocks, in this exact order:
 {json.dumps(planned_blocks, ensure_ascii=False, indent=2)}
 
@@ -407,11 +604,23 @@ Figures owned by this section; refer to these only when relevant:
 {json.dumps(figure_context, ensure_ascii=False, indent=2)}
 """.strip()
 
-    @staticmethod
-    def _validate_semantic_blocks(
+    def _validate_blocks_against_layout(
+        self,
         raw_blocks: Any,
         layout_blocks: List[LayoutBlock],
     ) -> List[ContentBlock]:
+        """Validate one attempt's blocks against the requested layout blocks.
+
+        ``layout_blocks`` may be the whole section or a narrowed pending
+        subset (see ``process_node``'s progressive narrowing) -- either way,
+        the returned blocks must match it exactly in id and order. That
+        structural check fails the whole attempt immediately (there's no
+        single block to blame for a wrong id, count, or order); every
+        block's *content* is checked regardless of any earlier block's
+        result and every failure is collected, not just the first, so a
+        caller can narrow the next attempt to exactly what's still wrong in
+        one pass instead of discovering violations one at a time.
+        """
         if not isinstance(raw_blocks, list):
             raise ValueError("content_blocks must be a JSON array.")
 
@@ -420,59 +629,114 @@ Figures owned by this section; refer to these only when relevant:
         actual_ids = [block.block_id for block in blocks]
         if actual_ids != expected_ids:
             raise ValueError(
-                "Semantic block IDs must match the blueprint blocks in order. "
+                "Semantic block IDs must match the requested blocks in order. "
                 f"Expected {expected_ids}, received {actual_ids}."
             )
 
+        errors: List[SemanticBlockError] = []
         for content_block, layout_block in zip(blocks, layout_blocks):
-            expected_type = SEMANTIC_TYPE_BY_LAYOUT_KIND[layout_block.kind]
-            if content_block.type != expected_type:
-                raise ValueError(
-                    f"Block '{layout_block.id}' must use type '{expected_type.value}', "
-                    f"not '{content_block.type.value}'."
-                )
-            if not content_block.content.strip():
-                raise ValueError(f"Block '{layout_block.id}' has empty content.")
-            # Same environment/command whitelist the composer enforces in
-            # LatexIntegratorAgent._validate_fragment, run here too so a
-            # violation raises inside process_node's try/except -- which
-            # marks the node ERROR and lets the pipeline's iteration loop
-            # retry it with a fresh sample -- instead of surfacing for the
-            # first time during Phase 3 integration, where nothing retries
-            # and the whole request dies.
-            validate_fragment_environments(
-                content_block.type, content_block.content, content_block.block_id
-            )
-            # Same reasoning: both used to be composer-only (Phase 3), where
-            # a violation surfaces only after every other section is already
-            # drafted and nothing retries -- a manually-written \label{}
-            # colliding with another independently-drafted section's guess
-            # at the "same" label (the eq:energy_balance incident), or an
-            # unescaped '|' inside a table cell (e.g. 'E[Y|X=x]' instead of
-            # '\mid'), used to kill the whole document there instead of
-            # retrying just this block.
-            validate_no_manual_labels(
-                content_block.type, content_block.content, content_block.block_id
-            )
-            if layout_block.kind in (
-                LayoutBlockKind.TABLE,
-                LayoutBlockKind.NOTATION_TABLE,
-                LayoutBlockKind.COMPARISON,
-            ):
-                validate_markdown_table_columns(content_block.content, content_block.block_id)
-            validate_plain_title(content_block.title, f"Block '{layout_block.id}'")
-            if layout_block.kind == LayoutBlockKind.FIGURE:
-                if content_block.asset_id != layout_block.asset_id:
-                    raise ValueError(
-                        f"Figure reference block '{layout_block.id}' must use asset_id "
-                        f"'{layout_block.asset_id}'."
-                    )
-                forbidden = ("\\begin{figure}", "\\includegraphics")
-                if any(token in content_block.content for token in forbidden):
-                    raise ValueError(
-                        f"Figure reference block '{layout_block.id}' must not render a figure."
-                    )
+            errors.extend(self._validate_one_block(content_block, layout_block))
+        if errors:
+            raise SemanticBlockErrors(blocks, errors)
         return blocks
+
+    def _validate_one_block(
+        self,
+        content_block: ContentBlock,
+        layout_block: LayoutBlock,
+    ) -> List[SemanticBlockError]:
+        """Check one block's content, returning every violation found.
+
+        Structural contract checks (required type, non-empty content) always
+        run -- the composer's single-sole-input contract depends on them.
+        Everything else here is a content-quality verifier gated by
+        ``self.enabled_validators``, so a verifier ablation run can disable
+        one named check without touching the others.
+        """
+        block_id = layout_block.id
+        errors: List[SemanticBlockError] = []
+
+        expected_type = SEMANTIC_TYPE_BY_LAYOUT_KIND[layout_block.kind]
+        if content_block.type != expected_type:
+            errors.append(
+                SemanticBlockError(
+                    "type_mismatch",
+                    block_id,
+                    f"Block '{block_id}' must use type '{expected_type.value}', "
+                    f"not '{content_block.type.value}'.",
+                )
+            )
+            # A wrong type makes every type-specific check below meaningless
+            # (e.g. checking the wrong type's environment allowlist) --
+            # report just this and let the next attempt fix it first.
+            return errors
+        if not content_block.content.strip():
+            errors.append(
+                SemanticBlockError("empty_content", block_id, f"Block '{block_id}' has empty content.")
+            )
+            return errors
+
+        # Same environment/command whitelist the composer enforces in
+        # LatexIntegratorAgent._validate_fragment, run here too so a
+        # violation raises inside process_node's try/except -- which
+        # marks the node ERROR and lets the pipeline's iteration loop
+        # retry it with a fresh sample -- instead of surfacing for the
+        # first time during Phase 3 integration, where nothing retries
+        # and the whole request dies.
+        if self.enabled_validators.get("forbidden_environment", True):
+            try:
+                validate_fragment_environments(content_block.type, content_block.content, block_id)
+            except ValueError as exc:
+                errors.append(SemanticBlockError("forbidden_environment", block_id, str(exc)))
+
+        # Same reasoning: both used to be composer-only (Phase 3), where
+        # a violation surfaces only after every other section is already
+        # drafted and nothing retries -- a manually-written \label{}
+        # colliding with another independently-drafted section's guess
+        # at the "same" label (the eq:energy_balance incident), or an
+        # unescaped '|' inside a table cell (e.g. 'E[Y|X=x]' instead of
+        # '\mid'), used to kill the whole document there instead of
+        # retrying just this block.
+        if self.enabled_validators.get("manual_label", True):
+            try:
+                validate_no_manual_labels(content_block.type, content_block.content, block_id)
+            except ValueError as exc:
+                errors.append(SemanticBlockError("manual_label", block_id, str(exc)))
+
+        if (
+            layout_block.kind in (LayoutBlockKind.TABLE, LayoutBlockKind.NOTATION_TABLE, LayoutBlockKind.COMPARISON)
+            and self.enabled_validators.get("table_columns", True)
+        ):
+            try:
+                validate_markdown_table_columns(content_block.content, block_id)
+            except ValueError as exc:
+                errors.append(SemanticBlockError("table_columns", block_id, str(exc)))
+
+        if self.enabled_validators.get("plain_title", True):
+            try:
+                validate_plain_title(content_block.title, f"Block '{block_id}'")
+            except ValueError as exc:
+                errors.append(SemanticBlockError("plain_title", block_id, str(exc)))
+
+        if layout_block.kind == LayoutBlockKind.FIGURE and self.enabled_validators.get("figure_content", True):
+            if content_block.asset_id != layout_block.asset_id:
+                errors.append(
+                    SemanticBlockError(
+                        "figure_asset_mismatch",
+                        block_id,
+                        f"Figure reference block '{block_id}' must use asset_id '{layout_block.asset_id}'.",
+                    )
+                )
+            forbidden = ("\\begin{figure}", "\\includegraphics")
+            if any(token in content_block.content for token in forbidden):
+                errors.append(
+                    SemanticBlockError(
+                        "figure_forbidden_content",
+                        block_id,
+                        f"Figure reference block '{block_id}' must not render a figure.",
+                    )
+                )
+        return errors
 
     @staticmethod
     def _render_draft_with_anchors(blocks: List[ContentBlock]) -> str:

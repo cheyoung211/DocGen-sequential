@@ -16,7 +16,7 @@ sys.path.append(str(REPO_ROOT))
 from src.common.state import DocumentGraph, NodeStatus, NodeType, DocumentNode
 from src.common.schemas import PlannerInput, TemplateSpec
 from src.agents.planner import PlannerAgent
-from src.agents.text_agent import TextAgent
+from src.agents.text_agent import DEFAULT_ENABLED_VALIDATORS, TextAgent
 from src.agents.image_agent import ImageAgent
 from src.agents.latex_integrator import LatexIntegratorAgent
 from src.dataset.schemas import BenchmarkItem
@@ -172,13 +172,14 @@ def _write_run_log(
 
 
 class DocGenPipeline:
-    def __init__(self, 
+    def __init__(self,
                  planner_model: str,
                  text_model: str,
                  image_model: str,
                  integrator_model: str,
-                 output_dir: str = "outputs/generations"):
-        
+                 output_dir: str = "outputs/generations",
+                 text_agent_enabled_validators: Optional[Dict[str, bool]] = None):
+
         # 'none' disables image generation entirely for this run: no image
         # model is loaded, and the planner is instructed (and validated) to
         # never create a FIGURE node, so ImageAgent is never invoked.
@@ -195,7 +196,10 @@ class DocGenPipeline:
         clients = {}
         agents = {
             'planner_agent': PlannerAgent(llm_client=get_client(clients, planner_model)),
-            'text_agent': TextAgent(llm_client=get_client(clients, text_model)),
+            'text_agent': TextAgent(
+                llm_client=get_client(clients, text_model),
+                enabled_validators=text_agent_enabled_validators,
+            ),
             'integrator': LatexIntegratorAgent(llm_client=get_client(clients, integrator_model)),
         }
         if self.images_enabled:
@@ -390,6 +394,18 @@ def main():
     parser.add_argument("--integrator-model", default=DEFAULT_MODEL, help="LLM for the LaTeX Integrator Agent, e.g. gpt-5.4-mini or gemini-3-flash")
     parser.add_argument("--out-dir", default="outputs/generations", help="Output directory")
     parser.add_argument("--iterations", type=int, default=3, help="Maximum number of iterations")
+    parser.add_argument(
+        "--disable-text-validator",
+        action="append",
+        choices=sorted(DEFAULT_ENABLED_VALIDATORS),
+        metavar="CODE",
+        help=(
+            "Turn off one TextAgent content-quality verifier by code, for "
+            "verifier ablation experiments (repeatable). Structural checks "
+            "(block id/order/type, non-empty content) are never disabled. "
+            f"Codes: {', '.join(sorted(DEFAULT_ENABLED_VALIDATORS))}"
+        ),
+    )
     args = parser.parse_args()
 
     out_dir = args.out_dir
@@ -400,12 +416,19 @@ def main():
         out_dir = f"{out_dir.rstrip('/')}_{timestamp}"
         print(f"[Batch] Writing outputs to: {out_dir}")
 
+    text_agent_enabled_validators = (
+        {code: False for code in args.disable_text_validator} if args.disable_text_validator else None
+    )
+    if text_agent_enabled_validators:
+        print(f"[Pipeline] TextAgent verifiers disabled for this run: {sorted(text_agent_enabled_validators)}")
+
     pipeline = DocGenPipeline(
         planner_model=args.planner_model,
         text_model=args.text_model,
         image_model=args.image_model,
         integrator_model=args.integrator_model,
-        output_dir=out_dir
+        output_dir=out_dir,
+        text_agent_enabled_validators=text_agent_enabled_validators,
     )
 
     if args.dataset:
