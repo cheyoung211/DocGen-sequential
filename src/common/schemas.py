@@ -156,6 +156,11 @@ class PlannerInput(BaseModel):
     user_query: str
     inputs: List[FileInput] = Field(default_factory=list)
     template: TemplateSpec
+    allow_figures: bool = Field(
+        True,
+        description="If False, no image-generation model is available for this run -- "
+        "the planner must not create any FIGURE node, asset_node, or figure_slots entry.",
+    )
 
 class SectionSpec(BaseModel):
     """state.py의 DocumentNode 내 spec 필드에 들어갈 상세 지침"""

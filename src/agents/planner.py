@@ -386,14 +386,6 @@ You are the Lead Document Architect. Your goal is to design both a hierarchical 
        "derivation" -> `equation` (write a complete `align`/`aligned`
        environment as the block's content); a "figure placeholder" -> `figure`.
 
-### Critical Depth Rule:
-- For a professional report, aim for at least 5-8 distinct nodes.
-- Do NOT create a single large 'Introduction' node. Instead, break it into:
-  1. Historical Background
-  2. Current Market/Technical Status
-  3. Scope of this Report
-- If the user query is complex, favor creating SUBSECTION nodes under SECTION nodes.
-
 ### Available Tools:
 {tool_schemas}
 """
@@ -482,6 +474,22 @@ blueprint is REQUIRED -- never return nodes_to_create/hierarchy_edges/global_con
 Return ONLY valid JSON. No commentary.
 """
 
+# Appended only when PlannerInput.allow_figures is False (no image-generation
+# model available for this run). Overrides every FIGURE-related instruction
+# in PLANNER_STRATEGY_PROMPT above -- content that would have been a figure
+# must be re-expressed as a non-visual block instead of simply omitted, so
+# the document doesn't lose the information the figure would have carried.
+PLANNER_NO_IMAGES_PROMPT = """
+### Image Generation Is Disabled For This Run
+No image-generation model is available. Regardless of anything said above:
+- Do not create any `FIGURE` node or any `asset_nodes` entry.
+- Do not add any `figure_slots` entry to the blueprint.
+- Do not use `kind: "figure"` / `component: "figure"` for any LayoutBlock.
+If content would otherwise have been a real illustrative image, represent it
+instead as a `table`, `notation_table`, `comparison`, or descriptive
+`paragraph` block -- never as a FIGURE node.
+"""
+
 class PlannerAgent:
     """
     Transforms a user query into an initial Document Graph structure.
@@ -522,6 +530,8 @@ class PlannerAgent:
         system_prompt = PLANNER_STRATEGY_PROMPT.format(
             tool_schemas=json.dumps(self.available_tools, indent=2)
         )
+        if not planner_input.allow_figures:
+            system_prompt += PLANNER_NO_IMAGES_PROMPT
         if not use_structured:
             system_prompt += PLANNER_LEGACY_OUTPUT_FORMAT_PROMPT
 
@@ -555,7 +565,7 @@ class PlannerAgent:
                 plan = PlannerOutput.model_validate(plan_data)
                 if plan.request_id is None:
                     plan.request_id = planner_input.request_id
-                self._validate_blueprint(plan)
+                self._validate_blueprint(plan, allow_figures=planner_input.allow_figures)
                 return plan
             except Exception as exc:
                 last_error = exc
@@ -566,7 +576,7 @@ class PlannerAgent:
         ) from last_error
 
     @staticmethod
-    def _validate_blueprint(plan: PlannerOutput) -> None:
+    def _validate_blueprint(plan: PlannerOutput, allow_figures: bool = True) -> None:
         """Reject graph/layout contracts that cannot be composed safely.
 
         The LLM chooses the layout, but this deterministic validation prevents a
@@ -590,6 +600,12 @@ class PlannerAgent:
             for node_id, node in nodes_by_id.items()
             if node.get("type") == NodeType.FIGURE.value
         }
+        if not allow_figures and figure_ids:
+            raise ValueError(
+                "Image generation is disabled for this run -- the plan must not include any "
+                f"FIGURE node: {sorted(figure_ids)}. Represent this content as a table, "
+                "notation_table, comparison, or paragraph block instead."
+            )
         blueprint = plan.blueprint
 
         if blueprint.document.kind != DocumentKind.SECTION_DRAFT and not blueprint.document.title:

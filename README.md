@@ -16,9 +16,12 @@ Alternatively, copy `.env.example` into your preferred secret-management workflo
 
 ```bash
 python3 scripts/run_full_pipeline.py \
-  --query "Create a technical report about zero-trust security." \
-  --image-model flux
+  --query "Create a technical report about zero-trust security."
 ```
+
+Image generation is disabled by default (`--image-model none`): the planner is instructed to never
+create a FIGURE node, so no image model is loaded and `ImageAgent` is never invoked. Pass
+`--image-model sdxl` or `--image-model flux` to re-enable it.
 
 The planner, text writer, image-prompt strategist, and LaTeX integrator all default to `gpt-4o-mini`. The `--planner-model`, `--text-model`, and `--integrator-model` options remain available only when an explicit OpenAI model override is required.
 
@@ -51,6 +54,21 @@ This is fully offline and deterministic by default (`network_sources_enabled: fa
 `configs/dataset_v1.yaml`): all 120 items come from the hand-curated seed bank in
 `src/dataset/source_adapters/manual_seed.py`. Re-running with the same `--seed` reproduces
 `data/benchmark/benchmark_v1.jsonl` byte-for-byte.
+
+### Short-form variant (`dataset2/`)
+
+For the verifier-evaluation project phase, long-form length is no longer a goal (see
+`instruction_builder.build_benchmark_item`'s `long_form` parameter and
+`validators.MIN_WORDS_FOR_LONG_FORM`). `configs/dataset2.yaml` selects shorter per-difficulty word/section
+targets and drops the explicit word-count sentence from `natural_language_instruction`, and writes to a
+separate `dataset2/` tree so `data/benchmark/benchmark_v1.jsonl` is never touched:
+
+```bash
+python3 -m src.dataset.build_dataset --config configs/dataset2.yaml --output-dir dataset2 --seed 42
+```
+
+This produces `dataset2/benchmark/benchmark_v2.jsonl` (120 items, same four domains, same offline/deterministic
+seed bank -- only the length contract differs).
 
 Output layout (spec section 10):
 
