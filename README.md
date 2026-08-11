@@ -2,6 +2,9 @@
 
 All language-model agents now call OpenAI's Responses API with `gpt-4o-mini` by default. The local Qwen/Transformers model, tokenizer, CUDA placement, and 4-bit quantization code have been removed from the active LLM path. SDXL and Flux remain optional local image renderers; they are not language models.
 
+> **Branch note:** This `generation` branch focuses on the core generation pipeline (planner, text/image agents, LaTeX integration) — not the verifier logic.
+
+
 ## Setup
 
 ```bash
