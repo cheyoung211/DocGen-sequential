@@ -342,6 +342,20 @@ def _classify_generation_error(exc: Exception) -> str:
     return "generation_error"
 
 
+# Content-quality verifiers only, mirroring TextAgent.DEFAULT_ENABLED_VALIDATORS
+# -- referential-integrity checks (duplicate/unknown ids, orphan figures,
+# empty section blocks, figure slot mismatches, ...) always run regardless,
+# since the composer literally cannot build a document without them holding;
+# disabling one of those would break the pipeline rather than test a
+# verifier's actual contribution. These two are the only checks in
+# _validate_blueprint that are about output quality rather than structural
+# composability, so they're what a verifier ablation run would toggle.
+DEFAULT_ENABLED_PLANNER_VALIDATORS: Dict[str, bool] = {
+    "plain_title": True,
+    "leading_section_number": True,
+}
+
+
 PLANNER_STRATEGY_PROMPT = """
 You are the Lead Document Architect. Your goal is to design both a hierarchical Document Graph and a LaTeX DocumentBlueprint.
 
@@ -512,10 +526,24 @@ class PlannerAgent:
     Acts as the 'Architect' of the multi-agent system.
     """
 
-    def __init__(self, llm_client: Optional[LLMClient] = None) -> None:
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        enabled_validators: Optional[Dict[str, bool]] = None,
+    ) -> None:
         self.llm = llm_client or LLMClient()
         # Fetch tool definitions to inform the LLM of available capabilities
         self.available_tools = get_all_tool_schemas()
+        unknown = set(enabled_validators or {}) - set(DEFAULT_ENABLED_PLANNER_VALIDATORS)
+        if unknown:
+            raise ValueError(
+                f"Unknown enabled_validators code(s): {sorted(unknown)}. "
+                f"Valid codes: {sorted(DEFAULT_ENABLED_PLANNER_VALIDATORS)}."
+            )
+        self.enabled_validators: Dict[str, bool] = {
+            **DEFAULT_ENABLED_PLANNER_VALIDATORS,
+            **(enabled_validators or {}),
+        }
 
     def generate_plan(
         self,
@@ -609,8 +637,7 @@ class PlannerAgent:
             f"PlannerAgent failed to produce a valid plan after {max_attempts} attempts: {last_error}"
         ) from last_error
 
-    @staticmethod
-    def _validate_blueprint(plan: PlannerOutput, allow_figures: bool = True) -> None:
+    def _validate_blueprint(self, plan: PlannerOutput, allow_figures: bool = True) -> None:
         """Reject graph/layout contracts that cannot be composed safely.
 
         The LLM chooses the layout, but this deterministic validation prevents a
@@ -644,8 +671,9 @@ class PlannerAgent:
 
         if blueprint.document.kind != DocumentKind.SECTION_DRAFT and not blueprint.document.title:
             raise ValueError("A report or article blueprint must define a document title.")
-        validate_plain_title(blueprint.document.title, "Document")
-        validate_plain_title(blueprint.document.subtitle, "Document subtitle")
+        if self.enabled_validators.get("plain_title", True):
+            validate_plain_title(blueprint.document.title, "Document")
+            validate_plain_title(blueprint.document.subtitle, "Document subtitle")
 
         layouts_by_id = {layout.section_id: layout for layout in blueprint.sections}
         if len(layouts_by_id) != len(blueprint.sections):
@@ -661,12 +689,32 @@ class PlannerAgent:
         all_block_ids = set()
         referenced_figure_ids = set()
         for section_id, layout in layouts_by_id.items():
-            validate_plain_title(layout.title, f"Section '{section_id}'")
-            if _LEADING_SECTION_NUMBER.match(layout.title):
+            if self.enabled_validators.get("plain_title", True):
+                validate_plain_title(layout.title, f"Section '{section_id}'")
+            if self.enabled_validators.get("leading_section_number", True) and _LEADING_SECTION_NUMBER.match(
+                layout.title
+            ):
                 raise ValueError(
                     f"Section '{section_id}' title {layout.title!r} starts with a number "
                     "-- \\section{}/\\subsection{} already number themselves automatically; "
                     "remove the leading number from the title."
+                )
+            # A section with zero blocks passes every check below (the loop
+            # over `layout.blocks` just never runs) and only fails once
+            # TextAgent tries to draft it -- see _layout_blocks_for_node's
+            # own "has no semantic blocks" raise. That happens after
+            # TextAgent's own AttemptTracker would have been created for an
+            # LLM-caused failure, but this one fires *before* it (nothing was
+            # generated yet to retry), so it used to vanish from event
+            # logging entirely instead of counting toward this stage's
+            # Verification Trigger Rate. Catching it here means the
+            # Planner's own AttemptTracker retries it with feedback instead,
+            # which is also the only place that can actually fix it (the
+            # blueprint, not TextAgent's output, is what's empty).
+            if not layout.blocks:
+                raise ValueError(
+                    f"Section '{section_id}' has no layout blocks -- every SECTION/SUBSECTION "
+                    "must have at least one block for TextAgent to draft."
                 )
             block_ids = set()
             for block in layout.blocks:
@@ -674,7 +722,8 @@ class PlannerAgent:
                     raise ValueError(f"DocumentBlueprint contains duplicate block ID '{block.id}'.")
                 all_block_ids.add(block.id)
                 block_ids.add(block.id)
-                validate_plain_title(block.title, f"Layout block '{block.id}'")
+                if self.enabled_validators.get("plain_title", True):
+                    validate_plain_title(block.title, f"Layout block '{block.id}'")
                 if block.kind == LayoutBlockKind.FIGURE and not block.asset_id:
                     raise ValueError(f"Figure block '{block.id}' must declare an asset_id.")
                 if block.asset_id and block.asset_id not in figure_ids:

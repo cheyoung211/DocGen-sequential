@@ -375,11 +375,45 @@ class TextAgent:
         the next attempt a per-block, rule-specific fix instruction instead
         of one generic notice for the whole section.
         """
+        def _log_precondition_failure(exc: Exception) -> None:
+            # node-lookup/layout-lookup failures happen before any LLM
+            # attempt -- there is nothing to retry (no attempt tracker
+            # exists yet, and resampling TextAgent's own LLM can't fix a
+            # blueprint that has no layout blocks for this node), so this
+            # can't go through AttemptTracker's retry-with-feedback pairing.
+            # Without this, such a failure was invisible to the evaluation
+            # layer entirely -- it propagated straight past every checked_
+            # count/triggered_count in Verification Trigger Rate. Logged
+            # with failure_id=None, the same convention used for other
+            # failures with no recovery path (see EventLogger.new_failure_id).
+            if event_logger is not None:
+                event_logger.log_verification(
+                    stage="text_agent",
+                    verifier="text_semantic_block_validator",
+                    artifact_id=node_id,
+                    section_id=node_id,
+                    attempt=0,
+                    outer_iteration=outer_iteration,
+                    result="fail",
+                    signal_type=_classify_generation_error(exc),
+                    message=str(exc),
+                    producer_model=self.llm.model_name,
+                    failure_id=None,
+                )
+
         node = graph.nodes.get(node_id)
         if node is None:
-            raise ValueError(f"Node '{node_id}' not found in graph.")
+            error = ValueError(f"Node '{node_id}' not found in graph.")
+            _log_precondition_failure(error)
+            raise error
 
-        layout_blocks = self._layout_blocks_for_node(node_id, graph)
+        try:
+            layout_blocks = self._layout_blocks_for_node(node_id, graph)
+        except Exception as exc:
+            _log_precondition_failure(exc)
+            graph.update_node_status(node_id, NodeStatus.ERROR, error=str(exc))
+            raise
+
         sections_dir = Path(output_dir) / request_id / "sections"
         sections_dir.mkdir(parents=True, exist_ok=True)
         graph.update_node_status(node_id, NodeStatus.RUNNING)

@@ -15,7 +15,7 @@ sys.path.append(str(REPO_ROOT))
 
 from src.common.state import DocumentGraph, NodeStatus, NodeType, DocumentNode
 from src.common.schemas import PlannerInput, TemplateSpec
-from src.agents.planner import PlannerAgent
+from src.agents.planner import DEFAULT_ENABLED_PLANNER_VALIDATORS, PlannerAgent
 from src.agents.text_agent import DEFAULT_ENABLED_VALIDATORS, TextAgent
 from src.agents.image_agent import ImageAgent
 from src.agents.latex_integrator import LatexIntegratorAgent
@@ -178,7 +178,8 @@ class DocGenPipeline:
                  image_model: str,
                  integrator_model: str,
                  output_dir: str = "outputs/generations",
-                 text_agent_enabled_validators: Optional[Dict[str, bool]] = None):
+                 text_agent_enabled_validators: Optional[Dict[str, bool]] = None,
+                 planner_enabled_validators: Optional[Dict[str, bool]] = None):
 
         # 'none' disables image generation entirely for this run: no image
         # model is loaded, and the planner is instructed (and validated) to
@@ -195,7 +196,10 @@ class DocGenPipeline:
 
         clients = {}
         agents = {
-            'planner_agent': PlannerAgent(llm_client=get_client(clients, planner_model)),
+            'planner_agent': PlannerAgent(
+                llm_client=get_client(clients, planner_model),
+                enabled_validators=planner_enabled_validators,
+            ),
             'text_agent': TextAgent(
                 llm_client=get_client(clients, text_model),
                 enabled_validators=text_agent_enabled_validators,
@@ -406,6 +410,20 @@ def main():
             f"Codes: {', '.join(sorted(DEFAULT_ENABLED_VALIDATORS))}"
         ),
     )
+    parser.add_argument(
+        "--disable-planner-validator",
+        action="append",
+        choices=sorted(DEFAULT_ENABLED_PLANNER_VALIDATORS),
+        metavar="CODE",
+        help=(
+            "Turn off one Planner content-quality verifier by code, for "
+            "verifier ablation experiments (repeatable). Referential-integrity "
+            "checks (duplicate/unknown ids, empty section blocks, orphan "
+            "figures, figure slot mismatches, ...) are never disabled -- the "
+            "composer cannot build a document without them holding. "
+            f"Codes: {', '.join(sorted(DEFAULT_ENABLED_PLANNER_VALIDATORS))}"
+        ),
+    )
     args = parser.parse_args()
 
     out_dir = args.out_dir
@@ -422,6 +440,12 @@ def main():
     if text_agent_enabled_validators:
         print(f"[Pipeline] TextAgent verifiers disabled for this run: {sorted(text_agent_enabled_validators)}")
 
+    planner_enabled_validators = (
+        {code: False for code in args.disable_planner_validator} if args.disable_planner_validator else None
+    )
+    if planner_enabled_validators:
+        print(f"[Pipeline] Planner verifiers disabled for this run: {sorted(planner_enabled_validators)}")
+
     pipeline = DocGenPipeline(
         planner_model=args.planner_model,
         text_model=args.text_model,
@@ -429,6 +453,7 @@ def main():
         integrator_model=args.integrator_model,
         output_dir=out_dir,
         text_agent_enabled_validators=text_agent_enabled_validators,
+        planner_enabled_validators=planner_enabled_validators,
     )
 
     if args.dataset:
