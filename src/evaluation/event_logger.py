@@ -29,6 +29,14 @@ class EventLogger:
         self.recovery_events: List[RecoveryEvent] = []
         self.compile_result: Optional[CompileResult] = None
         self._failure_counter = 0
+        self._sequence_counter = 0
+
+    def _next_sequence_id(self) -> int:
+        """Globally monotonic across verification *and* recovery events for
+        this run -- see VerificationEvent's docstring for why this exists
+        (attempt numbering alone resets across outer-loop re-dispatches)."""
+        self._sequence_counter += 1
+        return self._sequence_counter
 
     def new_failure_id(self) -> str:
         """Mint a fresh join key for a failure that has a recovery mechanism.
@@ -60,6 +68,7 @@ class EventLogger:
         artifact_id: Optional[str] = None,
         section_id: Optional[str] = None,
         block_id: Optional[str] = None,
+        outer_iteration: Optional[int] = None,
         signal_type: Optional[str] = None,
         message: Optional[str] = None,
         producer_model: Optional[str] = None,
@@ -73,6 +82,8 @@ class EventLogger:
             section_id=section_id,
             block_id=block_id,
             attempt=attempt,
+            outer_iteration=outer_iteration,
+            sequence_id=self._next_sequence_id(),
             result=result,
             signal_type=signal_type,
             message=message,
@@ -92,6 +103,7 @@ class EventLogger:
         attempt: int,
         success: bool,
         artifact_id: Optional[str] = None,
+        outer_iteration: Optional[int] = None,
         resulting_artifact_id: Optional[str] = None,
     ) -> RecoveryEvent:
         event = RecoveryEvent(
@@ -101,6 +113,8 @@ class EventLogger:
             artifact_id=artifact_id,
             recovery_action=recovery_action,
             attempt=attempt,
+            outer_iteration=outer_iteration,
+            sequence_id=self._next_sequence_id(),
             success=success,
             resulting_artifact_id=resulting_artifact_id,
         )
@@ -128,6 +142,10 @@ class AttemptTracker:
     top of each agent's own inner retry) -- that would need a second,
     node-id-keyed tracker living at the ``DocGenPipeline.run()`` level, which
     is out of scope for this pass (see the plan's design decisions).
+    ``attempt`` still resets to 1 on every outer re-dispatch, so
+    ``outer_iteration`` (recorded per event, see ``EventLogger``) plus the
+    globally-monotonic ``sequence_id`` are what keep events collision-free
+    end to end, not ``attempt`` alone.
 
     Pairing semantics: a ``RecoveryEvent`` represents one real retry
     attempt's outcome relative to the failure that triggered it. When a
@@ -150,6 +168,7 @@ class AttemptTracker:
         section_id: Optional[str] = None,
         block_id: Optional[str] = None,
         producer_model: Optional[str] = None,
+        outer_iteration: Optional[int] = None,
     ) -> None:
         self._logger = event_logger
         self._stage = stage
@@ -159,6 +178,7 @@ class AttemptTracker:
         self._section_id = section_id
         self._block_id = block_id
         self._producer_model = producer_model
+        self._outer_iteration = outer_iteration
         self._pending_failure_id: Optional[str] = None
 
     def record_failure(self, attempt: int, signal_type: str, message: str) -> None:
@@ -172,6 +192,7 @@ class AttemptTracker:
             section_id=self._section_id,
             block_id=self._block_id,
             attempt=attempt,
+            outer_iteration=self._outer_iteration,
             result="fail",
             signal_type=signal_type,
             message=message,
@@ -184,6 +205,7 @@ class AttemptTracker:
                 stage=self._stage,
                 recovery_action=self._recovery_action,
                 attempt=attempt,
+                outer_iteration=self._outer_iteration,
                 success=False,
                 artifact_id=self._artifact_id,
             )
@@ -201,6 +223,7 @@ class AttemptTracker:
             section_id=self._section_id,
             block_id=self._block_id,
             attempt=attempt,
+            outer_iteration=self._outer_iteration,
             result="pass",
             producer_model=self._producer_model,
         )
@@ -210,6 +233,7 @@ class AttemptTracker:
                 stage=self._stage,
                 recovery_action=self._recovery_action,
                 attempt=attempt,
+                outer_iteration=self._outer_iteration,
                 success=True,
                 artifact_id=self._artifact_id,
                 resulting_artifact_id=resulting_artifact_id,

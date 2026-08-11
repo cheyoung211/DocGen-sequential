@@ -293,11 +293,13 @@ class DocGenPipeline:
                         self.text_agent.process_node(
                             node.id, graph, request_id, output_dir=str(self.output_base),
                             event_logger=event_logger, usage_sink=token_usage_records,
+                            outer_iteration=i + 1,
                         )
                     elif node.type == NodeType.FIGURE:
                         self.image_agent.process_figure_node(
                             node.id, graph, request_id, output_dir=str(self.output_base),
                             event_logger=event_logger, usage_sink=token_usage_records,
+                            outer_iteration=i + 1,
                         )
                     # Tables are handled inside TextAgent via tools
 

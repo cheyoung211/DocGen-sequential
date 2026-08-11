@@ -235,6 +235,7 @@ class TextAgent:
         max_attempts: int = 3,
         event_logger: Optional[EventLogger] = None,
         usage_sink: Optional[list] = None,
+        outer_iteration: Optional[int] = None,
     ) -> Optional[TextAgentOutput]:
         """Generate and persist semantic blocks for one section node.
 
@@ -270,6 +271,7 @@ class TextAgent:
             artifact_id=node_id,
             section_id=node_id,
             producer_model=self.llm.model_name,
+            outer_iteration=outer_iteration,
         )
         last_error: Optional[str] = None
         for attempt in range(1, max_attempts + 1):

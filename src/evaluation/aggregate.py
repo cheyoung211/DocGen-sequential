@@ -134,10 +134,21 @@ def aggregate_batch(
         compile_results.append(compile_result)
 
         benchmark_item = benchmark_items.get(sample_id)
-        if run_result is not None and run_result.contract_result is not None:
-            contract_result: Optional[ContractResult] = run_result.contract_result
-        elif benchmark_item is not None:
-            contract_result = evaluate_contract(sample_dir, benchmark_item)
+        if benchmark_item is not None:
+            # Always recompute from what's on disk rather than trusting a
+            # value already embedded in run_result.json: evaluate_contract
+            # is a pure, cheap, local read (no LLM/network call), and a
+            # stored contract_result may have been produced by an older
+            # version of the matching/scoring logic -- re-running this
+            # aggregator (--eval-only) after an evaluation-layer code change
+            # is an explicitly supported workflow (see run_evaluation.sh),
+            # which only actually works if this always reflects current code.
+            contract_result: Optional[ContractResult] = evaluate_contract(sample_dir, benchmark_item)
+        elif run_result is not None and run_result.contract_result is not None:
+            # No benchmark item resolvable (e.g. --benchmark omitted, or a
+            # legacy/unmatched sample_id) -- fall back to whatever was
+            # embedded at generation time rather than reporting nothing.
+            contract_result = run_result.contract_result
         else:
             contract_result = None
         if contract_result is not None:

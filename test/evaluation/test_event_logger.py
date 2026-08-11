@@ -42,6 +42,41 @@ class EventLoggerTest(unittest.TestCase):
         )
         self.assertEqual(logger.total_recovery_attempts, 1)
 
+    def test_sequence_id_is_globally_monotonic_across_verification_and_recovery_events(self) -> None:
+        """Guards the outer-loop provenance gap: attempt alone resets to 1 on
+        every re-dispatch, so (stage, verifier, artifact_id, attempt) can
+        legitimately repeat within one run -- sequence_id must not."""
+        logger = EventLogger(run_id="run_001")
+        v1 = logger.log_verification(stage="text_agent", verifier="v", result="fail", attempt=1)
+        r1 = logger.log_recovery(
+            failure_id="f1", stage="text_agent", recovery_action="retry_with_feedback",
+            attempt=1, success=False,
+        )
+        v2 = logger.log_verification(stage="text_agent", verifier="v", result="pass", attempt=1)
+        ids = [v1.sequence_id, r1.sequence_id, v2.sequence_id]
+        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(len(set(ids)), 3)
+
+    def test_outer_iteration_distinguishes_events_that_share_the_same_attempt_number(self) -> None:
+        """Simulates run_full_pipeline.py's outer Phase-2 loop re-dispatching
+        the same node: a fresh AttemptTracker per outer iteration means
+        attempt resets to 1 each time, so outer_iteration is what keeps the
+        raw event stream unambiguous."""
+        logger = EventLogger(run_id="run_001")
+        for outer_iter in (1, 2):
+            tracker = AttemptTracker(
+                logger, stage="text_agent", verifier="text_semantic_block_validator",
+                recovery_action="retry_with_feedback", artifact_id="sec_prerequisites",
+                outer_iteration=outer_iter,
+            )
+            tracker.record_failure(1, "content_validation_error", "bad")
+            tracker.record_exhausted()
+
+        events = [e for e in logger.verification_events if e.artifact_id == "sec_prerequisites"]
+        self.assertEqual([e.attempt for e in events], [1, 1])
+        self.assertEqual([e.outer_iteration for e in events], [1, 2])
+        self.assertEqual(len({e.sequence_id for e in events}), 2)
+
 
 class AttemptTrackerTest(unittest.TestCase):
     def _tracker(self, logger: EventLogger) -> AttemptTracker:

@@ -188,5 +188,216 @@ class EvaluateContractTest(unittest.TestCase):
         self.assertEqual(result.details["notation"], [])
 
 
+def _write_generated_output_with_section(
+    project_dir: Path, *, generated_section_id: str, generated_title: str, block_content: str
+) -> None:
+    """Like ``_write_generated_output`` but with a caller-chosen generated
+    section_id/title, so the three required_sections matching tiers
+    (section_id / normalized title / keyword overlap) can be exercised
+    independently."""
+    blueprint = DocumentBlueprint(
+        document=DocumentSpec(kind=DocumentKind.ARTICLE, title="Convergence"),
+        document_class="article",
+        sections=[
+            SectionLayout(
+                section_id=generated_section_id,
+                title=generated_title,
+                blocks=[LayoutBlock(id="def1", kind=LayoutBlockKind.DEFINITION)],
+            ),
+        ],
+    )
+    from src.common.schemas import PlannerOutput
+
+    plan = PlannerOutput(
+        request_id="test-run",
+        nodes_to_create=[{"id": generated_section_id, "type": "SECTION", "title": generated_title}],
+        hierarchy_edges=[],
+        global_context="",
+        blueprint=blueprint,
+    )
+    (project_dir / "plan.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+
+    sections_dir = project_dir / "sections"
+    sections_dir.mkdir(parents=True)
+    output = TextAgentOutput(
+        request_id="test-run",
+        section_id=generated_section_id,
+        blocks=[ContentBlock(block_id="def1", type=SemanticBlockType.DEFINITION, content=block_content)],
+    )
+    (sections_dir / f"{generated_section_id}.blocks.json").write_text(
+        output.model_dump_json(indent=2), encoding="utf-8"
+    )
+
+
+def _write_generated_output_with_sections(
+    project_dir: Path, sections: "list[tuple[str, str, str]]"
+) -> None:
+    """``sections`` is a list of (section_id, title, block_content) triples,
+    all drafted. Used for topic-word-collision regression coverage, where a
+    single generated section isn't enough to exercise cross-matching."""
+    layouts = [
+        SectionLayout(
+            section_id=sid, title=title,
+            blocks=[LayoutBlock(id=f"{sid}_def", kind=LayoutBlockKind.DEFINITION)],
+        )
+        for sid, title, _ in sections
+    ]
+    blueprint = DocumentBlueprint(
+        document=DocumentSpec(kind=DocumentKind.ARTICLE, title="Topic"),
+        document_class="article",
+        sections=layouts,
+    )
+    from src.common.schemas import PlannerOutput
+
+    plan = PlannerOutput(
+        request_id="test-run",
+        nodes_to_create=[{"id": sid, "type": "SECTION", "title": title} for sid, title, _ in sections],
+        hierarchy_edges=[],
+        global_context="",
+        blueprint=blueprint,
+    )
+    (project_dir / "plan.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+
+    sections_dir = project_dir / "sections"
+    sections_dir.mkdir(parents=True)
+    for sid, _, content in sections:
+        output = TextAgentOutput(
+            request_id="test-run", section_id=sid,
+            blocks=[ContentBlock(block_id=f"{sid}_def", type=SemanticBlockType.DEFINITION, content=content)],
+        )
+        (sections_dir / f"{sid}.blocks.json").write_text(output.model_dump_json(indent=2), encoding="utf-8")
+
+
+class RequiredSectionMatchingTest(unittest.TestCase):
+    """Covers the section_id / title / keyword-overlap matching tiers and
+    the required_points evidence scoring introduced to replace exact-title
+    matching (which the benchmark schema never actually mandated)."""
+
+    def _item_with_required_points(self) -> BenchmarkItem:
+        item = _benchmark_item()
+        item.required_sections = [
+            RequiredSection(
+                section_id="introduction", title="Introduction",
+                purpose="Motivate convergence of real sequences and outline the document structure.",
+                required_points=[
+                    "State why convergence of real sequences matters.",
+                    "Outline the structure of the remaining sections.",
+                ],
+                target_words=50,
+            ),
+        ]
+        return item
+
+    def test_section_id_tier_matches_even_with_a_different_title(self) -> None:
+        item = self._item_with_required_points()
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            _write_generated_output_with_section(
+                project_dir, generated_section_id="introduction",
+                generated_title="Something Else Entirely",
+                block_content="Convergence of real sequences matters because it underlies analysis. "
+                              "This document's structure proceeds section by section.",
+            )
+            result = evaluate_contract(project_dir, item)
+        detail = result.details["required_sections"][0]
+        self.assertEqual(detail.matched_via, "section_id")
+        self.assertEqual(detail.status, "satisfied")
+        self.assertAlmostEqual(result.required_sections, 1.0)
+
+    def test_keyword_overlap_tier_matches_an_elaborated_title(self) -> None:
+        """Reproduces the live-validation case: the Planner elaborates
+        "Introduction" into a longer title that shares no section_id and no
+        normalized-title equality with the requirement, but does share real
+        keywords with the requirement's own stated purpose."""
+        item = self._item_with_required_points()
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            _write_generated_output_with_section(
+                project_dir, generated_section_id="sec_0001",
+                generated_title="Motivation and Structure of Convergence of Real Sequences",
+                block_content="Convergence of real sequences matters because it underlies analysis. "
+                              "This document's structure proceeds section by section.",
+            )
+            result = evaluate_contract(project_dir, item)
+        detail = result.details["required_sections"][0]
+        self.assertEqual(detail.matched_via, "keyword_overlap")
+        self.assertEqual(detail.status, "satisfied")
+
+    def test_partially_satisfied_when_only_some_required_points_are_evidenced(self) -> None:
+        item = self._item_with_required_points()
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            _write_generated_output_with_section(
+                project_dir, generated_section_id="introduction", generated_title="Introduction",
+                # Covers the first required_point's keywords, not the second's.
+                block_content="Convergence of real sequences matters a great deal in analysis.",
+            )
+            result = evaluate_contract(project_dir, item)
+        detail = result.details["required_sections"][0]
+        self.assertEqual(detail.status, "partially_satisfied")
+        self.assertAlmostEqual(detail.required_points_coverage, 0.5)
+        self.assertAlmostEqual(result.required_sections, 0.5)
+
+    def test_shared_document_topic_words_do_not_cause_cross_matching(self) -> None:
+        """Regression for a real bug hit during live validation: every
+        required section's purpose restates the document's own topic (e.g.
+        "... Basic Set Operations and Venn Diagrams"), and the Planner
+        echoes that same topic phrase in every generated section's title
+        too -- so unweighted keyword overlap let "Prerequisites and
+        Notation" out-score-match onto a generated "Synthesis of ..."
+        section instead of the real "Prerequisites and Notation for ..."
+        one, purely on shared topic words. Topic words must be down-weighted
+        enough that the genuinely distinguishing words win."""
+        item = _benchmark_item()
+        item.title = "Basic Set Operations and Venn Diagrams"
+        item.required_sections = [
+            RequiredSection(
+                section_id="introduction", title="Introduction",
+                purpose="Motivate Basic Set Operations and Venn Diagrams and outline the structure.",
+                target_words=50,
+            ),
+            RequiredSection(
+                section_id="prerequisites_and_notation", title="Prerequisites and Notation",
+                purpose="Establish prerequisite background and fix the notation used throughout "
+                        "the discussion of Basic Set Operations and Venn Diagrams.",
+                target_words=50,
+            ),
+            RequiredSection(
+                section_id="summary", title="Summary",
+                purpose="Synthesize the document and restate the central conclusions about "
+                        "Basic Set Operations and Venn Diagrams.",
+                target_words=50,
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            _write_generated_output_with_sections(project_dir, [
+                ("sec_introduction", "Motivation for Basic Set Operations and Venn Diagrams", "..."),
+                ("sec_prerequisites", "Prerequisites and Notation for Set Operations", "..."),
+                ("sec_summary", "Synthesis of Basic Set Operations and Venn Diagrams", "..."),
+            ])
+            result = evaluate_contract(project_dir, item)
+        matched = {d.item_id: d.reason for d in result.details["required_sections"]}
+        self.assertIn("sec_introduction", matched["introduction"])
+        self.assertIn("sec_prerequisites", matched["prerequisites_and_notation"])
+        self.assertIn("sec_summary", matched["summary"])
+
+    def test_two_required_sections_do_not_both_claim_the_same_generated_section(self) -> None:
+        item = _benchmark_item()  # required_sections: introduction, conclusion (no required_points)
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp)
+            # Only one generated section exists, matchable by title to
+            # "Introduction" -- "Conclusion" must not also claim it via the
+            # keyword-overlap tier.
+            _write_generated_output_with_section(
+                project_dir, generated_section_id="sec_intro", generated_title="Introduction",
+                block_content="Some content.",
+            )
+            result = evaluate_contract(project_dir, item)
+        statuses = {d.item_id: d.status for d in result.details["required_sections"]}
+        self.assertEqual(statuses["introduction"], "satisfied")
+        self.assertEqual(statuses["conclusion"], "missing")
+
+
 if __name__ == "__main__":
     unittest.main()

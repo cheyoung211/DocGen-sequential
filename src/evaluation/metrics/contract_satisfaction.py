@@ -6,27 +6,58 @@ objective coverage) and ``cross_section_dependency`` (logical dependency
 between sections) are semantic checks the research spec explicitly permits
 deferring -- they are never attempted here; see ``ContractResult``.
 
-Required Section Coverage matches on normalized *title* text, not
-``section_id``: the Planner is never shown ``RequiredSection.section_id``
-(only the section title, embedded in prose inside
-``natural_language_instruction`` -- confirmed by grepping the whole
-generation pipeline for any reference to the benchmark's ids), and a real
-generated ``plan.json`` shows the Planner inventing its own ``sec_``-prefixed
-ids independent of the benchmark's scheme. This under-counts a section whose
-title the model paraphrased despite being given the exact string -- a known,
-accepted recall limitation for this deterministic-only pass.
+Required Section Coverage matching is NOT an exact-title hard constraint --
+the benchmark schema (``src/dataset/schemas.py``) never says matching must be
+by exact title; that was this module's own earlier implementation choice.
+Matching now tries three tiers, in priority order, per required section:
+
+1. ``section_id`` equality against the generated blueprint's own section ids
+   (structurally correct, but rarely fires today -- confirmed by grepping
+   the whole generation pipeline that the Planner is never shown
+   ``RequiredSection.section_id``, only the title and ``purpose``, embedded
+   in prose inside ``natural_language_instruction``; a real generated
+   ``plan.json`` shows the Planner inventing its own ``sec_``-prefixed ids
+   independent of the benchmark's scheme).
+2. Normalized-title equality (casefold + whitespace-collapse).
+3. Keyword overlap between the required section's ``title``/``purpose`` and
+   a still-unclaimed generated section's title -- catches the common case a
+   pure title match misses, where the Planner elaborates a required title
+   into a longer one (observed live: "Introduction" -> "Motivation and
+   Structure of Convergence of Real Sequences") but the elaboration still
+   shares real keywords with the required section's own stated purpose.
+   Every required section's ``purpose`` also restates the *document's own
+   topic* (e.g. every section of a "Basic Set Operations and Venn Diagrams"
+   document has that phrase in its purpose text, and the Planner echoes it
+   in every generated section title too) -- counting those topic words at
+   full weight let two unrelated sections outscore the real match on shared
+   topic vocabulary alone (caught live: "Prerequisites and Notation"
+   matched to a generated "Synthesis of ..." section over the real
+   "Prerequisites and Notation for ..." one). Keywords drawn from
+   ``benchmark_item.title`` are therefore down-weighted, not excluded, so
+   they can still break a tie when nothing else distinguishes two
+   candidates.
+
+Once a required section is matched and drafted, its status is no longer
+existence-only: ``required_points`` (deterministic keyword-evidence search
+over that section's drafted text, not an LLM judgment) decides between
+``satisfied`` (every point evidenced) and ``partially_satisfied`` (some/none
+evidenced). This is still a lexical, not semantic, check -- true meaning-
+level content coverage remains out of scope here (``content_coverage`` stays
+``None``/``not_implemented``; see ``ContractResult``) and is deferred to a
+future semantic-evaluation pass.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 from src.common.schemas import PlannerOutput, TextAgentOutput
-from src.common.state import DocumentBlueprint, LayoutBlockKind
-from src.dataset.schemas import BenchmarkItem, ComponentType
-from src.evaluation.schemas import ContractCategoryDetail, ContractResult
+from src.common.state import DocumentBlueprint, LayoutBlockKind, SectionLayout
+from src.dataset.schemas import BenchmarkItem, ComponentType, RequiredSection
+from src.evaluation.schemas import ContractCategoryDetail, ContractItemStatus, ContractResult
 
 # Built from the Planner's own documented kind vocabulary
 # (PLANNER_STRATEGY_PROMPT's "kind vocabulary" section in
@@ -68,6 +99,30 @@ def _normalize_title(title: str) -> str:
     return " ".join(title.split()).casefold()
 
 
+# Small, fixed stopword list for the keyword-overlap match tier and the
+# required_points evidence check -- deliberately not a general-purpose NLP
+# stopword list, just enough to strip connective/instructional words
+# ("state", "present", "outline", ...) that would otherwise inflate overlap
+# scores between any two unrelated sections' purpose text.
+_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "that", "this", "these", "those", "into", "your", "each", "every",
+    "any", "all", "its", "their", "other", "also", "using", "used", "use",
+    "as", "is", "are", "was", "were", "be", "by", "from", "at", "if",
+    "then", "state", "states", "present", "presents", "describe",
+    "describes", "explain", "explains", "outline", "outlines", "discuss",
+    "discusses", "include", "includes", "reference", "references",
+    "restate", "restates", "establish", "establishes", "provide",
+    "provides", "introduce", "introduces", "show", "shows", "list", "lists",
+    "document", "section", "sections",
+})
+
+
+def _keywords(text: str) -> Set[str]:
+    words = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", text.casefold())
+    return {w for w in words if w not in _STOPWORDS and len(w) >= 4}
+
+
 def _drafted_section_ids(project_dir: Path, blueprint: DocumentBlueprint) -> set:
     sections_dir = project_dir / "sections"
     return {
@@ -75,6 +130,91 @@ def _drafted_section_ids(project_dir: Path, blueprint: DocumentBlueprint) -> set
         for section in blueprint.sections
         if (sections_dir / f"{section.section_id}.blocks.json").is_file()
     }
+
+
+def _section_text(project_dir: Path, section: SectionLayout) -> str:
+    """Rendered LaTeX when compilation reached this section, else the
+    persisted semantic blocks -- whichever the run actually produced.
+    Single-section counterpart to ``_collect_document_text``, used by the
+    required_points evidence check."""
+    sections_dir = project_dir / "sections"
+    tex_path = sections_dir / f"{section.section_id}.tex"
+    if tex_path.is_file():
+        return tex_path.read_text(encoding="utf-8", errors="replace")
+    blocks_path = sections_dir / f"{section.section_id}.blocks.json"
+    if not blocks_path.is_file():
+        return ""
+    try:
+        output = TextAgentOutput.model_validate(
+            json.loads(blocks_path.read_text(encoding="utf-8"))
+        )
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    parts = [section.title]
+    for block in output.blocks:
+        if block.title:
+            parts.append(block.title)
+        parts.append(block.content)
+    return "\n".join(parts)
+
+
+def _point_is_evidenced(point: str, haystack_casefold: str) -> bool:
+    """Deterministic, lexical stand-in for "was this required point covered"
+    -- not a semantic judgment. A point with no extractable keywords (all
+    stopwords/short words) can't be meaningfully checked this way, so it
+    counts as evidenced rather than silently failing every such point."""
+    point_keywords = _keywords(point)
+    if not point_keywords:
+        return True
+    hits = sum(1 for kw in point_keywords if kw in haystack_casefold)
+    return hits >= max(1, len(point_keywords) // 2)
+
+
+#: Weight given to a shared keyword that's also part of the document's own
+#: topic title (see the module docstring's tier-3 explanation) -- low enough
+#: that any genuinely distinguishing shared word wins, but non-zero so topic
+#: words can still break a tie when nothing else does.
+_TOPIC_KEYWORD_WEIGHT = 0.2
+
+
+def _match_required_section(
+    req: RequiredSection,
+    blueprint: DocumentBlueprint,
+    claimed_ids: Set[str],
+    topic_keywords: Set[str],
+) -> "tuple[Optional[SectionLayout], str]":
+    """Resolve which generated section (if any) corresponds to one required
+    section, trying section_id, then normalized title, then purpose/title
+    keyword overlap -- see this module's docstring for why in that order."""
+    by_id = {s.section_id: s for s in blueprint.sections}
+    candidate = by_id.get(req.section_id)
+    if candidate is not None and candidate.section_id not in claimed_ids:
+        return candidate, "section_id"
+
+    normalized_req_title = _normalize_title(req.title)
+    for section in blueprint.sections:
+        if section.section_id in claimed_ids:
+            continue
+        if _normalize_title(section.title) == normalized_req_title:
+            return section, "title"
+
+    req_keywords = _keywords(req.title) | _keywords(req.purpose)
+    if req_keywords:
+        best: Optional[SectionLayout] = None
+        best_score = 0.0
+        for section in blueprint.sections:
+            if section.section_id in claimed_ids:
+                continue
+            shared = req_keywords & _keywords(section.title)
+            score = sum(
+                _TOPIC_KEYWORD_WEIGHT if kw in topic_keywords else 1.0 for kw in shared
+            )
+            if score > best_score:
+                best, best_score = section, score
+        if best is not None:
+            return best, "keyword_overlap"
+
+    return None, "unmatched"
 
 
 def _collect_document_text(project_dir: Path, blueprint: DocumentBlueprint) -> str:
@@ -106,29 +246,58 @@ def _collect_document_text(project_dir: Path, blueprint: DocumentBlueprint) -> s
 def _score_required_sections(
     project_dir: Path, blueprint: DocumentBlueprint, benchmark_item: BenchmarkItem
 ) -> "tuple[Optional[float], List[ContractCategoryDetail]]":
-    generated_by_title = {_normalize_title(s.title): s for s in blueprint.sections}
     drafted_ids = _drafted_section_ids(project_dir, blueprint)
+    topic_keywords = _keywords(benchmark_item.title)
 
     details: List[ContractCategoryDetail] = []
-    satisfied = 0
+    scores: List[float] = []
+    claimed_ids: Set[str] = set()
     for req in benchmark_item.required_sections:
-        matched = generated_by_title.get(_normalize_title(req.title))
+        matched, matched_via = _match_required_section(req, blueprint, claimed_ids, topic_keywords)
+
         if matched is None:
             details.append(ContractCategoryDetail(
                 item_id=req.section_id, status="missing",
-                reason=f"no generated section titled {req.title!r}",
+                reason=(
+                    f"no generated section corresponds to {req.title!r} "
+                    "(checked section_id, normalized title, and purpose-keyword overlap)"
+                ),
+                matched_via="unmatched",
             ))
-        elif matched.section_id not in drafted_ids:
+            scores.append(0.0)
+            continue
+
+        claimed_ids.add(matched.section_id)
+        if matched.section_id not in drafted_ids:
             details.append(ContractCategoryDetail(
                 item_id=req.section_id, status="missing",
-                reason=f"section {matched.section_id!r} was planned but never drafted",
+                reason=f"matched generated section {matched.section_id!r} (via {matched_via}) "
+                       "was planned but never drafted",
+                matched_via=matched_via,
             ))
+            scores.append(0.0)
+            continue
+
+        if req.required_points:
+            haystack = _section_text(project_dir, matched).casefold()
+            evidenced = sum(1 for p in req.required_points if _point_is_evidenced(p, haystack))
+            points_coverage = evidenced / len(req.required_points)
+            points_note = f"{evidenced}/{len(req.required_points)} required_points evidenced"
         else:
-            satisfied += 1
-            details.append(ContractCategoryDetail(item_id=req.section_id, status="satisfied"))
+            points_coverage = 1.0
+            points_note = "no required_points to verify"
+
+        status: ContractItemStatus = "satisfied" if points_coverage >= 1.0 else "partially_satisfied"
+        scores.append(points_coverage)
+        details.append(ContractCategoryDetail(
+            item_id=req.section_id, status=status,
+            reason=f"matched generated section {matched.section_id!r} via {matched_via}; {points_note}",
+            matched_via=matched_via,
+            required_points_coverage=points_coverage,
+        ))
 
     total = len(benchmark_item.required_sections)
-    score = (satisfied / total) if total else None
+    score = (sum(scores) / total) if total else None
     return score, details
 
 

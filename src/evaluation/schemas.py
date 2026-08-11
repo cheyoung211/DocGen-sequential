@@ -60,6 +60,19 @@ class VerificationEvent(BaseModel):
     recovery mechanism at all (``None`` for image_agent/compile, which have
     none), not a per-event choice -- see ``EventLogger.new_failure_id`` and
     ``AttemptTracker``.
+
+    ``sequence_id`` and ``outer_iteration`` close a real provenance gap:
+    within one inner retry loop, ``attempt`` is monotonic, but
+    ``run_full_pipeline.py``'s *outer* Phase-2 loop re-dispatches a node with
+    a brand-new inner loop on every iteration, so ``attempt`` alone resets to
+    1 each time -- the same ``(run_id, stage, verifier, artifact_id,
+    attempt)`` tuple can legitimately repeat across outer iterations.
+    ``sequence_id`` is assigned by ``EventLogger`` itself, globally monotonic
+    across every verification *and* recovery event for one run, so call
+    order is always unambiguous and collision-free even when ``attempt``
+    resets; ``outer_iteration`` additionally records *which* Phase-2 pass
+    produced this event where that concept applies (``None`` for
+    planner/composer/compile, which only ever run once per run).
     """
 
     run_id: str
@@ -69,6 +82,8 @@ class VerificationEvent(BaseModel):
     section_id: Optional[str] = None
     block_id: Optional[str] = None
     attempt: int
+    outer_iteration: Optional[int] = None
+    sequence_id: Optional[int] = None
     result: VerificationResultValue
     signal_type: Optional[str] = None
     message: Optional[str] = None
@@ -95,6 +110,8 @@ class RecoveryEvent(BaseModel):
     artifact_id: Optional[str] = None
     recovery_action: str
     attempt: int
+    outer_iteration: Optional[int] = None
+    sequence_id: Optional[int] = None
     success: bool
     resulting_artifact_id: Optional[str] = None
 
@@ -120,7 +137,9 @@ class CompileResult(BaseModel):
     pdf_exists: bool = False
 
 
-ContractItemStatus = Literal["satisfied", "missing", "not_representable", "not_applicable"]
+ContractItemStatus = Literal[
+    "satisfied", "partially_satisfied", "missing", "not_representable", "not_applicable"
+]
 
 
 class ContractCategoryDetail(BaseModel):
@@ -132,11 +151,18 @@ class ContractCategoryDetail(BaseModel):
     score alone can't distinguish a component that was actually missing from
     one that was never representable in this pipeline's current block-kind
     vocabulary (see ``metrics/contract_satisfaction.py``'s mapping table).
+
+    ``matched_via``/``required_points_coverage`` are populated only for
+    ``required_sections`` items -- see that check's docstring in
+    ``metrics/contract_satisfaction.py`` for why a required section's status
+    now depends on more than bare existence.
     """
 
     item_id: str
     status: ContractItemStatus
     reason: Optional[str] = None
+    matched_via: Optional[str] = None
+    required_points_coverage: Optional[float] = None
 
 
 class ContractResult(BaseModel):

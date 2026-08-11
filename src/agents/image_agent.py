@@ -57,6 +57,7 @@ class ImageAgent:
         output_dir: str = ASSET_OUTPUT_DIR,
         event_logger: Optional[EventLogger] = None,
         usage_sink: Optional[list] = None,
+        outer_iteration: Optional[int] = None,
     ) -> Optional[Dict[str, str]]:
         node = graph.nodes.get(node_id)
         if not node or node.type != NodeType.FIGURE:
@@ -134,6 +135,7 @@ class ImageAgent:
                     artifact_id=node_id,
                     section_id=placement.owner_section if placement else None,
                     attempt=1,
+                    outer_iteration=outer_iteration,
                     result="pass",
                     producer_model=getattr(self.llm, "model_name", None),
                 )
@@ -156,6 +158,7 @@ class ImageAgent:
                     artifact_id=node_id,
                     section_id=placement.owner_section if placement else None,
                     attempt=1,
+                    outer_iteration=outer_iteration,
                     result="fail",
                     signal_type=_classify_generation_error(exc),
                     message=str(exc),
