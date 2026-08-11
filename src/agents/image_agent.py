@@ -11,6 +11,19 @@ import os
 from typing import Any, Dict, Optional
 
 from src.common.state import DocumentGraph, NodeStatus, NodeType
+from src.evaluation.event_logger import EventLogger
+
+
+def _classify_generation_error(exc: Exception) -> str:
+    """Map a process_figure_node() exception to a small, stable signal_type
+    vocabulary for the evaluation layer's Verification Trigger Rate."""
+    if isinstance(exc, json.JSONDecodeError):
+        return "json_parse_error"
+    if isinstance(exc, ValueError):
+        # Covers the missing-image_prompt raise and a duplicate-asset-path
+        # raise from graph.register_figure_asset.
+        return "content_validation_error"
+    return "image_generation_error"
 
 
 IMAGE_STRATEGY_PROMPT = """
@@ -42,6 +55,8 @@ class ImageAgent:
         graph: DocumentGraph,
         request_id: str,
         output_dir: str = ASSET_OUTPUT_DIR,
+        event_logger: Optional[EventLogger] = None,
+        usage_sink: Optional[list] = None,
     ) -> Optional[Dict[str, str]]:
         node = graph.nodes.get(node_id)
         if not node or node.type != NodeType.FIGURE:
@@ -78,6 +93,7 @@ class ImageAgent:
                 system_prompt=IMAGE_STRATEGY_PROMPT,
                 user_prompt=user_context,
                 temperature=0.2,
+                usage_sink=usage_sink,
             )
             strategy = json.loads(self.llm.extract_json_block(raw_response))
             image_prompt = strategy.get("image_prompt")
@@ -111,6 +127,16 @@ class ImageAgent:
                 NodeStatus.DRAFTED,
                 content=json.dumps(metadata, ensure_ascii=False),
             )
+            if event_logger is not None:
+                event_logger.log_verification(
+                    stage="image_agent",
+                    verifier="image_asset_validator",
+                    artifact_id=node_id,
+                    section_id=placement.owner_section if placement else None,
+                    attempt=1,
+                    result="pass",
+                    producer_model=getattr(self.llm, "model_name", None),
+                )
             print(f"[ImageAgent] Registered asset: {relative_path}")
             return metadata
         except Exception as exc:
@@ -119,5 +145,21 @@ class ImageAgent:
                 NodeStatus.ERROR,
                 error=str(exc),
             )
+            if event_logger is not None:
+                # failure_id is intentionally omitted: process_figure_node has
+                # no inner retry loop, so this stage has no recovery
+                # mechanism -- this failure correctly lands in Metric 2's
+                # "detected failure without recovery path" bucket.
+                event_logger.log_verification(
+                    stage="image_agent",
+                    verifier="image_asset_validator",
+                    artifact_id=node_id,
+                    section_id=placement.owner_section if placement else None,
+                    attempt=1,
+                    result="fail",
+                    signal_type=_classify_generation_error(exc),
+                    message=str(exc),
+                    producer_model=getattr(self.llm, "model_name", None),
+                )
             print(f"[ImageAgent] Image generation failed for {node_id}: {exc}")
             return None

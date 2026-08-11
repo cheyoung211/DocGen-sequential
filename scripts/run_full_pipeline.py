@@ -4,7 +4,7 @@ import time
 import sys
 import traceback
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from tqdm import tqdm
@@ -19,6 +19,10 @@ from src.agents.planner import PlannerAgent
 from src.agents.text_agent import TextAgent
 from src.agents.image_agent import ImageAgent
 from src.agents.latex_integrator import LatexIntegratorAgent
+from src.dataset.schemas import BenchmarkItem
+from src.evaluation.event_logger import EventLogger
+from src.evaluation.metrics.contract_satisfaction import evaluate_contract
+from src.evaluation.schemas import RunResult, TokenUsage
 from llm_client import DEFAULT_MODEL, LLMClient
 from src.helpers.image_generator_sdxl import SDXLGenerator
 from src.helpers.image_generator_flux import FluxGenerator
@@ -46,12 +50,71 @@ def build_user_query(item: Dict[str, Any]) -> str:
         f"Instruction: {instruction}",
     ])
 
+def _build_run_result(
+    *,
+    request_id: str,
+    status: str,
+    error: Optional[BaseException],
+    event_logger: EventLogger,
+    start_time: Optional[float],
+    token_usage_records: Optional[List[dict]],
+    benchmark_item: Optional[BenchmarkItem],
+    producer_models: Optional[Dict[str, str]],
+    project_dir: Path,
+) -> RunResult:
+    """Assemble the full evaluation-layer RunResult for one request.
+
+    contract_result is computed best-effort even on a failure path: a
+    partially-drafted document (e.g. only 2 of 5 sections got that far
+    before a later one hit content_generation_error) is still informative
+    for Metric 7, and evaluate_contract() degrades to a null-filled result
+    on its own if plan.json never got written at all.
+    """
+    compile_result = event_logger.compile_result
+    contract_result = evaluate_contract(project_dir, benchmark_item) if benchmark_item else None
+
+    token_usage = None
+    if token_usage_records:
+        token_usage = TokenUsage(
+            total_input_tokens=sum(r.get("input_tokens", 0) for r in token_usage_records),
+            total_output_tokens=sum(r.get("output_tokens", 0) for r in token_usage_records),
+            total_tokens=sum(r.get("total_tokens", 0) for r in token_usage_records),
+            call_count=len(token_usage_records),
+        )
+
+    return RunResult(
+        run_id=request_id,
+        benchmark_id=benchmark_item.sample_id if benchmark_item else None,
+        producer_model=(producer_models or {}).get("text", "unknown"),
+        producer_models=producer_models or {},
+        completed=(status == "success"),
+        status=status,
+        error_type=type(error).__name__ if error is not None else None,
+        error_message=str(error) if error is not None else None,
+        compile_success=bool(compile_result and compile_result.compile_success),
+        compile_result=compile_result,
+        verification_events=event_logger.verification_events,
+        recovery_events=event_logger.recovery_events,
+        contract_result=contract_result,
+        total_generation_attempts=event_logger.total_generation_attempts,
+        total_recovery_attempts=event_logger.total_recovery_attempts,
+        token_usage=token_usage,
+        elapsed_time=(time.perf_counter() - start_time) if start_time is not None else None,
+    )
+
+
 def _write_run_log(
     project_dir: Path,
     request_id: str,
     status: str,
     error: Optional[BaseException] = None,
     compile_log_path: Optional[Path] = None,
+    *,
+    event_logger: Optional[EventLogger] = None,
+    start_time: Optional[float] = None,
+    token_usage_records: Optional[List[dict]] = None,
+    benchmark_item: Optional[BenchmarkItem] = None,
+    producer_models: Optional[Dict[str, str]] = None,
 ) -> None:
     """Persist one request's outcome to ``<project_dir>/run_result.json``.
 
@@ -62,7 +125,32 @@ def _write_run_log(
     compile failure (pdflatex/tectonic ran and failed; compile.log exists
     and its content is embedded here rather than left as a separate file a
     batch summary would otherwise have to go find and open itself).
+
+    When ``event_logger`` is supplied, the file's top-level shape becomes a
+    full evaluation-layer ``RunResult`` instead (so ``src/evaluation/
+    aggregate.py`` can parse it directly) -- assembly is wrapped in its own
+    try/except so a bug in this new instrumentation can never prevent the
+    base outcome record from being written, or break an otherwise-successful
+    run. With no new keyword arguments passed (today's only call shape),
+    this function's output is unchanged.
     """
+    if event_logger is not None:
+        try:
+            run_result = _build_run_result(
+                request_id=request_id, status=status, error=error, event_logger=event_logger,
+                start_time=start_time, token_usage_records=token_usage_records,
+                benchmark_item=benchmark_item, producer_models=producer_models,
+                project_dir=project_dir,
+            )
+            project_dir.mkdir(parents=True, exist_ok=True)
+            (project_dir / "run_result.json").write_text(
+                run_result.model_dump_json(indent=2), encoding="utf-8"
+            )
+            return
+        except Exception as exc:
+            print(f"[Pipeline] Warning: evaluation-layer RunResult assembly failed, "
+                  f"falling back to the legacy run_result.json shape: {exc}")
+
     record: Dict[str, Any] = {
         "request_id": request_id,
         "status": status,
@@ -96,6 +184,14 @@ class DocGenPipeline:
         # never create a FIGURE node, so ImageAgent is never invoked.
         self.images_enabled = image_model != 'none'
 
+        # Retained for RunResult.producer_models -- this pipeline allows 4
+        # independently-chosen models per run, so a single flat model-name
+        # string would lose real information for a mixed-model run.
+        self.planner_model = planner_model
+        self.text_model = text_model
+        self.image_model = image_model
+        self.integrator_model = integrator_model
+
         clients = {}
         agents = {
             'planner_agent': PlannerAgent(llm_client=get_client(clients, planner_model)),
@@ -118,11 +214,39 @@ class DocGenPipeline:
 
         self.output_base = Path(output_dir)
 
-    def run(self, user_query: str, request_id: str, iterations: int, template_name: str = "default"):
+    def run(
+        self,
+        user_query: str,
+        request_id: str,
+        iterations: int,
+        template_name: str = "default",
+        benchmark_item: Optional[BenchmarkItem] = None,
+    ):
         project_dir = self.output_base / request_id
         project_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n>>> Starting Pipeline for Request: {request_id}")
+
+        start_time = time.perf_counter()
+        event_logger = EventLogger(run_id=request_id)
+        token_usage_records: List[dict] = []
+        producer_models = {
+            "planner": self.planner_model,
+            "text": self.text_model,
+            "image": self.image_model,
+            "integrator": self.integrator_model,
+        }
+
+        def _write_log(
+            status: str,
+            error: Optional[BaseException] = None,
+            compile_log_path: Optional[Path] = None,
+        ) -> None:
+            _write_run_log(
+                project_dir, request_id, status=status, error=error, compile_log_path=compile_log_path,
+                event_logger=event_logger, start_time=start_time, token_usage_records=token_usage_records,
+                benchmark_item=benchmark_item, producer_models=producer_models,
+            )
 
         # 1. Initialize Shared Document Graph via Planner
         graph = DocumentGraph()
@@ -135,7 +259,9 @@ class DocGenPipeline:
             )
 
             print("[Pipeline] Phase 1: Planning Document Structure...")
-            plan = self.planner.generate_plan(planner_in)
+            plan = self.planner.generate_plan(
+                planner_in, event_logger=event_logger, usage_sink=token_usage_records
+            )
             with open(project_dir / "plan.json", "w") as f:
                 f.write(plan.model_dump_json(indent=2))
 
@@ -164,9 +290,15 @@ class DocGenPipeline:
 
                 for node in pending_nodes:
                     if node.type in [NodeType.SECTION, NodeType.SUBSECTION]:
-                        self.text_agent.process_node(node.id, graph, request_id, output_dir=str(self.output_base))
+                        self.text_agent.process_node(
+                            node.id, graph, request_id, output_dir=str(self.output_base),
+                            event_logger=event_logger, usage_sink=token_usage_records,
+                        )
                     elif node.type == NodeType.FIGURE:
-                        self.image_agent.process_figure_node(node.id, graph, request_id, output_dir=str(self.output_base))
+                        self.image_agent.process_figure_node(
+                            node.id, graph, request_id, output_dir=str(self.output_base),
+                            event_logger=event_logger, usage_sink=token_usage_records,
+                        )
                     # Tables are handled inside TextAgent via tools
 
             # Phase 3 reads each SECTION/SUBSECTION's persisted blocks.json and each
@@ -193,30 +325,29 @@ class DocGenPipeline:
                     f"iteration(s), cannot start LaTeX integration: {details}"
                 )
         except Exception as exc:
-            _write_run_log(project_dir, request_id, status="content_generation_error", error=exc)
+            _write_log("content_generation_error", error=exc)
             raise
 
         # 3. Integration & Self-Correcting Compilation
         print("[Pipeline] Phase 3: Integrating Assets and Compiling...")
         try:
             # success = self.integrator.integrate_and_compile(graph, str(project_dir))
-            success = self.integrator.integrate(request_id, graph, output_dir=str(self.output_base))
+            success = self.integrator.integrate(
+                request_id, graph, output_dir=str(self.output_base), event_logger=event_logger
+            )
         except Exception as exc:
             # Raised by LatexIntegratorAgent.integrate() itself (blueprint
             # assembly / pre-compile validation) -- before pdflatex ever
             # runs, so no compile.log exists yet to attach.
-            _write_run_log(project_dir, request_id, status="integration_error", error=exc)
+            _write_log("integration_error", error=exc)
             raise
 
         if success:
             print(f">>> Success! Final PDF located in: {project_dir}")
-            _write_run_log(project_dir, request_id, status="success")
+            _write_log("success")
         else:
             print(">>> Pipeline finished with compilation warnings/errors.")
-            _write_run_log(
-                project_dir, request_id, status="compile_error",
-                compile_log_path=project_dir / "compile.log",
-            )
+            _write_log("compile_error", compile_log_path=project_dir / "compile.log")
 
 def run_batch(pipeline: DocGenPipeline, dataset_path: str, iterations: int):
     with open(dataset_path, "r", encoding="utf-8") as f:
@@ -228,10 +359,18 @@ def run_batch(pipeline: DocGenPipeline, dataset_path: str, iterations: int):
         group = item.get("sample_id") or item.get("stress_factor", "unknown")
         request_id = f"{group}/sample_{index:03d}"
         try:
+            benchmark_item = BenchmarkItem.model_validate(item)
+        except Exception:
+            # Legacy WikiHow-schema rows (or any dict not shaped like the
+            # current BenchmarkItem contract) degrade to no contract
+            # checking rather than crashing the batch.
+            benchmark_item = None
+        try:
             pipeline.run(
                 user_query=build_user_query(item),
                 request_id=request_id,
                 iterations=iterations,
+                benchmark_item=benchmark_item,
             )
         except Exception as exc:
             print(f"[Batch] Error at index {index} ({request_id}): {exc}")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional, Type
+from typing import List, Optional, Type
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -176,15 +176,27 @@ class LLMClient:
         temperature: float = 0.3,
         top_p: float = 0.9,
         max_new_tokens: Optional[int] = None,
+        usage_sink: Optional[List[dict]] = None,
     ) -> str:
-        """Generate text while retaining the old local-client method shape."""
+        """Generate text while retaining the old local-client method shape.
+
+        ``usage_sink``, when supplied, gets one normalized
+        ``{"input_tokens", "output_tokens", "total_tokens"}`` dict appended
+        per call -- best-effort only (see ``_record_openai_usage``/
+        ``_record_gemini_usage``), never changes this method's return type
+        or raises on its own.
+        """
         target_max_tokens = max_new_tokens or self.max_new_tokens
         if target_max_tokens <= 0:
             raise ValueError("max_new_tokens must be greater than zero.")
 
         if self.provider == "gemini":
-            return self._generate_gemini(system_prompt, user_prompt, temperature, top_p, target_max_tokens)
-        return self._generate_openai(system_prompt, user_prompt, temperature, top_p, target_max_tokens)
+            return self._generate_gemini(
+                system_prompt, user_prompt, temperature, top_p, target_max_tokens, usage_sink
+            )
+        return self._generate_openai(
+            system_prompt, user_prompt, temperature, top_p, target_max_tokens, usage_sink
+        )
 
     def supports_structured_output(self) -> bool:
         """Whether ``generate_structured`` has a native implementation for this provider.
@@ -207,6 +219,7 @@ class LLMClient:
         temperature: float = 0.3,
         top_p: float = 0.9,
         max_new_tokens: Optional[int] = None,
+        usage_sink: Optional[List[dict]] = None,
     ) -> str:
         """Generate text that is guaranteed (by the provider) to validate against ``response_model``.
 
@@ -228,10 +241,10 @@ class LLMClient:
 
         if self.provider == "gemini":
             return self._generate_gemini_structured(
-                system_prompt, user_prompt, response_model, temperature, top_p, target_max_tokens
+                system_prompt, user_prompt, response_model, temperature, top_p, target_max_tokens, usage_sink
             )
         return self._generate_openai_structured(
-            system_prompt, user_prompt, response_model, schema_name, temperature, top_p, target_max_tokens
+            system_prompt, user_prompt, response_model, schema_name, temperature, top_p, target_max_tokens, usage_sink
         )
 
     def _generate_openai_structured(
@@ -243,6 +256,7 @@ class LLMClient:
         temperature: float,
         top_p: float,
         target_max_tokens: int,
+        usage_sink: Optional[List[dict]] = None,
     ) -> str:
         response = self._create_openai_response({
             "model": self.model_name,
@@ -261,6 +275,7 @@ class LLMClient:
                 }
             },
         })
+        self._record_openai_usage(response, usage_sink)
         return self._text_from_openai_response(response)
 
     def _generate_gemini_structured(
@@ -271,6 +286,7 @@ class LLMClient:
         temperature: float,
         top_p: float,
         target_max_tokens: int,
+        usage_sink: Optional[List[dict]] = None,
     ) -> str:
         from google.genai import types
         from google.genai.errors import APIError
@@ -295,6 +311,7 @@ class LLMClient:
         except APIError as exc:
             raise RuntimeError(f"Gemini API returned an error: {exc}") from exc
 
+        self._record_gemini_usage(response, usage_sink)
         text = (response.text or "").strip()
         if not text:
             raise RuntimeError("Gemini returned no text output for this request.")
@@ -346,8 +363,53 @@ class LLMClient:
             raise RuntimeError("OpenAI returned no text output for this request.")
         return text
 
+    @staticmethod
+    def _record_openai_usage(response, usage_sink: Optional[List[dict]]) -> None:
+        """Best-effort token-usage capture; never raises on its own.
+
+        The OpenAI Responses API exposes ``response.usage.{input_tokens,
+        output_tokens,total_tokens}`` -- if the SDK ever renames/omits any of
+        these, this degrades to silently skipping the append rather than
+        breaking generation.
+        """
+        if usage_sink is None:
+            return
+        try:
+            usage = response.usage
+            usage_sink.append({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+            })
+        except AttributeError:
+            pass
+
+    @staticmethod
+    def _record_gemini_usage(response, usage_sink: Optional[List[dict]]) -> None:
+        """Best-effort token-usage capture; never raises on its own (see
+        ``_record_openai_usage``). Gemini exposes usage on
+        ``response.usage_metadata.{prompt_token_count,candidates_token_count,
+        total_token_count}``."""
+        if usage_sink is None:
+            return
+        try:
+            usage = response.usage_metadata
+            usage_sink.append({
+                "input_tokens": usage.prompt_token_count,
+                "output_tokens": usage.candidates_token_count,
+                "total_tokens": usage.total_token_count,
+            })
+        except AttributeError:
+            pass
+
     def _generate_openai(
-        self, system_prompt: str, user_prompt: str, temperature: float, top_p: float, target_max_tokens: int
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        top_p: float,
+        target_max_tokens: int,
+        usage_sink: Optional[List[dict]] = None,
     ) -> str:
         response = self._create_openai_response({
             "model": self.model_name,
@@ -359,10 +421,17 @@ class LLMClient:
             # Do not retain generated documents as server-side API state.
             "store": False,
         })
+        self._record_openai_usage(response, usage_sink)
         return self._text_from_openai_response(response)
 
     def _generate_gemini(
-        self, system_prompt: str, user_prompt: str, temperature: float, top_p: float, target_max_tokens: int
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        top_p: float,
+        target_max_tokens: int,
+        usage_sink: Optional[List[dict]] = None,
     ) -> str:
         from google.genai import types
         from google.genai.errors import APIError
@@ -385,6 +454,7 @@ class LLMClient:
         except APIError as exc:
             raise RuntimeError(f"Gemini API returned an error: {exc}") from exc
 
+        self._record_gemini_usage(response, usage_sink)
         text = (response.text or "").strip()
         if not text:
             raise RuntimeError("Gemini returned no text output for this request.")

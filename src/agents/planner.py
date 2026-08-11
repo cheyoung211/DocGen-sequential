@@ -3,7 +3,7 @@ import json
 import re
 from typing import Dict, List, Literal, Optional, TypeAlias
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from src.agents.latex_integrator import (
     KNOWN_SECTION_LEVELS,
@@ -12,6 +12,7 @@ from src.agents.latex_integrator import (
 )
 from src.common.schemas import PlannerInput, PlannerOutput
 from src.common.state import DocumentKind, DocumentBlueprint, LayoutBlockKind, NodeType, SAFE_IDENTIFIER
+from src.evaluation.event_logger import AttemptTracker, EventLogger
 from src.helpers.tools import get_all_tool_schemas
 from scripts.llm_client import LLMClient
 
@@ -326,6 +327,21 @@ def _sanitize_plan_identifiers(plan_data: dict) -> dict:
 
     return plan_data
 
+
+def _classify_generation_error(exc: Exception) -> str:
+    """Map a generate_plan() retry-loop exception to a small, stable signal_type
+    vocabulary for the evaluation layer's Verification Trigger Rate."""
+    if isinstance(exc, json.JSONDecodeError):
+        return "json_parse_error"
+    if isinstance(exc, ValidationError):
+        return "schema_validation_error"
+    if isinstance(exc, ValueError):
+        # Covers _validate_blueprint's own raises (duplicate IDs, orphan
+        # figures, invalid anchors, ...) -- the dominant failure mode here.
+        return "blueprint_validation_error"
+    return "generation_error"
+
+
 PLANNER_STRATEGY_PROMPT = """
 You are the Lead Document Architect. Your goal is to design both a hierarchical Document Graph and a LaTeX DocumentBlueprint.
 
@@ -501,7 +517,13 @@ class PlannerAgent:
         # Fetch tool definitions to inform the LLM of available capabilities
         self.available_tools = get_all_tool_schemas()
 
-    def generate_plan(self, planner_input: PlannerInput, max_attempts: int = 3) -> PlannerOutput:
+    def generate_plan(
+        self,
+        planner_input: PlannerInput,
+        max_attempts: int = 3,
+        event_logger: Optional[EventLogger] = None,
+        usage_sink: Optional[list] = None,
+    ) -> PlannerOutput:
         """
         Communicates with the LLM to design the document structure.
 
@@ -535,6 +557,13 @@ class PlannerAgent:
         if not use_structured:
             system_prompt += PLANNER_LEGACY_OUTPUT_FORMAT_PROMPT
 
+        tracker = AttemptTracker(
+            event_logger,
+            stage="planner",
+            verifier="planner_blueprint_validator",
+            recovery_action="retry_with_feedback",
+            producer_model=self.llm.model_name,
+        )
         last_error: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -549,6 +578,7 @@ class PlannerAgent:
                         schema_name="planner_output",
                         temperature=0.2,
                         max_new_tokens=12000,
+                        usage_sink=usage_sink,
                     )
                     plan_data = _wire_output_to_plan_data(json.loads(raw_response))
                 else:
@@ -557,6 +587,7 @@ class PlannerAgent:
                         user_prompt=user_prompt,
                         temperature=0.2, ##### 원래 0.2 정도; Low temperature for structural consistency
                         max_new_tokens=12000,
+                        usage_sink=usage_sink,
                     )
                     json_block = self.llm.extract_json_block(raw_response)
                     plan_data = json.loads(json_block)
@@ -566,11 +597,14 @@ class PlannerAgent:
                 if plan.request_id is None:
                     plan.request_id = planner_input.request_id
                 self._validate_blueprint(plan, allow_figures=planner_input.allow_figures)
+                tracker.record_success(attempt)
                 return plan
             except Exception as exc:
                 last_error = exc
+                tracker.record_failure(attempt, _classify_generation_error(exc), str(exc))
                 print(f"[PlannerAgent] Attempt {attempt}/{max_attempts} failed: {exc}")
 
+        tracker.record_exhausted()
         raise ValueError(
             f"PlannerAgent failed to produce a valid plan after {max_attempts} attempts: {last_error}"
         ) from last_error

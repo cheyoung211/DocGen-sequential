@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from pydantic import ValidationError
+
 from scripts.llm_client import LLMClient
 from src.agents.latex_integrator import (
     validate_fragment_environments,
@@ -20,7 +22,24 @@ from src.common.schemas import (
     ToolResponse,
 )
 from src.common.state import DocumentGraph, LayoutBlock, LayoutBlockKind, NodeStatus
+from src.evaluation.event_logger import AttemptTracker, EventLogger
 from src.helpers.tools import pandas_csv_to_latex_table
+
+
+def _classify_generation_error(exc: Exception) -> str:
+    """Map a process_node() retry-loop exception to a small, stable signal_type
+    vocabulary for the evaluation layer's Verification Trigger Rate."""
+    if isinstance(exc, json.JSONDecodeError):
+        return "json_parse_error"
+    if isinstance(exc, ValidationError):
+        return "schema_validation_error"
+    if isinstance(exc, ValueError):
+        # Covers _validate_semantic_blocks' own raises (id/type mismatch,
+        # empty content, ...) and the LaTeX fragment validators it calls
+        # (validate_fragment_environments/validate_no_manual_labels/
+        # validate_markdown_table_columns) -- the dominant failure mode here.
+        return "content_validation_error"
+    return "generation_error"
 
 SYSTEM_PROMPT = r"""
 You are a senior technical writer in a blueprint-driven LaTeX document system.
@@ -214,6 +233,8 @@ class TextAgent:
         request_id: str,
         output_dir: str = "outputs/generations",
         max_attempts: int = 3,
+        event_logger: Optional[EventLogger] = None,
+        usage_sink: Optional[list] = None,
     ) -> Optional[TextAgentOutput]:
         """Generate and persist semantic blocks for one section node.
 
@@ -241,6 +262,15 @@ class TextAgent:
         sections_dir.mkdir(parents=True, exist_ok=True)
         graph.update_node_status(node_id, NodeStatus.RUNNING)
 
+        tracker = AttemptTracker(
+            event_logger,
+            stage="text_agent",
+            verifier="text_semantic_block_validator",
+            recovery_action="retry_with_feedback",
+            artifact_id=node_id,
+            section_id=node_id,
+            producer_model=self.llm.model_name,
+        )
         last_error: Optional[str] = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -251,6 +281,7 @@ class TextAgent:
                     ),
                     temperature=0.3,
                     max_new_tokens=4096,
+                    usage_sink=usage_sink,
                 )
                 data = json.loads(self.llm.extract_json_block(raw_response))
                 blocks = self._validate_semantic_blocks(data.get("content_blocks"), layout_blocks)
@@ -266,12 +297,15 @@ class TextAgent:
 
                 draft_content = self._render_draft_with_anchors(blocks)
                 graph.update_node_status(node_id, NodeStatus.DRAFTED, content=draft_content)
+                tracker.record_success(attempt, resulting_artifact_id=f"{node_id}.blocks.json")
                 print(f"[TextAgent] Saved semantic blocks for section: {node_id}")
                 return output
             except Exception as exc:
                 last_error = str(exc)
+                tracker.record_failure(attempt, _classify_generation_error(exc), str(exc))
                 print(f"[TextAgent] Attempt {attempt}/{max_attempts} failed for '{node_id}': {exc}")
 
+        tracker.record_exhausted()
         graph.update_node_status(node_id, NodeStatus.ERROR, error=last_error)
         print(f"[TextAgent] Semantic block generation failed for '{node_id}' after {max_attempts} attempts: {last_error}")
         return None
