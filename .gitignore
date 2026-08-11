@@ -4,6 +4,8 @@ __pycache__/
 *.pdf
 .pytest_cache/
 dataset/
+dataset2/
 data/
 outputs/
 .git.bak/
+evaluation/foundation_metrics/

@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--dataset", default="data/benchmark/benchmark_v1.jsonl", help="Path to the benchmark JSONL.")
     parser.add_argument("--sample-id", default=None, help="sample_id to run (default: first item in the file).")
     parser.add_argument("--out-dir", default="outputs/single_item_check", help="Where to write the generated document.")
-    parser.add_argument("--image-model", default="flux", choices=["sdxl", "flux"])
+    parser.add_argument("--image-model", default="none", choices=["sdxl", "flux", "none"])
     parser.add_argument("--iterations", type=int, default=5, help="Max text-agent iterations (see DocGenPipeline.run).")
     parser.add_argument(
         "--keep-previous-run", action="store_true",

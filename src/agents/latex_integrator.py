@@ -24,6 +24,9 @@ from src.common.state import (
     SectionLayout,
     default_block_label,
 )
+from src.evaluation.compile_log_parser import parse_compile_log
+from src.evaluation.event_logger import EventLogger
+from src.evaluation.schemas import CompileResult
 
 
 SAFE_PACKAGES = {
@@ -364,6 +367,52 @@ KNOWN_LAYOUT_POLICY_KEYS = {
 CHAPTERLESS_DOCUMENT_CLASSES_WITHOUT_DOWNGRADE = {"scrartcl"}
 
 
+def _classify_composer_semantic_error(exc: Exception) -> str:
+    """Map a _read_semantic_blocks() exception to a small, stable signal_type
+    vocabulary. Covers both "the artifact isn't there / isn't parseable" and
+    "the artifact's content doesn't match the blueprint contract" -- the
+    composer's own independent re-check of what TextAgent already validated
+    once, since a JSON artifact can outlive the process that wrote it."""
+    if isinstance(exc, FileNotFoundError):
+        return "missing_semantic_artifact"
+    if isinstance(exc, ValueError):
+        return "invalid_semantic_artifact"
+    return "composer_semantic_check_error"
+
+
+def _log_list_check(
+    event_logger: Optional[EventLogger],
+    *,
+    verifier: str,
+    errors: List[str],
+    artifact_id: Optional[str],
+    signal_type: str,
+) -> None:
+    """Log one pass/fail VerificationEvent for a composer check that returns a
+    list of violation strings (empty list = pass). All of this module's
+    validate_* methods return that shape."""
+    if event_logger is None:
+        return
+    if errors:
+        event_logger.log_verification(
+            stage="composer",
+            verifier=verifier,
+            artifact_id=artifact_id,
+            attempt=1,
+            result="fail",
+            signal_type=signal_type,
+            message="; ".join(errors),
+        )
+    else:
+        event_logger.log_verification(
+            stage="composer",
+            verifier=verifier,
+            artifact_id=artifact_id,
+            attempt=1,
+            result="pass",
+        )
+
+
 class LatexIntegratorAgent:
     """Compose a document only from its registered blueprint and assets."""
 
@@ -374,7 +423,13 @@ class LatexIntegratorAgent:
         self.engine = engine
         self.runs = runs
 
-    def integrate(self, request_id: str, graph: DocumentGraph, output_dir: str = "outputs/generations") -> bool:
+    def integrate(
+        self,
+        request_id: str,
+        graph: DocumentGraph,
+        output_dir: str = "outputs/generations",
+        event_logger: Optional[EventLogger] = None,
+    ) -> bool:
         """Write a complete LaTeX project and compile it when an engine exists."""
         if graph.blueprint is None:
             raise ValueError("Latex integration requires a DocumentBlueprint on the graph.")
@@ -384,6 +439,10 @@ class LatexIntegratorAgent:
         # Layout policy is decided entirely by the blueprint, independent of any
         # section content, so it can be checked before doing any file I/O.
         layout_errors = self.validate_layout_policy(blueprint)
+        _log_list_check(
+            event_logger, verifier="layout_policy_validator", errors=layout_errors,
+            artifact_id=request_id, signal_type="layout_policy_violation",
+        )
         if layout_errors:
             raise ValueError("Layout policy validation failed:\n- " + "\n- ".join(layout_errors))
 
@@ -397,6 +456,10 @@ class LatexIntegratorAgent:
             for figure_id, entry in graph.figure_registry.items()
             if entry.required and not entry.asset_path
         ]
+        _log_list_check(
+            event_logger, verifier="figure_asset_completeness_validator", errors=missing_assets,
+            artifact_id=request_id, signal_type="missing_figure_asset",
+        )
         if missing_assets:
             raise ValueError(
                 "Cannot compose document: required figure assets are missing: "
@@ -417,6 +480,7 @@ class LatexIntegratorAgent:
                 blueprint,
                 graph,
                 sections_dir,
+                event_logger=event_logger,
             )
             rendered_sections[section_layout.section_id] = rendered_section
             (sections_dir / f"{section_layout.section_id}.tex").write_text(
@@ -429,16 +493,28 @@ class LatexIntegratorAgent:
         # Final pass over the fully assembled project, immediately before
         # compilation: figure bookkeeping vs. actual rendered content, dangling
         # cross-references, and the overall document frame's structural health.
-        validation_errors: List[str] = []
-        validation_errors += self.validate_figure_single_use(graph, rendered_sections)
-        validation_errors += self.validate_references(rendered_sections)
-        validation_errors += self.validate_document_frame(base_dir, blueprint)
+        figure_use_errors = self.validate_figure_single_use(graph, rendered_sections)
+        _log_list_check(
+            event_logger, verifier="figure_single_use_validator", errors=figure_use_errors,
+            artifact_id=request_id, signal_type="figure_single_use_violation",
+        )
+        reference_errors = self.validate_references(rendered_sections)
+        _log_list_check(
+            event_logger, verifier="reference_validator", errors=reference_errors,
+            artifact_id=request_id, signal_type="undefined_reference",
+        )
+        frame_errors = self.validate_document_frame(base_dir, blueprint)
+        _log_list_check(
+            event_logger, verifier="document_frame_validator", errors=frame_errors,
+            artifact_id=request_id, signal_type="document_frame_incomplete",
+        )
+        validation_errors: List[str] = figure_use_errors + reference_errors + frame_errors
         if validation_errors:
             raise ValueError(
                 "Pre-compile validation failed:\n- " + "\n- ".join(validation_errors)
             )
 
-        return self.compile_pdf(request_id, output_dir)
+        return self.compile_pdf(request_id, output_dir, event_logger=event_logger)
 
     def validate_layout_policy(self, blueprint: DocumentBlueprint) -> List[str]:
         """Confirm the blueprint's layout policy and section levels are renderable.
@@ -631,12 +707,36 @@ class LatexIntegratorAgent:
         blueprint: DocumentBlueprint,
         graph: DocumentGraph,
         sections_dir: Path,
+        event_logger: Optional[EventLogger] = None,
     ) -> str:
         node = graph.nodes.get(layout.section_id)
         if node is None:
             raise ValueError(f"Blueprint refers to unknown section '{layout.section_id}'.")
 
-        semantic_blocks = self._read_semantic_blocks(sections_dir, layout)
+        try:
+            semantic_blocks = self._read_semantic_blocks(sections_dir, layout)
+        except Exception as exc:
+            if event_logger is not None:
+                event_logger.log_verification(
+                    stage="composer",
+                    verifier="composer_semantic_block_validator",
+                    artifact_id=layout.section_id,
+                    section_id=layout.section_id,
+                    attempt=1,
+                    result="fail",
+                    signal_type=_classify_composer_semantic_error(exc),
+                    message=str(exc),
+                )
+            raise
+        if event_logger is not None:
+            event_logger.log_verification(
+                stage="composer",
+                verifier="composer_semantic_block_validator",
+                artifact_id=layout.section_id,
+                section_id=layout.section_id,
+                attempt=1,
+                result="pass",
+            )
         figure_after = self._figures_by_anchor(layout.section_id, blueprint)
         rendered: List[str] = [self._render_section_heading(layout, blueprint)]
 
@@ -1396,16 +1496,80 @@ class LatexIntegratorAgent:
             return pdflatex, ["-interaction=nonstopmode", "-halt-on-error"]
         return None, []
 
-    def compile_pdf(self, request_id: str, output_dir: str = "outputs/generations") -> bool:
+    def _finalize_compile_result(
+        self,
+        event_logger: Optional[EventLogger],
+        base_dir: Path,
+        *,
+        compile_success: bool,
+        engine: Optional[str],
+        return_code: Optional[int],
+        log_text: str,
+        first_error_type_override: Optional[str] = None,
+    ) -> None:
+        """Build, persist (``compile_result.json``), and log one CompileResult --
+        the single place every compile_pdf() return point converges through.
+        A no-op when no event_logger is supplied, so a caller that never
+        passes one (for example ``single_llm.py``'s direct ``compile_pdf``
+        call) sees no new files and no behavior change.
+        """
+        if event_logger is None:
+            return
+        if engine:
+            fatal_error_count, warning_count, first_error_type = parse_compile_log(log_text, engine)
+        else:
+            fatal_error_count, warning_count, first_error_type = 0, 0, None
+        first_error_type = first_error_type_override or first_error_type
+        result = CompileResult(
+            compile_success=compile_success,
+            engine=engine,
+            return_code=return_code,
+            fatal_error_count=fatal_error_count,
+            warning_count=warning_count,
+            first_error_type=first_error_type,
+            pdf_exists=(base_dir / "main.pdf").exists(),
+        )
+        event_logger.compile_result = result
+        try:
+            base_dir.mkdir(parents=True, exist_ok=True)
+            (base_dir / "compile_result.json").write_text(
+                result.model_dump_json(indent=2), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        event_logger.log_verification(
+            stage="compile",
+            verifier="latex_compiler",
+            artifact_id=base_dir.name,
+            attempt=1,
+            result="pass" if compile_success else "fail",
+            signal_type=None if compile_success else first_error_type,
+            message=None if compile_success else (log_text[-2000:] or first_error_type_override),
+        )
+
+    def compile_pdf(
+        self,
+        request_id: str,
+        output_dir: str = "outputs/generations",
+        event_logger: Optional[EventLogger] = None,
+    ) -> bool:
         base_dir = Path(output_dir) / request_id
         main_tex_path = base_dir / "main.tex"
         if not main_tex_path.exists():
             print(f"[Integrator Error] main.tex not found at {main_tex_path}")
+            self._finalize_compile_result(
+                event_logger, base_dir, compile_success=False, engine=None, return_code=None,
+                log_text="", first_error_type_override="main_tex_missing",
+            )
             return False
 
         engine_bin, mode_args = self._resolve_engine()
         if engine_bin is None:
             print("[Integrator Error] No LaTeX engine found (tried configured engine, tectonic, pdflatex).")
+            self._finalize_compile_result(
+                event_logger, base_dir, compile_success=False, engine=None, return_code=None,
+                log_text="", first_error_type_override="no_latex_engine_found",
+            )
             return False
 
         engine_name = Path(engine_bin).name
@@ -1422,5 +1586,16 @@ class LatexIntegratorAgent:
                 )
                 if result.returncode != 0:
                     print(f"[Integrator Warning] Compilation failed. Check {log_path}.")
+                    self._finalize_compile_result(
+                        event_logger, base_dir, compile_success=False, engine=engine_name,
+                        return_code=result.returncode,
+                        log_text=log_path.read_text(encoding="utf-8", errors="replace"),
+                    )
                     return False
-        return (base_dir / "main.pdf").exists()
+        pdf_exists = (base_dir / "main.pdf").exists()
+        self._finalize_compile_result(
+            event_logger, base_dir, compile_success=pdf_exists, engine=engine_name,
+            return_code=result.returncode,
+            log_text=log_path.read_text(encoding="utf-8", errors="replace"),
+        )
+        return pdf_exists

@@ -3,7 +3,7 @@ import json
 import re
 from typing import Dict, List, Literal, Optional, TypeAlias
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from src.agents.latex_integrator import (
     KNOWN_SECTION_LEVELS,
@@ -12,6 +12,7 @@ from src.agents.latex_integrator import (
 )
 from src.common.schemas import PlannerInput, PlannerOutput
 from src.common.state import DocumentKind, DocumentBlueprint, LayoutBlockKind, NodeType, SAFE_IDENTIFIER
+from src.evaluation.event_logger import AttemptTracker, EventLogger
 from src.helpers.tools import get_all_tool_schemas
 from scripts.llm_client import LLMClient
 
@@ -326,6 +327,35 @@ def _sanitize_plan_identifiers(plan_data: dict) -> dict:
 
     return plan_data
 
+
+def _classify_generation_error(exc: Exception) -> str:
+    """Map a generate_plan() retry-loop exception to a small, stable signal_type
+    vocabulary for the evaluation layer's Verification Trigger Rate."""
+    if isinstance(exc, json.JSONDecodeError):
+        return "json_parse_error"
+    if isinstance(exc, ValidationError):
+        return "schema_validation_error"
+    if isinstance(exc, ValueError):
+        # Covers _validate_blueprint's own raises (duplicate IDs, orphan
+        # figures, invalid anchors, ...) -- the dominant failure mode here.
+        return "blueprint_validation_error"
+    return "generation_error"
+
+
+# Content-quality verifiers only, mirroring TextAgent.DEFAULT_ENABLED_VALIDATORS
+# -- referential-integrity checks (duplicate/unknown ids, orphan figures,
+# empty section blocks, figure slot mismatches, ...) always run regardless,
+# since the composer literally cannot build a document without them holding;
+# disabling one of those would break the pipeline rather than test a
+# verifier's actual contribution. These two are the only checks in
+# _validate_blueprint that are about output quality rather than structural
+# composability, so they're what a verifier ablation run would toggle.
+DEFAULT_ENABLED_PLANNER_VALIDATORS: Dict[str, bool] = {
+    "plain_title": True,
+    "leading_section_number": True,
+}
+
+
 PLANNER_STRATEGY_PROMPT = """
 You are the Lead Document Architect. Your goal is to design both a hierarchical Document Graph and a LaTeX DocumentBlueprint.
 
@@ -385,14 +415,6 @@ You are the Lead Document Architect. Your goal is to design both a hierarchical 
        callout" or generic "callout" -> `warning`; "aligned equations" or a
        "derivation" -> `equation` (write a complete `align`/`aligned`
        environment as the block's content); a "figure placeholder" -> `figure`.
-
-### Critical Depth Rule:
-- For a professional report, aim for at least 5-8 distinct nodes.
-- Do NOT create a single large 'Introduction' node. Instead, break it into:
-  1. Historical Background
-  2. Current Market/Technical Status
-  3. Scope of this Report
-- If the user query is complex, favor creating SUBSECTION nodes under SECTION nodes.
 
 ### Available Tools:
 {tool_schemas}
@@ -482,18 +504,54 @@ blueprint is REQUIRED -- never return nodes_to_create/hierarchy_edges/global_con
 Return ONLY valid JSON. No commentary.
 """
 
+# Appended only when PlannerInput.allow_figures is False (no image-generation
+# model available for this run). Overrides every FIGURE-related instruction
+# in PLANNER_STRATEGY_PROMPT above -- content that would have been a figure
+# must be re-expressed as a non-visual block instead of simply omitted, so
+# the document doesn't lose the information the figure would have carried.
+PLANNER_NO_IMAGES_PROMPT = """
+### Image Generation Is Disabled For This Run
+No image-generation model is available. Regardless of anything said above:
+- Do not create any `FIGURE` node or any `asset_nodes` entry.
+- Do not add any `figure_slots` entry to the blueprint.
+- Do not use `kind: "figure"` / `component: "figure"` for any LayoutBlock.
+If content would otherwise have been a real illustrative image, represent it
+instead as a `table`, `notation_table`, `comparison`, or descriptive
+`paragraph` block -- never as a FIGURE node.
+"""
+
 class PlannerAgent:
     """
     Transforms a user query into an initial Document Graph structure.
     Acts as the 'Architect' of the multi-agent system.
     """
 
-    def __init__(self, llm_client: Optional[LLMClient] = None) -> None:
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        enabled_validators: Optional[Dict[str, bool]] = None,
+    ) -> None:
         self.llm = llm_client or LLMClient()
         # Fetch tool definitions to inform the LLM of available capabilities
         self.available_tools = get_all_tool_schemas()
+        unknown = set(enabled_validators or {}) - set(DEFAULT_ENABLED_PLANNER_VALIDATORS)
+        if unknown:
+            raise ValueError(
+                f"Unknown enabled_validators code(s): {sorted(unknown)}. "
+                f"Valid codes: {sorted(DEFAULT_ENABLED_PLANNER_VALIDATORS)}."
+            )
+        self.enabled_validators: Dict[str, bool] = {
+            **DEFAULT_ENABLED_PLANNER_VALIDATORS,
+            **(enabled_validators or {}),
+        }
 
-    def generate_plan(self, planner_input: PlannerInput, max_attempts: int = 3) -> PlannerOutput:
+    def generate_plan(
+        self,
+        planner_input: PlannerInput,
+        max_attempts: int = 3,
+        event_logger: Optional[EventLogger] = None,
+        usage_sink: Optional[list] = None,
+    ) -> PlannerOutput:
         """
         Communicates with the LLM to design the document structure.
 
@@ -522,9 +580,18 @@ class PlannerAgent:
         system_prompt = PLANNER_STRATEGY_PROMPT.format(
             tool_schemas=json.dumps(self.available_tools, indent=2)
         )
+        if not planner_input.allow_figures:
+            system_prompt += PLANNER_NO_IMAGES_PROMPT
         if not use_structured:
             system_prompt += PLANNER_LEGACY_OUTPUT_FORMAT_PROMPT
 
+        tracker = AttemptTracker(
+            event_logger,
+            stage="planner",
+            verifier="planner_blueprint_validator",
+            recovery_action="retry_with_feedback",
+            producer_model=self.llm.model_name,
+        )
         last_error: Optional[Exception] = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -539,6 +606,7 @@ class PlannerAgent:
                         schema_name="planner_output",
                         temperature=0.2,
                         max_new_tokens=12000,
+                        usage_sink=usage_sink,
                     )
                     plan_data = _wire_output_to_plan_data(json.loads(raw_response))
                 else:
@@ -547,6 +615,7 @@ class PlannerAgent:
                         user_prompt=user_prompt,
                         temperature=0.2, ##### 원래 0.2 정도; Low temperature for structural consistency
                         max_new_tokens=12000,
+                        usage_sink=usage_sink,
                     )
                     json_block = self.llm.extract_json_block(raw_response)
                     plan_data = json.loads(json_block)
@@ -555,18 +624,20 @@ class PlannerAgent:
                 plan = PlannerOutput.model_validate(plan_data)
                 if plan.request_id is None:
                     plan.request_id = planner_input.request_id
-                self._validate_blueprint(plan)
+                self._validate_blueprint(plan, allow_figures=planner_input.allow_figures)
+                tracker.record_success(attempt)
                 return plan
             except Exception as exc:
                 last_error = exc
+                tracker.record_failure(attempt, _classify_generation_error(exc), str(exc))
                 print(f"[PlannerAgent] Attempt {attempt}/{max_attempts} failed: {exc}")
 
+        tracker.record_exhausted()
         raise ValueError(
             f"PlannerAgent failed to produce a valid plan after {max_attempts} attempts: {last_error}"
         ) from last_error
 
-    @staticmethod
-    def _validate_blueprint(plan: PlannerOutput) -> None:
+    def _validate_blueprint(self, plan: PlannerOutput, allow_figures: bool = True) -> None:
         """Reject graph/layout contracts that cannot be composed safely.
 
         The LLM chooses the layout, but this deterministic validation prevents a
@@ -590,12 +661,19 @@ class PlannerAgent:
             for node_id, node in nodes_by_id.items()
             if node.get("type") == NodeType.FIGURE.value
         }
+        if not allow_figures and figure_ids:
+            raise ValueError(
+                "Image generation is disabled for this run -- the plan must not include any "
+                f"FIGURE node: {sorted(figure_ids)}. Represent this content as a table, "
+                "notation_table, comparison, or paragraph block instead."
+            )
         blueprint = plan.blueprint
 
         if blueprint.document.kind != DocumentKind.SECTION_DRAFT and not blueprint.document.title:
             raise ValueError("A report or article blueprint must define a document title.")
-        validate_plain_title(blueprint.document.title, "Document")
-        validate_plain_title(blueprint.document.subtitle, "Document subtitle")
+        if self.enabled_validators.get("plain_title", True):
+            validate_plain_title(blueprint.document.title, "Document")
+            validate_plain_title(blueprint.document.subtitle, "Document subtitle")
 
         layouts_by_id = {layout.section_id: layout for layout in blueprint.sections}
         if len(layouts_by_id) != len(blueprint.sections):
@@ -611,12 +689,32 @@ class PlannerAgent:
         all_block_ids = set()
         referenced_figure_ids = set()
         for section_id, layout in layouts_by_id.items():
-            validate_plain_title(layout.title, f"Section '{section_id}'")
-            if _LEADING_SECTION_NUMBER.match(layout.title):
+            if self.enabled_validators.get("plain_title", True):
+                validate_plain_title(layout.title, f"Section '{section_id}'")
+            if self.enabled_validators.get("leading_section_number", True) and _LEADING_SECTION_NUMBER.match(
+                layout.title
+            ):
                 raise ValueError(
                     f"Section '{section_id}' title {layout.title!r} starts with a number "
                     "-- \\section{}/\\subsection{} already number themselves automatically; "
                     "remove the leading number from the title."
+                )
+            # A section with zero blocks passes every check below (the loop
+            # over `layout.blocks` just never runs) and only fails once
+            # TextAgent tries to draft it -- see _layout_blocks_for_node's
+            # own "has no semantic blocks" raise. That happens after
+            # TextAgent's own AttemptTracker would have been created for an
+            # LLM-caused failure, but this one fires *before* it (nothing was
+            # generated yet to retry), so it used to vanish from event
+            # logging entirely instead of counting toward this stage's
+            # Verification Trigger Rate. Catching it here means the
+            # Planner's own AttemptTracker retries it with feedback instead,
+            # which is also the only place that can actually fix it (the
+            # blueprint, not TextAgent's output, is what's empty).
+            if not layout.blocks:
+                raise ValueError(
+                    f"Section '{section_id}' has no layout blocks -- every SECTION/SUBSECTION "
+                    "must have at least one block for TextAgent to draft."
                 )
             block_ids = set()
             for block in layout.blocks:
@@ -624,7 +722,8 @@ class PlannerAgent:
                     raise ValueError(f"DocumentBlueprint contains duplicate block ID '{block.id}'.")
                 all_block_ids.add(block.id)
                 block_ids.add(block.id)
-                validate_plain_title(block.title, f"Layout block '{block.id}'")
+                if self.enabled_validators.get("plain_title", True):
+                    validate_plain_title(block.title, f"Layout block '{block.id}'")
                 if block.kind == LayoutBlockKind.FIGURE and not block.asset_id:
                     raise ValueError(f"Figure block '{block.id}' must declare an asset_id.")
                 if block.asset_id and block.asset_id not in figure_ids:
