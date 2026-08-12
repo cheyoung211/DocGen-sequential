@@ -35,6 +35,18 @@ class Stage(str, Enum):
 # generate one, so it shouldn't count toward "generation attempts".
 GENERATION_STAGES = frozenset({Stage.PLANNER, Stage.TEXT_AGENT, Stage.IMAGE_AGENT})
 
+
+class RecoveryAction(str, Enum):
+    """What kind of recovery a compile failure would need -- classification
+    only, no retry loop consumes this yet. See
+    compile_log_parser.classify_recovery_action.
+    """
+
+    REGENERATE_CONTENT = "regenerate_content"
+    DETERMINISTIC_REPAIR = "deterministic_repair"
+    INFRASTRUCTURE_FAILURE = "infrastructure_failure"
+    UNKNOWN = "unknown"
+
 VerificationResultValue = Literal["pass", "fail"]
 
 # No real verification-config toggle system exists yet (see
@@ -134,6 +146,9 @@ class CompileResult(BaseModel):
     fatal_error_count: int = 0
     warning_count: int = 0
     first_error_type: Optional[str] = None
+    # Populated by classify_recovery_action() from first_error_type -- no
+    # retry loop consumes this yet, classification only.
+    recovery_action: Optional[RecoveryAction] = None
     pdf_exists: bool = False
 
 

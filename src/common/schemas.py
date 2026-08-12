@@ -26,7 +26,7 @@ from src.common.state import DocumentBlueprint
 # as a genuine multi-letter command -- so instead of guessing from context,
 # only the finite set of real LaTeX/amsmath commands this pipeline's blocks
 # are actually allowed to contain (see text_agent.SYSTEM_PROMPT and
-# latex_integrator.FORBIDDEN_LATEX_COMMANDS) is treated as "real"; anything
+# latex_assembler.FORBIDDEN_LATEX_COMMANDS) is treated as "real"; anything
 # else starting with \n or \t is the escape artifact and gets unescaped, with
 # the trailing letters preserved as the prose that follows.
 _REAL_LATEX_COMMANDS_BY_LEADING_LETTER = {
@@ -253,7 +253,7 @@ class ContentBlock(BaseModel):
     @validator("content", pre=True)
     def normalize_escaped_whitespace(cls, v):
         """Repair double-escaped '\\n'/'\\t' before any downstream renderer
-        splits this content on real newlines (see latex_integrator._render_list
+        splits this content on real newlines (see latex_assembler._render_list
         and _markdown_table_to_tabularx, which rely on actual line breaks)."""
         if not isinstance(v, str):
             return v

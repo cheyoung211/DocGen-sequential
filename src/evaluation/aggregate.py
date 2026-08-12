@@ -33,7 +33,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from src.dataset.schemas import BenchmarkItem
-from src.evaluation.compile_log_parser import parse_compile_log
+from src.evaluation.compile_log_parser import classify_recovery_action, parse_compile_log
 from src.evaluation.discovery import discover_sample_dirs, split_factor_sample
 from src.evaluation.metrics.compile_success import compute_compile_success_rate
 from src.evaluation.metrics.contract_satisfaction import (
@@ -102,6 +102,7 @@ def _fallback_compile_result(sample_dir: Path) -> Optional[CompileResult]:
         fatal_error_count=fatal,
         warning_count=warnings,
         first_error_type=first_error_type,
+        recovery_action=classify_recovery_action(first_error_type),
         pdf_exists=pdf_exists,
     )
 

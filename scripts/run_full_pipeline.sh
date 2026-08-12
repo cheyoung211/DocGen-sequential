@@ -12,7 +12,7 @@ python3 scripts/run_full_pipeline.py \
 python3 scripts/run_full_pipeline.py \
   --dataset "dataset2/benchmark/dev_debug.jsonl" \
   --image-model none \
-  --planner-model gpt-5-mini 
+  --planner-model gpt-4o-mini 
 
   # 가능 모델: gemini-*-preview / gemini-*.* (Google) or gpt-* (OpenAI)
 

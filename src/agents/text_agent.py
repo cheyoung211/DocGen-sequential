@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import ValidationError
 
 from scripts.llm_client import LLMClient
-from src.agents.latex_integrator import (
+from src.agents.latex_assembler import (
     validate_fragment_environments,
     validate_markdown_table_columns,
     validate_no_manual_labels,
@@ -120,7 +120,7 @@ UNICODE_MATH_SYMBOLS: Dict[str, str] = {
 # math expression left bare in prose (no surrounding $...$). Deliberately
 # narrow (math-only macros, not '^'/'_'): those two characters have a
 # legitimate bare-prose meaning too (a literal underscore in a filename, for
-# instance) that LatexIntegratorAgent._sanitize_prose already escapes safely
+# instance) that LatexAssembler._sanitize_prose already escapes safely
 # outside math mode, so flagging them here would false-positive on prose that
 # was never broken.
 MATH_ONLY_COMMANDS = frozenset({
@@ -150,7 +150,7 @@ def _validate_bare_math_commands(content: str, block_id: Optional[str]) -> None:
     """Reject a math-only LaTeX command (e.g. ``\\epsilon``) written outside
     ``$...$``/``\\(...\\)``/``\\[...\\]``.
 
-    Mirrors LatexIntegratorAgent._sanitize_prose's own $/\\(\\)/\\[\\] state
+    Mirrors LatexAssembler._sanitize_prose's own $/\\(\\)/\\[\\] state
     tracking (including treating a ``$$`` run as one toggle, not two) so this
     check agrees with how the composer will actually interpret math mode --
     a command's own ``{...}`` argument is skipped rather than scanned, since
@@ -850,7 +850,7 @@ Figures owned by this section; refer to these only when relevant:
             return errors
 
         # Same environment/command whitelist the composer enforces in
-        # LatexIntegratorAgent._validate_fragment, run here too so a
+        # LatexAssembler._validate_fragment, run here too so a
         # violation raises inside process_node's try/except -- which
         # marks the node ERROR and lets the pipeline's iteration loop
         # retry it with a fresh sample -- instead of surfacing for the

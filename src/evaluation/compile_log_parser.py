@@ -1,7 +1,7 @@
 """Parse a LaTeX compiler's log into (fatal_error_count, warning_count, first_error_type).
 
 Built from real logs already on disk in this repo, not guessed. Tectonic
-(the default engine -- see ``LatexIntegratorAgent._resolve_engine``) writes
+(the default engine -- see ``LatexCompiler._resolve_engine``) writes
 lowercase ``note:``/``warning:``/``error:`` prefixed lines, which is a
 different format from classic pdflatex output (``"! ..."`` fatal errors,
 ``"LaTeX Warning:"``/``"Package ... Warning:"`` warnings). The existing
@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import re
 from typing import Optional, Tuple
+
+from src.evaluation.schemas import RecoveryAction
 
 # Tectonic emits these as their own "error:"/"warning:" lines, but they are
 # terminal meta-commentary about the run as a whole, not distinct diagnostics
@@ -60,6 +62,43 @@ def classify_error_type(message: str) -> str:
         if pattern.search(message):
             return error_type
     return "other"
+
+
+# package_error/missing_file are composer-owned bookkeeping (package set in
+# _required_packages, figure asset paths in the figure registry) -- not model
+# content and not a broken environment, so DETERMINISTIC_REPAIR rather than
+# INFRASTRUCTURE_FAILURE. missing_begin_document means the assembled document
+# frame itself is malformed, which LatexAssembler.validate_document_frame
+# should already have caught before compilation -- reaching the engine at all
+# means something structural broke, not the content.
+_REGENERATE_CONTENT_ERROR_TYPES = frozenset({
+    "missing_math_delimiter", "undefined_control_sequence",
+    "undefined_reference_or_command", "unbalanced_environment",
+    "missing_delimiter_or_argument", "latex_error",
+})
+_DETERMINISTIC_REPAIR_ERROR_TYPES = frozenset({"package_error", "missing_file"})
+_INFRASTRUCTURE_FAILURE_ERROR_TYPES = frozenset({
+    "missing_begin_document", "main_tex_missing", "no_latex_engine_found",
+})
+
+
+def classify_recovery_action(error_type: Optional[str]) -> Optional[RecoveryAction]:
+    """Map a ``first_error_type`` to the kind of recovery it would need.
+
+    ``None`` only when there's no error_type at all (e.g. compile succeeded);
+    an unrecognized non-None error_type (``other``, or a future addition to
+    ``classify_error_type``) falls to ``UNKNOWN`` rather than being silently
+    miscategorized into one of the other three buckets.
+    """
+    if error_type is None:
+        return None
+    if error_type in _REGENERATE_CONTENT_ERROR_TYPES:
+        return RecoveryAction.REGENERATE_CONTENT
+    if error_type in _DETERMINISTIC_REPAIR_ERROR_TYPES:
+        return RecoveryAction.DETERMINISTIC_REPAIR
+    if error_type in _INFRASTRUCTURE_FAILURE_ERROR_TYPES:
+        return RecoveryAction.INFRASTRUCTURE_FAILURE
+    return RecoveryAction.UNKNOWN
 
 
 def parse_compile_log(log_text: str, engine_name: str) -> Tuple[int, int, Optional[str]]:

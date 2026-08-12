@@ -1,7 +1,7 @@
 """Image asset generation without LaTeX layout decisions.
 
 The ImageAgent creates pixels and records metadata.  Figure environments are
-emitted only by ``LatexIntegratorAgent`` according to the DocumentBlueprint.
+emitted only by ``LatexAssembler`` according to the DocumentBlueprint.
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.agents.latex_integrator import LatexIntegratorAgent
+from src.agents.latex_assembler import LatexAssembler
 from src.common.schemas import ContentBlock, SemanticBlockType, TextAgentOutput
 from src.common.state import (
     DocumentBlueprint,
@@ -115,7 +115,7 @@ class SemanticIntegratorTest(unittest.TestCase):
                 # This must never be used as source input by the composer.
                 (sections / "overview.draft.tex").write_text("THIS MUST NOT APPEAR", encoding="utf-8")
 
-                LatexIntegratorAgent(engine="").integrate("semantic-test", graph)
+                LatexAssembler().assemble("semantic-test", graph)
 
                 rendered = (sections / "overview.tex").read_text(encoding="utf-8")
                 preamble = (base / "preamble.tex").read_text(encoding="utf-8")
@@ -149,7 +149,7 @@ class SemanticIntegratorTest(unittest.TestCase):
                 (base / "assets/system-figure.png").write_bytes(b"placeholder")
                 graph.register_figure_asset("system-figure", "assets/system-figure.png")
                 with self.assertRaisesRegex(FileNotFoundError, "blocks.json"):
-                    LatexIntegratorAgent(engine="").integrate("semantic-test", graph)
+                    LatexAssembler().assemble("semantic-test", graph)
             finally:
                 os.chdir(original_cwd)
 
@@ -157,10 +157,10 @@ class SemanticIntegratorTest(unittest.TestCase):
 class MarkdownTablePipeEscapingTest(unittest.TestCase):
     """Regression coverage for a raw '|' inside a table cell (e.g. conditional
     probability written as 'P(A|B)') desynchronizing the column count -- see
-    UNESCAPED_PIPE / _split_markdown_row in latex_integrator.py."""
+    UNESCAPED_PIPE / _split_markdown_row in latex_assembler.py."""
 
     def setUp(self) -> None:
-        self.agent = LatexIntegratorAgent()
+        self.agent = LatexAssembler()
 
     def test_unescaped_pipe_in_cell_raises_actionable_error(self) -> None:
         table = (
@@ -261,7 +261,7 @@ class TheoremProofSketchNotationTableTest(unittest.TestCase):
                     self._semantic_output().model_dump_json(indent=2), encoding="utf-8"
                 )
 
-                LatexIntegratorAgent(engine="").integrate("theorem-test", graph)
+                LatexAssembler().assemble("theorem-test", graph)
 
                 rendered = (sections / "overview.tex").read_text(encoding="utf-8")
                 preamble = (base / "preamble.tex").read_text(encoding="utf-8")
@@ -292,7 +292,7 @@ class TheoremProofSketchNotationTableTest(unittest.TestCase):
         """theorem/proof_sketch are prose-only, like definition/warning --
         ALLOWED_ENVIRONMENTS has no entry for them, so a model-supplied
         \\begin{...} must still be rejected."""
-        agent = LatexIntegratorAgent()
+        agent = LatexAssembler()
         block = ContentBlock(
             block_id="thm",
             type=SemanticBlockType.THEOREM,

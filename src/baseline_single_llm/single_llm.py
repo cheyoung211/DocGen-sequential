@@ -10,7 +10,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.llm_client import DEFAULT_MODEL, LLMClient
-from src.agents.latex_integrator import LatexIntegratorAgent
+from src.agents.latex_compiler import LatexCompiler
 
 
 def build_system_prompt() -> str:
@@ -59,8 +59,8 @@ def main() -> None:
     print(f"Using OpenAI Responses API model: {args.model_name}")
 
     # Same engine ("tectonic", falling back to pdflatex) and 2-pass run count as
-    # DocGenPipeline's integrator, so compile success is comparable across baselines.
-    integrator = LatexIntegratorAgent()
+    # DocGenPipeline's compiler, so compile success is comparable across baselines.
+    compiler = LatexCompiler()
 
     root_dir = Path(args.out_dir)
     root_dir.mkdir(parents=True, exist_ok=True)
@@ -100,7 +100,7 @@ def main() -> None:
                 json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8"
             )
 
-            if integrator.compile_pdf(request_id, output_dir=str(root_dir)):
+            if compiler.compile_pdf(request_id, output_dir=str(root_dir)):
                 print(f"[{request_id}] PDF compiled successfully.")
             else:
                 print(f"[{request_id}] PDF compilation failed; see compile.log.")

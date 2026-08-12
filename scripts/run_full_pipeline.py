@@ -18,7 +18,8 @@ from src.common.schemas import PlannerInput, TemplateSpec
 from src.agents.planner import DEFAULT_ENABLED_PLANNER_VALIDATORS, PlannerAgent
 from src.agents.text_agent import DEFAULT_ENABLED_VALIDATORS, TextAgent
 from src.agents.image_agent import ImageAgent
-from src.agents.latex_integrator import DEFAULT_ENABLED_INTEGRATOR_VALIDATORS, LatexIntegratorAgent
+from src.agents.latex_assembler import DEFAULT_ENABLED_ASSEMBLER_VALIDATORS, LatexAssembler
+from src.agents.latex_compiler import LatexCompiler
 from src.dataset.schemas import BenchmarkItem
 from src.evaluation.event_logger import EventLogger
 from src.evaluation.metrics.contract_satisfaction import evaluate_contract
@@ -177,8 +178,8 @@ def _warn_verifier_pairing_mismatches(
     """Flag a code that's on in one layer and off in the other.
 
     TextAgent's forbidden_environment/manual_label/table_columns checks and
-    LatexIntegratorAgent's copies of the same three checks are independently
-    toggleable (see DEFAULT_ENABLED_VALIDATORS / DEFAULT_ENABLED_INTEGRATOR_
+    LatexAssembler's copies of the same three checks are independently
+    toggleable (see DEFAULT_ENABLED_VALIDATORS / DEFAULT_ENABLED_ASSEMBLER_
     VALIDATORS) -- deliberately not mirrored, so a verifier ablation run can
     study either layer alone. This just warns when that's likely accidental:
     a check "disabled" for the run that's still enforced by the other layer.
@@ -191,7 +192,7 @@ def _warn_verifier_pairing_mismatches(
             print(
                 f"[Pipeline] WARNING: '{code}' verifier mismatch -- "
                 f"TextAgent={'ON' if text_state else 'OFF'}, "
-                f"LatexIntegratorAgent={'ON' if integrator_state else 'OFF'}."
+                f"LatexAssembler={'ON' if integrator_state else 'OFF'}."
             )
 
 
@@ -204,7 +205,7 @@ class DocGenPipeline:
                  output_dir: str = "outputs/generations",
                  text_agent_enabled_validators: Optional[Dict[str, bool]] = None,
                  planner_enabled_validators: Optional[Dict[str, bool]] = None,
-                 integrator_enabled_validators: Optional[Dict[str, bool]] = None):
+                 assembler_enabled_validators: Optional[Dict[str, bool]] = None):
 
         # 'none' disables image generation entirely for this run: no image
         # model is loaded, and the planner is instructed (and validated) to
@@ -229,13 +230,16 @@ class DocGenPipeline:
                 llm_client=get_client(clients, text_model),
                 enabled_validators=text_agent_enabled_validators,
             ),
-            'integrator': LatexIntegratorAgent(
+            'assembler': LatexAssembler(
                 llm_client=get_client(clients, integrator_model),
-                enabled_validators=integrator_enabled_validators,
+                enabled_validators=assembler_enabled_validators,
+            ),
+            'compiler': LatexCompiler(
+                llm_client=get_client(clients, integrator_model),
             ),
         }
         _warn_verifier_pairing_mismatches(
-            agents['text_agent'].enabled_validators, agents['integrator'].enabled_validators
+            agents['text_agent'].enabled_validators, agents['assembler'].enabled_validators
         )
         if self.images_enabled:
             if image_model == 'sdxl':
@@ -249,7 +253,8 @@ class DocGenPipeline:
         self.planner = agents['planner_agent']
         self.text_agent = agents['text_agent']
         self.image_agent = agents['image_agent']
-        self.integrator = agents['integrator']
+        self.assembler = agents['assembler']
+        self.compiler = agents['compiler']
 
         self.output_base = Path(output_dir)
 
@@ -350,7 +355,7 @@ class DocGenPipeline:
             # block), that artifact was never written. Failing loudly here, with
             # every unfinished node's last error, beats the alternative: silently
             # falling into Phase 3 and hitting a FileNotFoundError several stack
-            # frames deep in LatexIntegratorAgent that doesn't say which content
+            # frames deep in LatexAssembler that doesn't say which content
             # agent actually failed or why.
             unfinished = [
                 node for node in graph.nodes.values()
@@ -372,16 +377,19 @@ class DocGenPipeline:
         # 3. Integration & Self-Correcting Compilation
         print("[Pipeline] Phase 3: Integrating Assets and Compiling...")
         try:
-            # success = self.integrator.integrate_and_compile(graph, str(project_dir))
-            success = self.integrator.integrate(
+            self.assembler.assemble(
                 request_id, graph, output_dir=str(self.output_base), event_logger=event_logger
             )
         except Exception as exc:
-            # Raised by LatexIntegratorAgent.integrate() itself (blueprint
-            # assembly / pre-compile validation) -- before pdflatex ever
-            # runs, so no compile.log exists yet to attach.
+            # Raised by LatexAssembler.assemble() itself (blueprint assembly /
+            # pre-compile validation) -- before pdflatex ever runs, so no
+            # compile.log exists yet to attach.
             _write_log("integration_error", error=exc)
             raise
+
+        success = self.compiler.compile_pdf(
+            request_id, output_dir=str(self.output_base), event_logger=event_logger
+        )
 
         if success:
             print(f">>> Success! Final PDF located in: {project_dir}")
@@ -426,7 +434,7 @@ def main():
     parser.add_argument("--planner-model", default=DEFAULT_MODEL, help="LLM for the Planner Agent, e.g. gpt-5.4-mini or gemini-3-flash")
     parser.add_argument("--text-model", default=DEFAULT_MODEL, help="LLM for the Text Generation Agent, e.g. gpt-5.4-mini or gemini-3-flash")
     parser.add_argument("--image-model", default="none", choices=['sdxl', 'flux', 'none'], help="Model for the Image Strategy Agent, or 'none' to disable image generation for this run (default)")
-    parser.add_argument("--integrator-model", default=DEFAULT_MODEL, help="LLM for the LaTeX Integrator Agent, e.g. gpt-5.4-mini or gemini-3-flash")
+    parser.add_argument("--integrator-model", default=DEFAULT_MODEL, help="LLM slot shared by LatexAssembler/LatexCompiler (currently unused by either), e.g. gpt-5.4-mini or gemini-3-flash")
     parser.add_argument("--out-dir", default="outputs/generations", help="Output directory")
     parser.add_argument("--iterations", type=int, default=3, help="Maximum number of iterations")
     parser.add_argument(
@@ -456,17 +464,22 @@ def main():
         ),
     )
     parser.add_argument(
-        "--disable-integrator-validator",
+        "--disable-assembler-validator",
         action="append",
-        choices=sorted(DEFAULT_ENABLED_INTEGRATOR_VALIDATORS),
+        choices=sorted(DEFAULT_ENABLED_ASSEMBLER_VALIDATORS),
         metavar="CODE",
         help=(
-            "Turn off one LatexIntegratorAgent content-quality verifier by "
-            "code, for verifier ablation experiments (repeatable). This is "
-            "the composer's own second-line-of-defense copy of the same "
-            "check TextAgent runs first -- toggled independently, not "
-            "mirrored from --disable-text-validator. "
-            f"Codes: {', '.join(sorted(DEFAULT_ENABLED_INTEGRATOR_VALIDATORS))}"
+            "Turn off one LatexAssembler verifier by code, for verifier "
+            "ablation experiments (repeatable). forbidden_environment/"
+            "manual_label/table_columns are the composer's own "
+            "second-line-of-defense copy of the same check TextAgent runs "
+            "first -- toggled independently, not mirrored from "
+            "--disable-text-validator. The rest (layout_policy, "
+            "figure_asset_completeness, figure_single_use, reference, "
+            "document_frame) gate the composer's own pre-compile structural "
+            "checks. Block id/order/type/asset_id consistency is never "
+            "disabled -- the renderer assumes it already holds. "
+            f"Codes: {', '.join(sorted(DEFAULT_ENABLED_ASSEMBLER_VALIDATORS))}"
         ),
     )
     args = parser.parse_args()
@@ -491,12 +504,12 @@ def main():
     if planner_enabled_validators:
         print(f"[Pipeline] Planner verifiers disabled for this run: {sorted(planner_enabled_validators)}")
 
-    integrator_enabled_validators = (
-        {code: False for code in args.disable_integrator_validator}
-        if args.disable_integrator_validator else None
+    assembler_enabled_validators = (
+        {code: False for code in args.disable_assembler_validator}
+        if args.disable_assembler_validator else None
     )
-    if integrator_enabled_validators:
-        print(f"[Pipeline] Integrator verifiers disabled for this run: {sorted(integrator_enabled_validators)}")
+    if assembler_enabled_validators:
+        print(f"[Pipeline] Assembler verifiers disabled for this run: {sorted(assembler_enabled_validators)}")
 
     pipeline = DocGenPipeline(
         planner_model=args.planner_model,
@@ -506,7 +519,7 @@ def main():
         output_dir=out_dir,
         text_agent_enabled_validators=text_agent_enabled_validators,
         planner_enabled_validators=planner_enabled_validators,
-        integrator_enabled_validators=integrator_enabled_validators,
+        assembler_enabled_validators=assembler_enabled_validators,
     )
 
     if args.dataset:

@@ -5,7 +5,7 @@ from typing import Dict, List, Literal, Optional, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from src.agents.latex_integrator import (
+from src.agents.latex_assembler import (
     KNOWN_SECTION_LEVELS,
     SAFE_DOCUMENT_CLASSES,
     validate_plain_title,
@@ -52,7 +52,7 @@ _SECTION_NODE_TYPES: TypeAlias = Literal["SECTION", "SUBSECTION"]
 # a retry. Removing the dead TABLE option (and node_id below) removes both
 # the false affordance and the temptation.
 _ASSET_NODE_TYPES: TypeAlias = Literal["FIGURE"]
-# Built from the composer's own allowlist (src/agents/latex_integrator.py)
+# Built from the composer's own allowlist (src/agents/latex_assembler.py)
 # rather than duplicated here, so the two can't drift apart the way
 # document_class did: the wire schema left it as a bare `str`, so a model
 # had no structural reason not to write "article (11pt)" -- a value that
