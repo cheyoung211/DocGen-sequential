@@ -18,7 +18,7 @@ from src.common.schemas import PlannerInput, TemplateSpec
 from src.agents.planner import DEFAULT_ENABLED_PLANNER_VALIDATORS, PlannerAgent
 from src.agents.text_agent import DEFAULT_ENABLED_VALIDATORS, TextAgent
 from src.agents.image_agent import ImageAgent
-from src.agents.latex_integrator import LatexIntegratorAgent
+from src.agents.latex_integrator import DEFAULT_ENABLED_INTEGRATOR_VALIDATORS, LatexIntegratorAgent
 from src.dataset.schemas import BenchmarkItem
 from src.evaluation.event_logger import EventLogger
 from src.evaluation.metrics.contract_satisfaction import evaluate_contract
@@ -171,6 +171,30 @@ def _write_run_log(
     )
 
 
+def _warn_verifier_pairing_mismatches(
+    text_agent_validators: Dict[str, bool], integrator_validators: Dict[str, bool]
+) -> None:
+    """Flag a code that's on in one layer and off in the other.
+
+    TextAgent's forbidden_environment/manual_label/table_columns checks and
+    LatexIntegratorAgent's copies of the same three checks are independently
+    toggleable (see DEFAULT_ENABLED_VALIDATORS / DEFAULT_ENABLED_INTEGRATOR_
+    VALIDATORS) -- deliberately not mirrored, so a verifier ablation run can
+    study either layer alone. This just warns when that's likely accidental:
+    a check "disabled" for the run that's still enforced by the other layer.
+    """
+    shared_codes = set(text_agent_validators) & set(integrator_validators)
+    for code in sorted(shared_codes):
+        text_state = text_agent_validators[code]
+        integrator_state = integrator_validators[code]
+        if text_state != integrator_state:
+            print(
+                f"[Pipeline] WARNING: '{code}' verifier mismatch -- "
+                f"TextAgent={'ON' if text_state else 'OFF'}, "
+                f"LatexIntegratorAgent={'ON' if integrator_state else 'OFF'}."
+            )
+
+
 class DocGenPipeline:
     def __init__(self,
                  planner_model: str,
@@ -179,7 +203,8 @@ class DocGenPipeline:
                  integrator_model: str,
                  output_dir: str = "outputs/generations",
                  text_agent_enabled_validators: Optional[Dict[str, bool]] = None,
-                 planner_enabled_validators: Optional[Dict[str, bool]] = None):
+                 planner_enabled_validators: Optional[Dict[str, bool]] = None,
+                 integrator_enabled_validators: Optional[Dict[str, bool]] = None):
 
         # 'none' disables image generation entirely for this run: no image
         # model is loaded, and the planner is instructed (and validated) to
@@ -204,8 +229,14 @@ class DocGenPipeline:
                 llm_client=get_client(clients, text_model),
                 enabled_validators=text_agent_enabled_validators,
             ),
-            'integrator': LatexIntegratorAgent(llm_client=get_client(clients, integrator_model)),
+            'integrator': LatexIntegratorAgent(
+                llm_client=get_client(clients, integrator_model),
+                enabled_validators=integrator_enabled_validators,
+            ),
         }
+        _warn_verifier_pairing_mismatches(
+            agents['text_agent'].enabled_validators, agents['integrator'].enabled_validators
+        )
         if self.images_enabled:
             if image_model == 'sdxl':
                 image_generator = SDXLGenerator()
@@ -424,6 +455,20 @@ def main():
             f"Codes: {', '.join(sorted(DEFAULT_ENABLED_PLANNER_VALIDATORS))}"
         ),
     )
+    parser.add_argument(
+        "--disable-integrator-validator",
+        action="append",
+        choices=sorted(DEFAULT_ENABLED_INTEGRATOR_VALIDATORS),
+        metavar="CODE",
+        help=(
+            "Turn off one LatexIntegratorAgent content-quality verifier by "
+            "code, for verifier ablation experiments (repeatable). This is "
+            "the composer's own second-line-of-defense copy of the same "
+            "check TextAgent runs first -- toggled independently, not "
+            "mirrored from --disable-text-validator. "
+            f"Codes: {', '.join(sorted(DEFAULT_ENABLED_INTEGRATOR_VALIDATORS))}"
+        ),
+    )
     args = parser.parse_args()
 
     out_dir = args.out_dir
@@ -446,6 +491,13 @@ def main():
     if planner_enabled_validators:
         print(f"[Pipeline] Planner verifiers disabled for this run: {sorted(planner_enabled_validators)}")
 
+    integrator_enabled_validators = (
+        {code: False for code in args.disable_integrator_validator}
+        if args.disable_integrator_validator else None
+    )
+    if integrator_enabled_validators:
+        print(f"[Pipeline] Integrator verifiers disabled for this run: {sorted(integrator_enabled_validators)}")
+
     pipeline = DocGenPipeline(
         planner_model=args.planner_model,
         text_model=args.text_model,
@@ -454,6 +506,7 @@ def main():
         output_dir=out_dir,
         text_agent_enabled_validators=text_agent_enabled_validators,
         planner_enabled_validators=planner_enabled_validators,
+        integrator_enabled_validators=integrator_enabled_validators,
     )
 
     if args.dataset:

@@ -222,13 +222,6 @@ def validate_plain_title(title: Optional[str], source: str) -> None:
 
 LABEL_TOKEN = re.compile(r"\\label\s*\{(?P<label>[^{}]+)\}")
 VALID_LABEL = re.compile(r"[A-Za-z0-9:._-]+")
-# A '|' not preceded by a backslash: the actual column delimiter in a Markdown
-# table row, as opposed to a literal pipe character a model escaped as '\|'
-# inside a cell (for example conditional-probability notation it failed to
-# write as '\mid' -- see the table-formatting rules in text_agent.SYSTEM_PROMPT).
-# An unescaped raw '|' inside a cell is the most common cause of a ragged
-# table, since str.split("|") alone treats it as an extra column boundary.
-UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
 VALID_GRAPHICS_PATH = re.compile(r"[A-Za-z0-9_./-]+")
 
 # The one sanctioned way a block's content may already contain a hand-placed
@@ -266,11 +259,116 @@ def validate_no_manual_labels(block_type: SemanticBlockType, content: str, block
         )
 
 
+def _find_math_spans(row: str) -> List["tuple[int, int]"]:
+    """Return (start, end) index ranges for each top-level math region in
+    ``row`` -- ``\\(...\\)``, ``\\[...\\]``, ``$...$`` -- tracking a ``$$``
+    run as one toggle, not two, the same as ``_sanitize_prose``/
+    ``_validate_bare_math_commands``."""
+    spans: List["tuple[int, int]"] = []
+    length = len(row)
+    index = 0
+    in_math = False
+    span_start = 0
+    while index < length:
+        char = row[index]
+        if char == "\\" and index + 1 < length:
+            two_char = row[index : index + 2]
+            if two_char in (r"\(", r"\[") and not in_math:
+                in_math = True
+                span_start = index
+                index += 2
+                continue
+            if two_char in (r"\)", r"\]") and in_math:
+                spans.append((span_start, index + 2))
+                in_math = False
+                index += 2
+                continue
+            index += 2
+            continue
+        if char == "$":
+            if index + 1 < length and row[index + 1] == "$":
+                if not in_math:
+                    in_math = True
+                    span_start = index
+                else:
+                    spans.append((span_start, index + 2))
+                    in_math = False
+                index += 2
+                continue
+            if not in_math:
+                in_math = True
+                span_start = index
+            else:
+                spans.append((span_start, index + 1))
+                in_math = False
+            index += 1
+            continue
+        index += 1
+    if in_math:
+        spans.append((span_start, length))
+    return spans
+
+
+def _paired_pipe_indices(row: str, spans: List["tuple[int, int]"]) -> "set[int]":
+    """Indices of raw (non-escaped) '|' characters inside a math span whose
+    span contains an *even*, non-zero count of them.
+
+    A single raw '|' inside math (``P(A|B)``) is the same ambiguous
+    conditional-probability notation the project's convention already
+    requires writing as ``\\mid`` instead -- still a real column-count
+    violation. A *pair* of raw '|' inside one math span (``|x - c|``) is
+    unambiguous absolute-value notation with nothing to disambiguate, so
+    those -- and only those -- are exempted from splitting.
+    """
+    paired: "set[int]" = set()
+    for start, end in spans:
+        positions = []
+        i = start
+        while i < end:
+            if row[i] == "\\" and i + 1 < end:
+                i += 2
+                continue
+            if row[i] == "|":
+                positions.append(i)
+            i += 1
+        if positions and len(positions) % 2 == 0:
+            paired.update(positions)
+    return paired
+
+
 def _split_markdown_row(row: str) -> List[str]:
-    """Split one Markdown table row on unescaped '|', restoring '\\|' to a
-    literal '|' in each cell -- see UNESCAPED_PIPE for why this must not be
-    a plain ``row.split("|")``."""
-    return [cell.replace(r"\|", "|").strip() for cell in UNESCAPED_PIPE.split(row)]
+    """Split one Markdown table row on unescaped '|', except a paired
+    absolute-value-style '|' inside math mode -- see ``_paired_pipe_indices``.
+
+    A plain ``row.split("|")`` (or a naive "'|' not preceded by a backslash"
+    regex) treats every raw '|' as a column boundary, including
+    ``\\( |x - c| \\)``'s absolute-value bars -- a table_columns violation
+    the model had no correct way to satisfy, since that math was already
+    written correctly (the "block_notation_table" incident this was pulled
+    out to fix). ``\\|`` is always restored to a literal, non-delimiting '|'
+    in the cell, in or out of math mode.
+    """
+    spans = _find_math_spans(row)
+    paired = _paired_pipe_indices(row, spans)
+    cells: List[str] = []
+    current: List[str] = []
+    length = len(row)
+    index = 0
+    while index < length:
+        char = row[index]
+        if char == "\\" and index + 1 < length and row[index + 1] == "|":
+            current.append("|")
+            index += 2
+            continue
+        if char == "|" and index not in paired:
+            cells.append("".join(current).strip())
+            current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    cells.append("".join(current).strip())
+    return cells
 
 
 def _split_leading_markdown_table(content: str) -> "tuple[List[str], str]":
@@ -413,15 +511,47 @@ def _log_list_check(
         )
 
 
+# The same three checks TextAgent already gates behind its own
+# ``enabled_validators`` (see DEFAULT_ENABLED_VALIDATORS in text_agent.py),
+# re-run here as the composer's second line of defense right before
+# rendering. Kept as an independently toggleable dict -- NOT mirrored
+# automatically from TextAgent's setting -- so a verifier ablation run can
+# study, say, "TextAgent's forbidden_environment check off, composer's on"
+# as its own condition. Label-uniqueness checking has no code here because
+# it stays always-on on the instance method (needs the document-wide label
+# registry, not a per-code toggle).
+DEFAULT_ENABLED_INTEGRATOR_VALIDATORS: Dict[str, bool] = {
+    "forbidden_environment": True,
+    "manual_label": True,
+    "table_columns": True,
+}
+
+
 class LatexIntegratorAgent:
     """Compose a document only from its registered blueprint and assets."""
 
-    def __init__(self, llm_client: Any = None, engine: str = "tectonic", runs: int = 2):
+    def __init__(
+        self,
+        llm_client: Any = None,
+        engine: str = "tectonic",
+        runs: int = 2,
+        enabled_validators: Optional[Dict[str, bool]] = None,
+    ):
         # Kept for constructor compatibility. Layout decisions are deterministic
         # once the planner has produced a DocumentBlueprint.
         self.llm = llm_client
         self.engine = engine
         self.runs = runs
+        unknown = set(enabled_validators or {}) - set(DEFAULT_ENABLED_INTEGRATOR_VALIDATORS)
+        if unknown:
+            raise ValueError(
+                f"Unknown enabled_validators code(s): {sorted(unknown)}. "
+                f"Valid codes: {sorted(DEFAULT_ENABLED_INTEGRATOR_VALIDATORS)}."
+            )
+        self.enabled_validators: Dict[str, bool] = {
+            **DEFAULT_ENABLED_INTEGRATOR_VALIDATORS,
+            **(enabled_validators or {}),
+        }
 
     def integrate(
         self,
@@ -925,9 +1055,15 @@ class LatexIntegratorAgent:
 
     def _validate_fragment(self, block: ContentBlock) -> None:
         """Reject LaTeX that would escape the semantic-block rendering boundary."""
-        content = validate_fragment_environments(block.type, block.content, block.block_id)
-        validate_no_manual_labels(block.type, content, block.block_id)
-        if block.type in (SemanticBlockType.TABLE, SemanticBlockType.NOTATION_TABLE, SemanticBlockType.COMPARISON):
+        content = block.content.replace("\r\n", "\n")
+        if self.enabled_validators.get("forbidden_environment", True):
+            content = validate_fragment_environments(block.type, block.content, block.block_id)
+        if self.enabled_validators.get("manual_label", True):
+            validate_no_manual_labels(block.type, content, block.block_id)
+        if (
+            block.type in (SemanticBlockType.TABLE, SemanticBlockType.NOTATION_TABLE, SemanticBlockType.COMPARISON)
+            and self.enabled_validators.get("table_columns", True)
+        ):
             validate_markdown_table_columns(content, block.block_id)
         for label_match in LABEL_TOKEN.finditer(content):
             self._validate_label(label_match.group("label"), f"block '{block.block_id}'")

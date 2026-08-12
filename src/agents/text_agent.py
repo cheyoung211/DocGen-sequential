@@ -90,7 +90,126 @@ DEFAULT_ENABLED_VALIDATORS: Dict[str, bool] = {
     "table_columns": True,
     "plain_title": True,
     "figure_content": True,
+    "unicode_math_symbol": True,
+    "bare_math_notation": True,
 }
+
+# A raw Unicode Greek letter or math symbol renders correctly by pure luck
+# (most PDF viewers happen to have the glyph), but breaks the moment the
+# document needs the symbol to behave like math (spacing, italics, no
+# hyphenation, kerning against subscripts) -- and breaks outright under a
+# strict LaTeX engine without full Unicode/fontspec support. Every key here
+# is a character _validate_one_block rejects; every value is the LaTeX
+# command REMEDIATION_HINTS tells the model to use instead.
+UNICODE_MATH_SYMBOLS: Dict[str, str] = {
+    "ε": r"\epsilon", "δ": r"\delta", "α": r"\alpha", "β": r"\beta", "γ": r"\gamma",
+    "θ": r"\theta", "λ": r"\lambda", "μ": r"\mu", "π": r"\pi", "σ": r"\sigma",
+    "φ": r"\phi", "ψ": r"\psi", "ω": r"\omega", "χ": r"\chi", "ξ": r"\xi",
+    "ζ": r"\zeta", "η": r"\eta", "ι": r"\iota", "κ": r"\kappa", "ν": r"\nu",
+    "ρ": r"\rho", "τ": r"\tau", "υ": r"\upsilon",
+    "Γ": r"\Gamma", "Δ": r"\Delta", "Θ": r"\Theta", "Λ": r"\Lambda", "Ξ": r"\Xi",
+    "Π": r"\Pi", "Σ": r"\Sigma", "Φ": r"\Phi", "Ψ": r"\Psi", "Ω": r"\Omega",
+    "≤": r"\leq", "≥": r"\geq", "≠": r"\neq", "≈": r"\approx", "∈": r"\in",
+    "∉": r"\notin", "⊂": r"\subset", "⊆": r"\subseteq", "∪": r"\cup", "∩": r"\cap",
+    "∀": r"\forall", "∃": r"\exists", "∞": r"\infty", "∂": r"\partial",
+    "∇": r"\nabla", "∑": r"\sum", "∏": r"\prod", "√": r"\sqrt", "±": r"\pm",
+    "×": r"\times", "÷": r"\div", "→": r"\to", "⇒": r"\Rightarrow", "·": r"\cdot",
+}
+
+# Command names that only mean something inside math mode -- used to detect a
+# math expression left bare in prose (no surrounding $...$). Deliberately
+# narrow (math-only macros, not '^'/'_'): those two characters have a
+# legitimate bare-prose meaning too (a literal underscore in a filename, for
+# instance) that LatexIntegratorAgent._sanitize_prose already escapes safely
+# outside math mode, so flagging them here would false-positive on prose that
+# was never broken.
+MATH_ONLY_COMMANDS = frozenset({
+    "epsilon", "varepsilon", "delta", "alpha", "beta", "gamma", "theta", "vartheta",
+    "lambda", "mu", "nu", "xi", "pi", "rho", "sigma", "varsigma", "tau", "upsilon",
+    "phi", "varphi", "psi", "omega", "chi", "zeta", "eta", "iota", "kappa",
+    "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Phi", "Psi", "Omega",
+    "leq", "geq", "neq", "approx", "sim", "equiv", "in", "notin", "subset", "subseteq",
+    "cup", "cap", "forall", "exists", "infty", "partial", "nabla", "sum", "prod",
+    "int", "sqrt", "frac", "to", "rightarrow", "leftarrow", "Rightarrow", "Leftarrow",
+    "cdot", "times", "div", "pm", "mp", "mid", "mathbb", "mathcal", "binom",
+    "lim", "sup", "inf",
+})
+
+
+def _validate_unicode_math_symbols(content: str, block_id: Optional[str]) -> None:
+    found = sorted({char for char in content if char in UNICODE_MATH_SYMBOLS})
+    if found:
+        replacements = ", ".join(f"'{char}' -> '{UNICODE_MATH_SYMBOLS[char]}'" for char in found)
+        raise ValueError(
+            f"Block '{block_id}' uses raw Unicode math symbol(s) instead of LaTeX "
+            f"commands: {replacements}."
+        )
+
+
+def _validate_bare_math_commands(content: str, block_id: Optional[str]) -> None:
+    """Reject a math-only LaTeX command (e.g. ``\\epsilon``) written outside
+    ``$...$``/``\\(...\\)``/``\\[...\\]``.
+
+    Mirrors LatexIntegratorAgent._sanitize_prose's own $/\\(\\)/\\[\\] state
+    tracking (including treating a ``$$`` run as one toggle, not two) so this
+    check agrees with how the composer will actually interpret math mode --
+    a command's own ``{...}`` argument is skipped rather than scanned, since
+    it is typically an identifier (e.g. \\mathbb{R}'s argument), not prose.
+    """
+    text = content.replace("\r\n", "\n")
+    length = len(text)
+    index = 0
+    in_math = False
+    offenders: List[str] = []
+    while index < length:
+        char = text[index]
+        if char == "\\":
+            if index + 1 < length and text[index + 1].isalpha():
+                end = index + 2
+                while end < length and text[end].isalpha():
+                    end += 1
+                command_name = text[index + 1 : end]
+                if not in_math and command_name in MATH_ONLY_COMMANDS:
+                    offenders.append(f"\\{command_name}")
+                index = end
+                if index < length and text[index] == "{":
+                    depth = 0
+                    while index < length:
+                        if text[index] == "{":
+                            depth += 1
+                        elif text[index] == "}":
+                            depth -= 1
+                            if depth == 0:
+                                index += 1
+                                break
+                        index += 1
+                continue
+            if index + 1 < length and text[index : index + 2] in (r"\(", r"\["):
+                in_math = True
+                index += 2
+                continue
+            if index + 1 < length and text[index : index + 2] in (r"\)", r"\]"):
+                in_math = False
+                index += 2
+                continue
+            index += 2
+            continue
+        if char == "$":
+            if index + 1 < length and text[index + 1] == "$":
+                in_math = not in_math
+                index += 2
+                continue
+            in_math = not in_math
+            index += 1
+            continue
+        index += 1
+    if offenders:
+        unique = sorted(set(offenders))
+        raise ValueError(
+            f"Block '{block_id}' has math command(s) outside '$...$' (or "
+            f"'\\(...\\)'/'\\[...\\]'): {', '.join(unique)}. Wrap the whole "
+            "expression in math delimiters."
+        )
 
 # One deterministic, rule-specific remediation instruction per SemanticBlockError
 # code. Looked up by _build_prompt_from_node and injected next to that block's
@@ -135,6 +254,16 @@ REMEDIATION_HINTS: Dict[str, str] = {
         "\\includegraphics -- reference the figure in a plain sentence only; "
         "the Composer places the image."
     ),
+    "unicode_math_symbol": (
+        "Replace every raw Unicode Greek letter/math symbol named in the error "
+        "with its LaTeX command (e.g. 'ε' -> '\\epsilon', 'δ' -> '\\delta'), "
+        "written inside $...$."
+    ),
+    "bare_math_notation": (
+        "Wrap the math command(s) named in the error -- and the full expression "
+        "they belong to -- in '$...$' (for example '$\\epsilon > 0$', not "
+        "'\\epsilon > 0')."
+    ),
 }
 
 SYSTEM_PROMPT = r"""
@@ -157,6 +286,16 @@ Generate content for exactly the requested layout blocks.
   `available_cross_reference_labels`. Never invent labels.
 - Titles are plain text: never use LaTeX commands, `$...$`, or math notation
   in `title`. Put mathematical notation in `content`.
+
+<Math notation>
+- Never write a raw Unicode Greek letter or math symbol (e.g. ε, δ, α, θ, λ,
+  π, σ, ≤, ≥, ∈, →, ∞). Always use the equivalent LaTeX command instead
+  (`\epsilon`, `\delta`, `\alpha`, `\theta`, `\lambda`, `\pi`, `\sigma`,
+  `\leq`, `\geq`, `\in`, `\to`, `\infty`, ...).
+- Every math expression must be wrapped in delimiters: `$...$` for inline
+  math in prose, or the block's own math body for an `equation` block. Never
+  write a LaTeX math command or expression as bare text outside `$...$`
+  (wrong: "for every \epsilon > 0"; right: "for every $\epsilon > 0$").
 
 <Content rules by block type>
 
@@ -751,6 +890,27 @@ Figures owned by this section; refer to these only when relevant:
                 validate_plain_title(content_block.title, f"Block '{block_id}'")
             except ValueError as exc:
                 errors.append(SemanticBlockError("plain_title", block_id, str(exc)))
+
+        # Applies to every block type, including equation -- a raw Unicode
+        # symbol is wrong LaTeX regardless of whether it sits inside a math
+        # delimiter or not.
+        if self.enabled_validators.get("unicode_math_symbol", True):
+            try:
+                _validate_unicode_math_symbols(content_block.content, block_id)
+            except ValueError as exc:
+                errors.append(SemanticBlockError("unicode_math_symbol", block_id, str(exc)))
+
+        # equation is exempt: its whole "content" IS a math body (see
+        # <Content rules by block type>), so it never needs its own $...$
+        # wrapper -- the composer's _render_equation supplies the delimiters.
+        if (
+            layout_block.kind != LayoutBlockKind.EQUATION
+            and self.enabled_validators.get("bare_math_notation", True)
+        ):
+            try:
+                _validate_bare_math_commands(content_block.content, block_id)
+            except ValueError as exc:
+                errors.append(SemanticBlockError("bare_math_notation", block_id, str(exc)))
 
         if layout_block.kind == LayoutBlockKind.FIGURE and self.enabled_validators.get("figure_content", True):
             if content_block.asset_id != layout_block.asset_id:

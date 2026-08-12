@@ -6,9 +6,7 @@
 #
 # Usage:
 #   scripts/run_evaluation.sh [DATASET_JSONL] [OUT_DIR_PREFIX] [MODEL]
-##   -> scripts/run_evaluation.sh dataset2/benchmark/dev_debug.jsonl outputs/eval_run gpt-4o-mini
 #   scripts/run_evaluation.sh --eval-only BATCH_DIR [DATASET_JSONL]
-##   -> scripts/run_evaluation.sh --eval-only outputs/foundation_validate_08111246 dataset2/benchmark/benchmark_v2.jsonl
 #
 # Examples:
 #   scripts/run_evaluation.sh
