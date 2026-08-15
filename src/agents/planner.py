@@ -11,8 +11,16 @@ from src.agents.latex_assembler import (
     validate_plain_title,
 )
 from src.common.schemas import PlannerInput, PlannerOutput
-from src.common.state import DocumentKind, DocumentBlueprint, LayoutBlockKind, NodeType, SAFE_IDENTIFIER
+from src.common.state import DocumentKind, DocumentBlueprint, LatexComponent, LayoutBlockKind, NodeType, SAFE_IDENTIFIER
+from src.dataset.schemas import RequiredSection
 from src.evaluation.event_logger import AttemptTracker, EventLogger
+# Reused as-is from the evaluation layer rather than reimplemented here, so
+# the planner's live "is this required section covered" gate and
+# evaluate_contract's post-hoc scoring never disagree about what counts as a
+# match. Both are pure functions over an in-memory DocumentBlueprint -- no
+# file I/O -- so calling them at blueprint-validation time (before anything
+# is written to disk) is safe.
+from src.evaluation.metrics.contract_satisfaction import _keywords, _match_required_section
 from src.helpers.tools import get_all_tool_schemas
 from scripts.llm_client import LLMClient
 
@@ -347,12 +355,64 @@ def _classify_generation_error(exc: Exception) -> str:
 # empty section blocks, figure slot mismatches, ...) always run regardless,
 # since the composer literally cannot build a document without them holding;
 # disabling one of those would break the pipeline rather than test a
-# verifier's actual contribution. These two are the only checks in
+# verifier's actual contribution. These are the only checks in
 # _validate_blueprint that are about output quality rather than structural
 # composability, so they're what a verifier ablation run would toggle.
+# required_sections is included here (not always-on) even though a missing
+# required section is a real defect, because -- unlike the referential-
+# integrity checks above -- nothing downstream crashes without it holding;
+# it only degrades contract satisfaction, the same class of "quality, not
+# composability" issue the other two codes already cover. Note this only
+# gates the *check*: the required-sections data itself is always injected
+# into the prompt regardless of this toggle (see PLANNER_REQUIRED_SECTIONS_PROMPT).
 DEFAULT_ENABLED_PLANNER_VALIDATORS: Dict[str, bool] = {
     "plain_title": True,
     "leading_section_number": True,
+    "required_sections": True,
+    "component_kind_pairing": True,
+}
+
+# Which `LatexComponent` values are meaningful for a given `LayoutBlockKind`
+# -- derived from what LatexAssembler's renderers actually consult, not from
+# the prompt's prose guidance alone (see PLANNER_STRATEGY_PROMPT's "Use
+# semantic blocks and components deliberately" paragraph, which was
+# previously only ever enforced by the model choosing to follow it).
+# `PLAIN` is always allowed: every renderer treats it as the harmless
+# no-op default. `FIGURE_FLOAT` ("figure") never appears in any set below --
+# that value belongs to a FigurePlacement's `layout` field (the real image
+# asset's own placement), not a LayoutBlock's `component`; a block declaring
+# it is always a confusion between "this block is *about* a figure" (a
+# `figure`-kind LayoutBlock, prose only) and "this block *is* the figure"
+# (which doesn't exist -- see PLANNER_NO_IMAGES_PROMPT-adjacent guidance
+# against `kind: figure, component: figure`).
+KIND_ALLOWED_COMPONENTS: Dict[LayoutBlockKind, "frozenset[LatexComponent]"] = {
+    LayoutBlockKind.PARAGRAPH: frozenset({LatexComponent.PLAIN}),
+    LayoutBlockKind.LIST: frozenset({LatexComponent.PLAIN}),
+    LayoutBlockKind.KEY_TAKEAWAY: frozenset(
+        {LatexComponent.PLAIN, LatexComponent.TCOLORBOX, LatexComponent.MINIPAGE}
+    ),
+    LayoutBlockKind.DEFINITION: frozenset(
+        {LatexComponent.PLAIN, LatexComponent.TCOLORBOX, LatexComponent.MINIPAGE}
+    ),
+    LayoutBlockKind.WARNING: frozenset(
+        {LatexComponent.PLAIN, LatexComponent.TCOLORBOX, LatexComponent.MINIPAGE}
+    ),
+    LayoutBlockKind.CASE_STUDY: frozenset(
+        {LatexComponent.PLAIN, LatexComponent.TCOLORBOX, LatexComponent.MINIPAGE}
+    ),
+    LayoutBlockKind.COMPARISON: frozenset(
+        {LatexComponent.PLAIN, LatexComponent.TCOLORBOX, LatexComponent.MINIPAGE}
+    ),
+    LayoutBlockKind.TABLE: frozenset(
+        {LatexComponent.PLAIN, LatexComponent.TABULARX, LatexComponent.LONGTABLE}
+    ),
+    LayoutBlockKind.NOTATION_TABLE: frozenset(
+        {LatexComponent.PLAIN, LatexComponent.TABULARX, LatexComponent.LONGTABLE}
+    ),
+    LayoutBlockKind.FIGURE: frozenset({LatexComponent.PLAIN}),
+    LayoutBlockKind.EQUATION: frozenset({LatexComponent.PLAIN}),
+    LayoutBlockKind.THEOREM: frozenset({LatexComponent.PLAIN}),
+    LayoutBlockKind.PROOF_SKETCH: frozenset({LatexComponent.PLAIN}),
 }
 
 
@@ -520,6 +580,19 @@ instead as a `table`, `notation_table`, `comparison`, or descriptive
 `paragraph` block -- never as a FIGURE node.
 """
 
+# Appended only when PlannerInput.required_sections is non-empty. The actual
+# required sections (id/title/purpose/required_points) are serialized into
+# the per-request user prompt (see _build_detailed_user_prompt), not here --
+# this is just the standing instruction to comply with them.
+PLANNER_REQUIRED_SECTIONS_PROMPT = """
+### Required Sections
+The request below lists required sections this document MUST include. For
+each one, create a matching SECTION node -- reuse its `section_id` and
+`title` where reasonable, and fold its `purpose`/`required_points` into that
+section's `key_points`/`instructions` (and its blocks', where relevant).
+Additional sections beyond the required ones are fine.
+"""
+
 class PlannerAgent:
     """
     Transforms a user query into an initial Document Graph structure.
@@ -582,6 +655,8 @@ class PlannerAgent:
         )
         if not planner_input.allow_figures:
             system_prompt += PLANNER_NO_IMAGES_PROMPT
+        if planner_input.required_sections:
+            system_prompt += PLANNER_REQUIRED_SECTIONS_PROMPT
         if not use_structured:
             system_prompt += PLANNER_LEGACY_OUTPUT_FORMAT_PROMPT
 
@@ -624,7 +699,11 @@ class PlannerAgent:
                 plan = PlannerOutput.model_validate(plan_data)
                 if plan.request_id is None:
                     plan.request_id = planner_input.request_id
-                self._validate_blueprint(plan, allow_figures=planner_input.allow_figures)
+                self._validate_blueprint(
+                    plan,
+                    allow_figures=planner_input.allow_figures,
+                    required_sections=planner_input.required_sections,
+                )
                 tracker.record_success(attempt)
                 return plan
             except Exception as exc:
@@ -637,7 +716,12 @@ class PlannerAgent:
             f"PlannerAgent failed to produce a valid plan after {max_attempts} attempts: {last_error}"
         ) from last_error
 
-    def _validate_blueprint(self, plan: PlannerOutput, allow_figures: bool = True) -> None:
+    def _validate_blueprint(
+        self,
+        plan: PlannerOutput,
+        allow_figures: bool = True,
+        required_sections: Optional[List[RequiredSection]] = None,
+    ) -> None:
         """Reject graph/layout contracts that cannot be composed safely.
 
         The LLM chooses the layout, but this deterministic validation prevents a
@@ -724,6 +808,16 @@ class PlannerAgent:
                 block_ids.add(block.id)
                 if self.enabled_validators.get("plain_title", True):
                     validate_plain_title(block.title, f"Layout block '{block.id}'")
+                if (
+                    self.enabled_validators.get("component_kind_pairing", True)
+                    and block.component not in KIND_ALLOWED_COMPONENTS[block.kind]
+                ):
+                    allowed = sorted(c.value for c in KIND_ALLOWED_COMPONENTS[block.kind])
+                    raise ValueError(
+                        f"Layout block '{block.id}' has kind '{block.kind.value}' with "
+                        f"component '{block.component.value}', which doesn't apply to that "
+                        f"kind -- allowed component(s) for '{block.kind.value}': {allowed}."
+                    )
                 if block.kind == LayoutBlockKind.FIGURE and not block.asset_id:
                     raise ValueError(f"Figure block '{block.id}' must declare an asset_id.")
                 if block.asset_id and block.asset_id not in figure_ids:
@@ -779,6 +873,30 @@ class PlannerAgent:
                         f"'{placement.anchor_after_block}' in section '{placement.owner_section}'."
                     )
 
+        if required_sections and self.enabled_validators.get("required_sections", True):
+            # Same matcher evaluate_contract uses post-hoc (section_id, then
+            # normalized title, then title/purpose keyword overlap against
+            # unclaimed sections) -- see the import comment at the top of
+            # this file for why it's reused rather than reimplemented.
+            # topic_keywords comes from this blueprint's own title (not a
+            # separate benchmark_item.title) so this check is self-contained
+            # on data _validate_blueprint already has.
+            topic_keywords = _keywords(blueprint.document.title or "")
+            claimed_ids: set[str] = set()
+            unmatched: List[str] = []
+            for required_section in required_sections:
+                matched, _matched_via = _match_required_section(
+                    required_section, blueprint, claimed_ids, topic_keywords
+                )
+                if matched is None:
+                    unmatched.append(f"{required_section.section_id} ({required_section.title!r})")
+                else:
+                    claimed_ids.add(matched.section_id)
+            if unmatched:
+                raise ValueError(
+                    "Blueprint is missing required section(s): " + "; ".join(unmatched)
+                )
+
     def _build_detailed_user_prompt(
         self, planner_input: PlannerInput, previous_error: Optional[str] = None
     ) -> str:
@@ -793,6 +911,17 @@ class PlannerAgent:
             if previous_error
             else ""
         )
+        required_sections_block = ""
+        if planner_input.required_sections:
+            required_lines = "\n".join(
+                f"        - [{req.section_id}] \"{req.title}\" -- {req.purpose}"
+                + (f" (must cover: {', '.join(req.required_points)})" if req.required_points else "")
+                for req in planner_input.required_sections
+            )
+            required_sections_block = f"""
+        Required Sections (see "### Required Sections" above -- each of these needs a matching SECTION node):
+{required_lines}
+        """
         prompt = f"""
         {retry_notice}Document Request:
         - Project ID: {planner_input.request_id}
@@ -803,7 +932,7 @@ class PlannerAgent:
         Template Info:
         - Main Template: {planner_input.template.name}
         - Suggested Order: {planner_input.template.section_order}
-
+        {required_sections_block}
         Generate the 'nodes_to_create' and 'hierarchy_edges' now.
         """
         return prompt.strip()

@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, validator
 from enum import Enum
 
 from src.common.state import DocumentBlueprint
+from src.dataset.schemas import RequiredSection
 
 # Some LLM responses double-escape backslashes when they emit a JSON string
 # whose value itself contains a markdown/LaTeX newline, so json.loads() leaves
@@ -161,6 +162,11 @@ class PlannerInput(BaseModel):
         description="If False, no image-generation model is available for this run -- "
         "the planner must not create any FIGURE node, asset_node, or figure_slots entry.",
     )
+    # Populated from BenchmarkItem.required_sections when the request comes
+    # from a benchmark dataset item; empty otherwise. When non-empty, the
+    # planner is prompted to cover each one and _validate_blueprint checks
+    # that coverage (see DEFAULT_ENABLED_PLANNER_VALIDATORS["required_sections"]).
+    required_sections: List[RequiredSection] = Field(default_factory=list)
 
 class SectionSpec(BaseModel):
     """state.py의 DocumentNode 내 spec 필드에 들어갈 상세 지침"""

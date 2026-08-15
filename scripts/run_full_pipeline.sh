@@ -10,7 +10,7 @@ python3 scripts/run_full_pipeline.py \
 # Short-form (dataset2) dev set -- see README "Short-form variant (dataset2/)".
 # Use data/benchmark/dev_debug.jsonl instead for the original long-form set.
 python3 scripts/run_full_pipeline.py \
-  --dataset "dataset2/benchmark/dev_debug.jsonl" \
+  --dataset "dataset2/benchmark/benchmark_v2.jsonl" \
   --image-model none \
   --planner-model gpt-4o-mini 
 

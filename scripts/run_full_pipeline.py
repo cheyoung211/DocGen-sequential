@@ -300,6 +300,7 @@ class DocGenPipeline:
                 user_query=user_query,
                 template=TemplateSpec(name=template_name, main_tex_template="main.tex"),
                 allow_figures=self.images_enabled,
+                required_sections=benchmark_item.required_sections if benchmark_item else [],
             )
 
             print("[Pipeline] Phase 1: Planning Document Structure...")

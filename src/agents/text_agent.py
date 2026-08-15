@@ -10,6 +10,8 @@ from pydantic import ValidationError
 
 from scripts.llm_client import LLMClient
 from src.agents.latex_assembler import (
+    ENVIRONMENT_TOKEN,
+    is_markdown_table,
     validate_fragment_environments,
     validate_markdown_table_columns,
     validate_no_manual_labels,
@@ -92,6 +94,8 @@ DEFAULT_ENABLED_VALIDATORS: Dict[str, bool] = {
     "figure_content": True,
     "unicode_math_symbol": True,
     "bare_math_notation": True,
+    "table_shape": True,
+    "equation_shape": True,
 }
 
 # A raw Unicode Greek letter or math symbol renders correctly by pure luck
@@ -211,6 +215,45 @@ def _validate_bare_math_commands(content: str, block_id: Optional[str]) -> None:
             "expression in math delimiters."
         )
 
+
+# table_columns (above) only checks a table's *internal* correctness (every
+# row has the header's column count) once it's already recognized as a
+# table -- it silently no-ops on content that isn't table-shaped at all
+# (see is_markdown_table). Nothing used to catch that case: a `table`/
+# `notation_table` block containing plain prose passed every existing check
+# and reached LatexAssembler, which silently wrapped the whole prose blob as
+# a fake one-cell table (_single_column_table) instead of failing anywhere.
+# Symmetrically, `bare_math_notation` is explicitly skipped for `equation`
+# blocks (their content IS the math body, no $...$ wrapper needed), which
+# left an equation block with literally no math notation at all -- plain
+# English prose -- completely unchecked; LatexAssembler._render_equation
+# then wrapped it verbatim, unescaped, inside \begin{equation}...\end{equation}.
+# Deliberately narrow: chars that essentially never appear in ordinary
+# English prose but are near-universal in even a bare (undelimited) formula
+# like "E = mc^2" -- this must not reject a legitimate bare equation body
+# just because it has no '$'.
+_EQUATION_MATH_SIGNAL_CHARS = "=^_$\\"
+
+
+def _validate_component_content_shape(
+    kind: LayoutBlockKind, content: str, block_id: Optional[str]
+) -> None:
+    if kind in (LayoutBlockKind.TABLE, LayoutBlockKind.NOTATION_TABLE):
+        if not (is_markdown_table(content) or ENVIRONMENT_TOKEN.search(content)):
+            raise ValueError(
+                f"Block '{block_id}' is a table/notation_table block but its content "
+                "isn't table-shaped -- write a Markdown pipe table (with a header "
+                "separator row) or a tabular/tabularx/longtable fragment, not prose."
+            )
+    elif kind == LayoutBlockKind.EQUATION:
+        if not any(char in content for char in _EQUATION_MATH_SIGNAL_CHARS):
+            raise ValueError(
+                f"Block '{block_id}' is an equation block but its content has no math "
+                "notation ('=', '^', '_', '$', or a LaTeX command) -- write an actual "
+                "mathematical expression, not a prose description of one."
+            )
+
+
 # One deterministic, rule-specific remediation instruction per SemanticBlockError
 # code. Looked up by _build_prompt_from_node and injected next to that block's
 # own error message, instead of the one hard-coded, equation-shaped hint every
@@ -239,6 +282,16 @@ REMEDIATION_HINTS: Dict[str, str] = {
         "must have the same number of '|'-delimited columns as the header. A "
         "raw '|' inside a cell is read as an extra column -- use '\\mid' for a "
         "conditional-probability or set-builder bar, or '\\|' for a literal pipe."
+    ),
+    "table_shape": (
+        "Rewrite \"content\" as an actual table: a Markdown pipe table with a "
+        "header row, a '|---|---|' separator row, and data rows -- or a "
+        "tabular/tabularx/longtable fragment. Do not describe the table in prose."
+    ),
+    "equation_shape": (
+        "Rewrite \"content\" as an actual mathematical expression (using '=', "
+        "'^', '_', LaTeX commands like '\\frac{}{}', etc.), not a prose "
+        "description of one. No '$...$' wrapper is needed -- the composer adds it."
     ),
     "plain_title": (
         '"title" is plain text only -- remove the backslash/LaTeX command from '
@@ -884,6 +937,30 @@ Figures owned by this section; refer to these only when relevant:
                 validate_markdown_table_columns(content_block.content, block_id)
             except ValueError as exc:
                 errors.append(SemanticBlockError("table_columns", block_id, str(exc)))
+
+        # Content-shape checks, as opposed to table_columns' internal-
+        # correctness check above: does this block even look like the thing
+        # its kind claims to be. COMPARISON is deliberately excluded from the
+        # table-shape check -- LatexAssembler._render_comparison already
+        # treats plain prose as an equally legitimate rendering for that
+        # kind, unlike TABLE/NOTATION_TABLE.
+        if (
+            layout_block.kind in (LayoutBlockKind.TABLE, LayoutBlockKind.NOTATION_TABLE)
+            and self.enabled_validators.get("table_shape", True)
+        ):
+            try:
+                _validate_component_content_shape(layout_block.kind, content_block.content, block_id)
+            except ValueError as exc:
+                errors.append(SemanticBlockError("table_shape", block_id, str(exc)))
+
+        if (
+            layout_block.kind == LayoutBlockKind.EQUATION
+            and self.enabled_validators.get("equation_shape", True)
+        ):
+            try:
+                _validate_component_content_shape(layout_block.kind, content_block.content, block_id)
+            except ValueError as exc:
+                errors.append(SemanticBlockError("equation_shape", block_id, str(exc)))
 
         if self.enabled_validators.get("plain_title", True):
             try:
