@@ -118,6 +118,28 @@ FORBIDDEN_LAYOUT_ENVIRONMENTS = {
     "tcolorbox",
     "minipage",
 }
+# Pure matrix notation (no numbering, no cross-reference target of its own --
+# it only ever appears nested inside a $...$/equation body) is allowed in
+# every block type's content, not just EQUATION. Splitting these out of
+# EQUATION's set is what lets a CASE_STUDY/PROOF_SKETCH-style prose block
+# write out an eigenvector calculation as \begin{pmatrix}...\end{pmatrix}
+# directly, instead of forbidden_environment forcing a false choice between
+# "no matrix at all" and "wrap it in a whole separate numbered equation
+# block" -- see the worked_examples incident this was pulled out to fix
+# (pmatrix in CASE_STUDY/PROOF_SKETCH hit forbidden_environment every retry,
+# exhausting the section's 3 attempts and failing the whole pipeline run).
+# Numbered/labeled *display* environments (equation, align, gather, ...) stay
+# EQUATION-only: those need the composer's own label bookkeeping, and are
+# exactly what REMEDIATION_HINTS["forbidden_environment"] tells a prose block
+# to use a dedicated `equation` block for instead.
+MATRIX_ENVIRONMENTS = {
+    "matrix",
+    "pmatrix",
+    "bmatrix",
+    "vmatrix",
+    "Vmatrix",
+    "smallmatrix",
+}
 ALLOWED_ENVIRONMENTS = {
     SemanticBlockType.LIST: {"itemize", "enumerate", "description"},
     SemanticBlockType.COMPARISON: {"tabular", "tabularx", "array"},
@@ -135,13 +157,8 @@ ALLOWED_ENVIRONMENTS = {
         "multline*",
         "split",
         "cases",
-        "matrix",
-        "pmatrix",
-        "bmatrix",
-        "vmatrix",
-        "Vmatrix",
-        "smallmatrix",
-    },
+    }
+    | MATRIX_ENVIRONMENTS,
 }
 ENVIRONMENT_TOKEN = re.compile(r"\\(?P<action>begin|end)\s*\{(?P<name>[A-Za-z*]+)\}")
 
@@ -168,7 +185,12 @@ def validate_fragment_environments(block_type: SemanticBlockType, content: str, 
             f"Block '{block_id}' contains a document-level or unsafe LaTeX command."
         )
 
-    allowed = ALLOWED_ENVIRONMENTS.get(block_type, set())
+    # Matrix notation is allowed in every block type's content (see
+    # MATRIX_ENVIRONMENTS), not just whatever ALLOWED_ENVIRONMENTS lists for
+    # this specific block_type -- a type with no entry there at all (e.g.
+    # CASE_STUDY, PROOF_SKETCH) still gets `set()` from .get() and must not
+    # lose the matrix allowance to that default.
+    allowed = ALLOWED_ENVIRONMENTS.get(block_type, set()) | MATRIX_ENVIRONMENTS
     stack: List[str] = []
     for token in ENVIRONMENT_TOKEN.finditer(normalized):
         name = token.group("name")
@@ -442,6 +464,9 @@ VALID_WIDTH = re.compile(r"(?:0?\.\d+|1(?:\.0+)?)\\(?:textwidth|linewidth|column
 # opaque compiler failure (or, for dangling references, instead of a silently
 # incomplete PDF full of "??").
 REFERENCE_COMMAND = re.compile(r"\\(?:ref|Cref|cref|eqref|nameref|autoref|pageref)\*?\{(?P<label>[^{}]+)\}")
+# Matches the `% <layout-anchor:{block_id}>` comment _render_section writes
+# immediately before each block -- see locate_block_at_line.
+_LAYOUT_ANCHOR_LINE = re.compile(r"^%\s*<layout-anchor:(?P<block_id>[A-Za-z0-9_-]+)>\s*$")
 UNESCAPED_OPEN_BRACE = re.compile(r"(?<!\\)\{")
 UNESCAPED_CLOSE_BRACE = re.compile(r"(?<!\\)\}")
 # The argument of these commands is a label key, not prose: _sanitize_prose
@@ -891,6 +916,13 @@ class LatexAssembler:
         rendered: List[str] = [self._render_section_heading(layout, blueprint)]
 
         for layout_block, content_block in zip(layout.blocks, semantic_blocks):
+            # Written immediately before the block's own rendered LaTeX so a
+            # compiler error's line number can be resolved back to the block
+            # that produced it (see locate_block_at_line) -- the same
+            # convention TextAgent._render_draft_with_anchors already uses
+            # for its own draft artifact, applied here to the text that
+            # actually gets compiled.
+            rendered.append(f"% <layout-anchor:{layout_block.id}>")
             rendered.append(self._render_semantic_block(layout_block, content_block))
 
             for figure_id in figure_after.pop(layout_block.id, []):
@@ -904,6 +936,31 @@ class LatexAssembler:
         if blueprint.layout_policy.get("insert_float_barrier_after_section", False):
             rendered.append(r"\FloatBarrier")
         return "\n\n".join(part for part in rendered if part.strip()) + "\n"
+
+    @staticmethod
+    def locate_block_at_line(section_tex_path: Path, line_number: int) -> Optional[str]:
+        """Resolve a 1-indexed line number in a rendered ``sections/{id}.tex``
+        file back to the semantic block whose content that line belongs to.
+
+        Used by the compile-repair loop (``run_full_pipeline.
+        DocGenPipeline._repair_and_recompile``) to narrow a tectonic error
+        down to one block instead of redrafting the whole section. Returns
+        ``None`` -- caller falls back to whole-section regeneration -- when
+        the file doesn't exist, or the line falls before any anchor (e.g.
+        inside the section heading itself).
+        """
+        if not section_tex_path.is_file():
+            return None
+        current_block_id: Optional[str] = None
+        for index, line in enumerate(
+            section_tex_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+        ):
+            match = _LAYOUT_ANCHOR_LINE.match(line)
+            if match:
+                current_block_id = match.group("block_id")
+            if index >= line_number:
+                break
+        return current_block_id
 
     def _read_semantic_blocks(
         self,

@@ -13,7 +13,8 @@ log -- this is an independent parser, not a reuse of that one.
 from __future__ import annotations
 
 import re
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 from src.evaluation.schemas import RecoveryAction
 
@@ -99,6 +100,62 @@ def classify_recovery_action(error_type: Optional[str]) -> Optional[RecoveryActi
     if error_type in _INFRASTRUCTURE_FAILURE_ERROR_TYPES:
         return RecoveryAction.INFRASTRUCTURE_FAILURE
     return RecoveryAction.UNKNOWN
+
+
+@dataclass(frozen=True)
+class CompileErrorLocation:
+    """One fatal error, resolved back to the section file tectonic was
+    reading when it fired.
+
+    ``section_id`` needs no extra lookup to become a graph node id:
+    ``LatexAssembler._write_main_tex`` ``\\input``s every section from its
+    own physical file (``sections/{section_id}.tex``), so tectonic's own
+    path component in the log line already *is* the section_id.
+    """
+
+    section_id: str
+    line: int
+    message: str
+    error_type: str
+
+
+# Same path tectonic reports every diagnostic against: the physical file it
+# was reading when the diagnostic fired. Only fatal ``error:`` lines are
+# matched (not ``warning:``) -- a warning (e.g. the missing-character/
+# overfull-hbox lines seen in real logs) is cosmetic, not a reason to spend
+# an LLM call rewriting a block. Never observed for pdflatex (see the module
+# docstring): its log instead nests file names as parenthesis-delimited
+# push/pop markers, which needs a stack to resolve correctly and isn't
+# attempted here -- extract_error_locations() simply returns no locations
+# for a pdflatex log.
+_TECTONIC_LOCATED_ERROR = re.compile(
+    r"^error:\s*sections/(?P<section_id>[A-Za-z0-9_-]+):(?P<line>\d+):\s*(?P<message>.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_error_locations(log_text: str, engine_name: str) -> List[CompileErrorLocation]:
+    """Return every fatal error tectonic attributed to a specific section
+    file, in log order. Empty for a pdflatex log, or for a tectonic log
+    whose fatal error has no section-file location (e.g. a preamble-level
+    failure) -- callers fall back to their non-located behavior either way.
+    """
+    if "tectonic" not in engine_name.lower():
+        return []
+    locations: List[CompileErrorLocation] = []
+    for match in _TECTONIC_LOCATED_ERROR.finditer(log_text):
+        message = match.group("message").strip()
+        if any(s in message.lower() for s in _TECTONIC_BOILERPLATE_SUBSTRINGS):
+            continue
+        locations.append(
+            CompileErrorLocation(
+                section_id=match.group("section_id"),
+                line=int(match.group("line")),
+                message=message,
+                error_type=classify_error_type(message),
+            )
+        )
+    return locations
 
 
 def parse_compile_log(log_text: str, engine_name: str) -> Tuple[int, int, Optional[str]]:

@@ -154,6 +154,47 @@ class SemanticIntegratorTest(unittest.TestCase):
                 os.chdir(original_cwd)
 
 
+class MatrixEnvironmentInAnyBlockTypeTest(unittest.TestCase):
+    """Regression coverage for the worked_examples incident: a pmatrix in a
+    CASE_STUDY/PROOF_SKETCH block used to hit forbidden_environment on every
+    retry (ALLOWED_ENVIRONMENTS had no entry at all for those types, so
+    .get(block_type, set()) allowed nothing), exhausting TextAgent's 3
+    attempts and failing the whole pipeline run -- see MATRIX_ENVIRONMENTS /
+    validate_fragment_environments in latex_assembler.py."""
+
+    def test_pmatrix_allowed_in_case_study_and_proof_sketch(self) -> None:
+        from src.agents.latex_assembler import validate_fragment_environments
+
+        content = (
+            r"The eigenvectors are $\begin{pmatrix} 1 \\ 0 \end{pmatrix}$ and "
+            r"$\begin{pmatrix} 0 \\ 1 \end{pmatrix}$."
+        )
+        for block_type in (SemanticBlockType.CASE_STUDY, SemanticBlockType.PROOF_SKETCH):
+            validate_fragment_environments(block_type, content, "b1")  # must not raise
+
+    def test_every_matrix_variant_allowed_in_a_prose_type(self) -> None:
+        from src.agents.latex_assembler import validate_fragment_environments
+
+        for env in ("matrix", "pmatrix", "bmatrix", "vmatrix", "Vmatrix", "smallmatrix"):
+            content = f"$\\begin{{{env}}} 1 & 0 \\\\ 0 & 1 \\end{{{env}}}$"
+            validate_fragment_environments(SemanticBlockType.PARAGRAPH, content, "b1")
+
+    def test_numbered_display_environment_still_rejected_in_prose_types(self) -> None:
+        from src.agents.latex_assembler import validate_fragment_environments
+
+        content = r"\begin{align} x &= 1 \end{align}"
+        for block_type in (SemanticBlockType.CASE_STUDY, SemanticBlockType.PARAGRAPH):
+            with self.assertRaises(ValueError):
+                validate_fragment_environments(block_type, content, "b1")
+
+    def test_document_framing_environments_still_rejected_alongside_matrix(self) -> None:
+        from src.agents.latex_assembler import validate_fragment_environments
+
+        content = r"\begin{figure}\begin{pmatrix} 1 \end{pmatrix}\end{figure}"
+        with self.assertRaises(ValueError):
+            validate_fragment_environments(SemanticBlockType.CASE_STUDY, content, "b1")
+
+
 class MarkdownTablePipeEscapingTest(unittest.TestCase):
     """Regression coverage for a raw '|' inside a table cell (e.g. conditional
     probability written as 'P(A|B)') desynchronizing the column count -- see

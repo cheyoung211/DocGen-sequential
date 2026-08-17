@@ -21,9 +21,10 @@ from src.agents.image_agent import ImageAgent
 from src.agents.latex_assembler import DEFAULT_ENABLED_ASSEMBLER_VALIDATORS, LatexAssembler
 from src.agents.latex_compiler import LatexCompiler
 from src.dataset.schemas import BenchmarkItem
-from src.evaluation.event_logger import EventLogger
+from src.evaluation.compile_log_parser import classify_recovery_action, extract_error_locations
+from src.evaluation.event_logger import AttemptTracker, EventLogger
 from src.evaluation.metrics.contract_satisfaction import evaluate_contract
-from src.evaluation.schemas import RunResult, TokenUsage
+from src.evaluation.schemas import RecoveryAction, RunResult, Stage, TokenUsage
 from llm_client import DEFAULT_MODEL, LLMClient
 from src.helpers.image_generator_sdxl import SDXLGenerator
 from src.helpers.image_generator_flux import FluxGenerator
@@ -205,7 +206,8 @@ class DocGenPipeline:
                  output_dir: str = "outputs/generations",
                  text_agent_enabled_validators: Optional[Dict[str, bool]] = None,
                  planner_enabled_validators: Optional[Dict[str, bool]] = None,
-                 assembler_enabled_validators: Optional[Dict[str, bool]] = None):
+                 assembler_enabled_validators: Optional[Dict[str, bool]] = None,
+                 max_compile_repair_attempts: int = 2):
 
         # 'none' disables image generation entirely for this run: no image
         # model is loaded, and the planner is instructed (and validated) to
@@ -257,6 +259,13 @@ class DocGenPipeline:
         self.compiler = agents['compiler']
 
         self.output_base = Path(output_dir)
+        # Bounds LatexCompiler-triggered regeneration rounds (see
+        # _repair_and_recompile) -- distinct from `iterations` (Phase 2's
+        # first-draft retry budget) since a compile-repair round is much
+        # cheaper (usually one block, not a whole section) and this backstop
+        # exists mainly to prevent looping forever against a section that
+        # keeps re-failing in a new way each time.
+        self.max_compile_repair_attempts = max_compile_repair_attempts
 
     def run(
         self,
@@ -392,12 +401,131 @@ class DocGenPipeline:
             request_id, output_dir=str(self.output_base), event_logger=event_logger
         )
 
+        if not success:
+            success = self._repair_and_recompile(
+                request_id, graph, event_logger=event_logger, token_usage_records=token_usage_records,
+            )
+
         if success:
             print(f">>> Success! Final PDF located in: {project_dir}")
             _write_log("success")
         else:
             print(">>> Pipeline finished with compilation warnings/errors.")
             _write_log("compile_error", compile_log_path=project_dir / "compile.log")
+
+    def _repair_and_recompile(
+        self,
+        request_id: str,
+        graph: DocumentGraph,
+        *,
+        event_logger: EventLogger,
+        token_usage_records: List[dict],
+    ) -> bool:
+        """React to a failed compile_pdf() by regenerating exactly the block
+        (or, failing that, the whole section) the compiler pointed at, then
+        re-assembling and recompiling -- instead of giving up after the
+        first failed compile the way this pipeline always has.
+
+        Every location tectonic reports is against the physical file it was
+        reading (``sections/{section_id}.tex``, one per graph section -- see
+        ``LatexAssembler._write_main_tex``), so the section is known for
+        free; the block within it is resolved via the
+        ``% <layout-anchor:...>`` comment ``LatexAssembler._render_section``
+        writes ahead of each block (``LatexAssembler.locate_block_at_line``).
+        When no block resolves -- the error sits before the first anchor, or
+        the error type isn't one TextAgent content can fix at all (a missing
+        asset file, a broken document frame) -- the whole section is
+        redrafted via the existing ``process_node`` instead, or the loop
+        stops outright for a non-content error type.
+
+        One AttemptTracker spans the whole repair loop, not one per
+        recompile, so a fix that takes 2 rounds still pairs as a single
+        failure -> recovery outcome -- the same semantics Planner/TextAgent's
+        own inner retry loops already have (see AttemptTracker's docstring).
+        """
+        project_dir = self.output_base / request_id
+        compile_log_path = project_dir / "compile.log"
+        tracker: Optional[AttemptTracker] = None
+
+        for attempt in range(1, self.max_compile_repair_attempts + 1):
+            log_text = (
+                compile_log_path.read_text(encoding="utf-8", errors="replace")
+                if compile_log_path.is_file() else ""
+            )
+            engine_name = event_logger.compile_result.engine if event_logger.compile_result else None
+            locations = extract_error_locations(log_text, engine_name or self.compiler.engine)
+            regenerable = [
+                loc for loc in locations
+                if classify_recovery_action(loc.error_type) == RecoveryAction.REGENERATE_CONTENT
+            ]
+            if not regenerable:
+                # Nothing here is a content problem TextAgent can fix
+                # (missing asset, broken document frame, or no location at
+                # all) -- stop and let the caller report the failure as before.
+                break
+            location = regenerable[0]
+            if graph.nodes.get(location.section_id) is None:
+                break
+
+            if tracker is None:
+                tracker = AttemptTracker(
+                    event_logger,
+                    stage=Stage.COMPILE,
+                    verifier="latex_compiler",
+                    recovery_action=RecoveryAction.REGENERATE_CONTENT.value,
+                    artifact_id=request_id,
+                    section_id=location.section_id,
+                    producer_model=self.text_model,
+                )
+            tracker.record_failure(attempt, location.error_type, location.message)
+
+            section_tex_path = project_dir / "sections" / f"{location.section_id}.tex"
+            block_id = LatexAssembler.locate_block_at_line(section_tex_path, location.line)
+            print(
+                f"[Pipeline] Compile repair {attempt}/{self.max_compile_repair_attempts}: "
+                f"{location.section_id}" + (f" block '{block_id}'" if block_id else " (whole section)") +
+                f" -- {location.message}"
+            )
+
+            try:
+                if block_id:
+                    self.text_agent.regenerate_blocks(
+                        location.section_id, block_id, location.message, graph, request_id,
+                        output_dir=str(self.output_base), event_logger=event_logger,
+                        usage_sink=token_usage_records,
+                    )
+                else:
+                    self.text_agent.process_node(
+                        location.section_id, graph, request_id,
+                        output_dir=str(self.output_base), event_logger=event_logger,
+                        usage_sink=token_usage_records,
+                    )
+            except Exception as exc:
+                print(f"[Pipeline] Compile repair regeneration failed: {exc}")
+                break
+
+            if graph.nodes[location.section_id].status != NodeStatus.DRAFTED:
+                # regenerate_blocks()/process_node() already marked the node
+                # ERROR and logged its own failure -- nothing new to compile.
+                break
+
+            try:
+                self.assembler.assemble(
+                    request_id, graph, output_dir=str(self.output_base), event_logger=event_logger
+                )
+            except Exception as exc:
+                print(f"[Pipeline] Re-assembly after compile repair failed: {exc}")
+                break
+
+            if self.compiler.compile_pdf(
+                request_id, output_dir=str(self.output_base), event_logger=event_logger
+            ):
+                tracker.record_success(attempt)
+                return True
+
+        if tracker is not None:
+            tracker.record_exhausted()
+        return False
 
 def run_batch(pipeline: DocGenPipeline, dataset_path: str, iterations: int):
     with open(dataset_path, "r", encoding="utf-8") as f:
@@ -438,6 +566,11 @@ def main():
     parser.add_argument("--integrator-model", default=DEFAULT_MODEL, help="LLM slot shared by LatexAssembler/LatexCompiler (currently unused by either), e.g. gpt-5.4-mini or gemini-3-flash")
     parser.add_argument("--out-dir", default="outputs/generations", help="Output directory")
     parser.add_argument("--iterations", type=int, default=3, help="Maximum number of iterations")
+    parser.add_argument(
+        "--max-compile-repair-attempts", type=int, default=2,
+        help="Max compile-failure repair rounds (regenerate the flagged block/section, "
+             "re-assemble, recompile) before giving up (default 2).",
+    )
     parser.add_argument(
         "--disable-text-validator",
         action="append",
@@ -521,6 +654,7 @@ def main():
         text_agent_enabled_validators=text_agent_enabled_validators,
         planner_enabled_validators=planner_enabled_validators,
         assembler_enabled_validators=assembler_enabled_validators,
+        max_compile_repair_attempts=args.max_compile_repair_attempts,
     )
 
     if args.dataset:

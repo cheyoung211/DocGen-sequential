@@ -23,7 +23,7 @@ from src.common.schemas import (
     TextAgentOutput,
     ToolResponse,
 )
-from src.common.state import DocumentGraph, LayoutBlock, LayoutBlockKind, NodeStatus
+from src.common.state import DocumentGraph, LayoutBlock, LayoutBlockKind, NodeStatus, SectionLayout
 from src.evaluation.event_logger import AttemptTracker, EventLogger
 from src.helpers.tools import pandas_csv_to_latex_table
 
@@ -271,7 +271,10 @@ REMEDIATION_HINTS: Dict[str, str] = {
         "may not contain a numbered/labeled display-math or box environment, "
         "even if the instructions ask for something \"numbered\" or \"labeled\" -- "
         "write it as inline math ($...$) instead; a numbered, cross-referenceable "
-        "version belongs in a dedicated `equation` block only."
+        "version belongs in a dedicated `equation` block only. Exception: matrix "
+        "notation (matrix, pmatrix, bmatrix, vmatrix, Vmatrix, smallmatrix) is "
+        "allowed directly in any block type's content, inside $...$ -- it is not "
+        "numbered/labeled, so it does not need a dedicated `equation` block."
     ),
     "manual_label": (
         "Do not write your own \\label{...}. Cite one of the exact strings from "
@@ -317,6 +320,13 @@ REMEDIATION_HINTS: Dict[str, str] = {
         "they belong to -- in '$...$' (for example '$\\epsilon > 0$', not "
         "'\\epsilon > 0')."
     ),
+    "compile_error": (
+        "This exact block failed to compile as LaTeX with the error shown above. "
+        "Rewrite \"content\" to fix that specific syntax problem (for example, "
+        "close every '$...$'/environment you open, and never leave a math command "
+        "outside '$...$') while preserving the block's meaning -- do not change "
+        "what it says, only the broken LaTeX syntax."
+    ),
 }
 
 SYSTEM_PROMPT = r"""
@@ -349,6 +359,10 @@ Generate content for exactly the requested layout blocks.
   math in prose, or the block's own math body for an `equation` block. Never
   write a LaTeX math command or expression as bare text outside `$...$`
   (wrong: "for every \epsilon > 0"; right: "for every $\epsilon > 0$").
+- Matrix notation (`matrix`, `pmatrix`, `bmatrix`, `vmatrix`, `Vmatrix`,
+  `smallmatrix`) is allowed inside `$...$` in any block type's content, not
+  only `equation` -- it is not numbered/labeled, so it never needs its own
+  dedicated `equation` block.
 
 <Content rules by block type>
 
@@ -600,7 +614,7 @@ class TextAgent:
             raise error
 
         try:
-            layout_blocks = self._layout_blocks_for_node(node_id, graph)
+            layout = self._section_layout_for_node(node_id, graph)
         except Exception as exc:
             _log_precondition_failure(exc)
             graph.update_node_status(node_id, NodeStatus.ERROR, error=str(exc))
@@ -621,11 +635,121 @@ class TextAgent:
             outer_iteration=outer_iteration,
         )
 
-        accepted: Dict[str, ContentBlock] = {}
-        pending_ids = {block.id for block in layout_blocks}
-        block_errors: Dict[str, SemanticBlockError] = {}
+        layout_blocks = layout.blocks
+        return self._run_generation_loop(
+            node,
+            graph,
+            node_id,
+            request_id,
+            sections_dir,
+            layout_blocks,
+            pending_ids={block.id for block in layout_blocks},
+            accepted={},
+            block_errors={},
+            max_attempts=max_attempts,
+            tracker=tracker,
+            usage_sink=usage_sink,
+        )
+
+    def regenerate_blocks(
+        self,
+        node_id: str,
+        block_id: str,
+        error_message: str,
+        graph: DocumentGraph,
+        request_id: str,
+        output_dir: str = "outputs/generations",
+        max_attempts: int = 2,
+        event_logger: Optional[EventLogger] = None,
+        usage_sink: Optional[list] = None,
+        outer_iteration: Optional[int] = None,
+    ) -> Optional[TextAgentOutput]:
+        """Regenerate exactly one block of an already-drafted section.
+
+        Called by the compile-repair loop (``run_full_pipeline.
+        DocGenPipeline._repair_and_recompile``) after a compile failure is
+        attributed to one rendered block via its
+        ``% <layout-anchor:...>`` comment (see
+        ``LatexAssembler.locate_block_at_line``), instead of redrafting the
+        whole section the way ``process_node`` does. Every other block is
+        loaded from the section's persisted ``.blocks.json`` and kept
+        exactly as-is; only ``block_id`` re-enters ``_run_generation_loop``,
+        pre-seeded as already-failing (via a ``SemanticBlockError`` carrying
+        the compiler's own message) so the model sees that message on its
+        first attempt instead of starting blind. Raises if the section has
+        never been drafted yet -- there is nothing to regenerate *from*.
+        """
+        node = graph.nodes.get(node_id)
+        if node is None:
+            raise ValueError(f"Node '{node_id}' not found in graph.")
+        layout = self._section_layout_for_node(node_id, graph)
+        if block_id not in {block.id for block in layout.blocks}:
+            raise ValueError(f"Block '{block_id}' is not part of section '{node_id}'.")
+
+        sections_dir = Path(output_dir) / request_id / "sections"
+        persisted = self._read_persisted_output(sections_dir, node_id)
+        existing = {block.block_id: block for block in persisted.blocks}
+        if block_id not in existing:
+            raise ValueError(
+                f"Block '{block_id}' has no persisted content for section '{node_id}' yet."
+            )
+
+        graph.update_node_status(node_id, NodeStatus.RUNNING)
+        tracker = AttemptTracker(
+            event_logger,
+            stage="text_agent",
+            verifier="text_semantic_block_validator",
+            recovery_action="retry_with_feedback",
+            artifact_id=node_id,
+            section_id=node_id,
+            block_id=block_id,
+            producer_model=self.llm.model_name,
+            outer_iteration=outer_iteration,
+        )
+
+        accepted = {bid: block for bid, block in existing.items() if bid != block_id}
+        block_errors = {block_id: SemanticBlockError("compile_error", block_id, error_message)}
+        return self._run_generation_loop(
+            node,
+            graph,
+            node_id,
+            request_id,
+            sections_dir,
+            layout.blocks,
+            pending_ids={block_id},
+            accepted=accepted,
+            block_errors=block_errors,
+            max_attempts=max_attempts,
+            tracker=tracker,
+            usage_sink=usage_sink,
+            initial_used_tools=persisted.used_tools,
+        )
+
+    def _run_generation_loop(
+        self,
+        node: Any,
+        graph: DocumentGraph,
+        node_id: str,
+        request_id: str,
+        sections_dir: Path,
+        layout_blocks: List[LayoutBlock],
+        pending_ids: set,
+        accepted: Dict[str, ContentBlock],
+        block_errors: Dict[str, SemanticBlockError],
+        max_attempts: int,
+        tracker: AttemptTracker,
+        usage_sink: Optional[list],
+        initial_used_tools: Optional[List[ToolResponse]] = None,
+    ) -> Optional[TextAgentOutput]:
+        """Shared attempt loop behind both ``process_node`` (fresh section
+        draft, every block starts pending) and ``regenerate_blocks`` (an
+        already-drafted section, only the compiler-flagged block pending,
+        every other block pre-seeded into ``accepted`` from disk) -- narrows
+        ``pending_ids`` down on a ``SemanticBlockErrors`` failure exactly the
+        same way either way.
+        """
         last_error: Optional[str] = None
-        used_tools: List[ToolResponse] = []
+        used_tools: List[ToolResponse] = list(initial_used_tools) if initial_used_tools else []
 
         for attempt in range(1, max_attempts + 1):
             pending_layout_blocks = [block for block in layout_blocks if block.id in pending_ids]
@@ -697,7 +821,7 @@ class TextAgent:
         return None
 
     @staticmethod
-    def _layout_blocks_for_node(node_id: str, graph: DocumentGraph) -> List[LayoutBlock]:
+    def _section_layout_for_node(node_id: str, graph: DocumentGraph) -> SectionLayout:
         if graph.blueprint is None:
             raise ValueError("TextAgent requires a DocumentBlueprint on the graph.")
         layout = next(
@@ -708,7 +832,17 @@ class TextAgent:
             raise ValueError(f"No section layout exists for node '{node_id}'.")
         if not layout.blocks:
             raise ValueError(f"Section layout '{node_id}' has no semantic blocks.")
-        return layout.blocks
+        return layout
+
+    @staticmethod
+    def _read_persisted_output(sections_dir: Path, node_id: str) -> TextAgentOutput:
+        blocks_path = sections_dir / f"{node_id}.blocks.json"
+        if not blocks_path.is_file():
+            raise FileNotFoundError(
+                f"No drafted output found for '{node_id}' at '{blocks_path}' -- "
+                "regenerate_blocks() requires the section to already be drafted."
+            )
+        return TextAgentOutput.model_validate(json.loads(blocks_path.read_text(encoding="utf-8")))
 
     def _build_prompt_from_node(
         self,

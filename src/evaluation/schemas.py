@@ -37,9 +37,11 @@ GENERATION_STAGES = frozenset({Stage.PLANNER, Stage.TEXT_AGENT, Stage.IMAGE_AGEN
 
 
 class RecoveryAction(str, Enum):
-    """What kind of recovery a compile failure would need -- classification
-    only, no retry loop consumes this yet. See
-    compile_log_parser.classify_recovery_action.
+    """What kind of recovery a compile failure would need. See
+    compile_log_parser.classify_recovery_action --
+    ``scripts.run_full_pipeline.DocGenPipeline._repair_and_recompile`` acts
+    on ``REGENERATE_CONTENT`` specifically; the other three are classified
+    but never auto-recovered.
     """
 
     REGENERATE_CONTENT = "regenerate_content"
