@@ -125,15 +125,32 @@ class LLMClient:
         timeout: float = 300.0,
         max_retries: int = 2,
         max_new_tokens: int = 4096,
+        seed: Optional[int] = None,
     ) -> None:
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
         self.provider = _infer_provider(model_name)
+        self.seed = seed
 
         if self.provider == "gemini":
             self._init_gemini(api_key=api_key)
         else:
             self._init_openai(api_key=api_key, timeout=timeout, max_retries=max_retries)
+            # The Responses API (client.responses.create) has no `seed`
+            # parameter at all -- confirmed directly against the API, which
+            # rejects it with "Unknown parameter: 'seed'" even via
+            # extra_body. `seed` is a Chat Completions-only feature this
+            # client doesn't use. temperature=0 (forced in _generate_openai/
+            # _generate_openai_structured below) is the closest available
+            # approximation, and even that is not a true determinism
+            # guarantee -- see those methods' docstrings.
+            if self.seed is not None:
+                print(
+                    f"[LLMClient] WARNING: seed={self.seed} was requested for the model "
+                    f"'{model_name}', but the Responses API does not support a seed parameter. "
+                    "Forcing temperature=0 for this client as a best-effort approximation -- "
+                    "output is not guaranteed to be identical across runs."
+                )
 
     def _init_openai(self, *, api_key: Optional[str], timeout: float, max_retries: int) -> None:
         try:
@@ -302,6 +319,7 @@ class LLMClient:
                     max_output_tokens=target_max_tokens,
                     response_mime_type="application/json",
                     response_schema=_pydantic_schema_for_gemini(response_model),
+                    seed=self.seed,
                 ),
             )
             if response.candidates and response.candidates[0].finish_reason == "MAX_TOKENS":
@@ -411,6 +429,10 @@ class LLMClient:
         target_max_tokens: int,
         usage_sink: Optional[List[dict]] = None,
     ) -> str:
+        # No true seed for the Responses API (see __init__) -- temperature=0
+        # is the best available determinism approximation.
+        if self.seed is not None:
+            temperature = 0.0
         response = self._create_openai_response({
             "model": self.model_name,
             "instructions": system_prompt,
@@ -445,6 +467,7 @@ class LLMClient:
                     temperature=temperature,
                     top_p=top_p,
                     max_output_tokens=target_max_tokens,
+                    seed=self.seed,
                 ),
             )
             if response.candidates and response.candidates[0].finish_reason == "MAX_TOKENS":

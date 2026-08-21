@@ -10,3 +10,4 @@ outputs/
 .git.bak/
 evaluation/foundation_metrics/
 test/
+docs/

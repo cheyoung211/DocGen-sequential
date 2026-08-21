@@ -53,9 +53,14 @@ def main() -> None:
     parser.add_argument("--model-name", default=DEFAULT_MODEL, help="OpenAI model name")
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.3)
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Fix the LLM sampling seed, for reproducibility across runs on the same "
+             "data (same meaning as run_full_pipeline.py's --seed -- see LLMClient).",
+    )
     args = parser.parse_args()
 
-    llm = LLMClient(model_name=args.model_name, max_new_tokens=args.max_new_tokens)
+    llm = LLMClient(model_name=args.model_name, max_new_tokens=args.max_new_tokens, seed=args.seed)
     print(f"Using OpenAI Responses API model: {args.model_name}")
 
     # Same engine ("tectonic", falling back to pdflatex) and 2-pass run count as

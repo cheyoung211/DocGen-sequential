@@ -13,7 +13,15 @@ python3 scripts/run_full_pipeline.py \
   --dataset "dataset2/benchmark/benchmark_v2.jsonl" \
   --image-model none \
   --planner-model gpt-4o-mini \
-  --out-dir "outputs/baseline_run" \
+  --out-dir "outputs/all_verifiers/" \
+  --seed 42
+
+python3 scripts/run_full_pipeline.py \
+  --dataset "dataset2/benchmark/benchmark_v2.jsonl" \
+  --image-model none \
+  --planner-model gpt-4o-mini \
+  --out-dir "outputs/baseline_run/" \
+  --seed 42 \
   --disable-text-validator bare_math_notation \
   --disable-text-validator equation_shape \
   --disable-text-validator figure_content \

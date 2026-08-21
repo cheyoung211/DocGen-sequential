@@ -249,6 +249,13 @@ class RunResult(BaseModel):
     benchmark_id: Optional[str] = None
     producer_model: str
     producer_models: Dict[str, str] = Field(default_factory=dict)
+    # The --seed value this run was invoked with, if any (see LLMClient/
+    # get_client in run_full_pipeline.py) -- recorded so a run_result.json
+    # can be traced back to whether/how it was seeded. None means no seed
+    # was requested, not that determinism was achieved; note also that a
+    # seed forces temperature=0 for OpenAI models rather than a true seed,
+    # since the Responses API has no seed parameter at all.
+    seed: Optional[int] = None
     config_name: str = DEFAULT_CONFIG_NAME
     verification_config: VerificationConfigSnapshot = Field(
         default_factory=VerificationConfigSnapshot

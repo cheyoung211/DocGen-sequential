@@ -29,9 +29,9 @@ from llm_client import DEFAULT_MODEL, LLMClient
 from src.helpers.image_generator_sdxl import SDXLGenerator
 from src.helpers.image_generator_flux import FluxGenerator
 
-def get_client(clients, model_name):
+def get_client(clients, model_name, seed=None):
     if model_name not in clients:
-        clients[model_name] = LLMClient(model_name=model_name)
+        clients[model_name] = LLMClient(model_name=model_name, seed=seed)
     return clients[model_name]
 
 def build_user_query(item: Dict[str, Any]) -> str:
@@ -63,6 +63,7 @@ def _build_run_result(
     benchmark_item: Optional[BenchmarkItem],
     producer_models: Optional[Dict[str, str]],
     project_dir: Path,
+    seed: Optional[int] = None,
 ) -> RunResult:
     """Assemble the full evaluation-layer RunResult for one request.
 
@@ -89,6 +90,7 @@ def _build_run_result(
         benchmark_id=benchmark_item.sample_id if benchmark_item else None,
         producer_model=(producer_models or {}).get("text", "unknown"),
         producer_models=producer_models or {},
+        seed=seed,
         completed=(status == "success"),
         status=status,
         error_type=type(error).__name__ if error is not None else None,
@@ -117,6 +119,7 @@ def _write_run_log(
     token_usage_records: Optional[List[dict]] = None,
     benchmark_item: Optional[BenchmarkItem] = None,
     producer_models: Optional[Dict[str, str]] = None,
+    seed: Optional[int] = None,
 ) -> None:
     """Persist one request's outcome to ``<project_dir>/run_result.json``.
 
@@ -142,7 +145,7 @@ def _write_run_log(
                 request_id=request_id, status=status, error=error, event_logger=event_logger,
                 start_time=start_time, token_usage_records=token_usage_records,
                 benchmark_item=benchmark_item, producer_models=producer_models,
-                project_dir=project_dir,
+                project_dir=project_dir, seed=seed,
             )
             project_dir.mkdir(parents=True, exist_ok=True)
             (project_dir / "run_result.json").write_text(
@@ -207,7 +210,8 @@ class DocGenPipeline:
                  text_agent_enabled_validators: Optional[Dict[str, bool]] = None,
                  planner_enabled_validators: Optional[Dict[str, bool]] = None,
                  assembler_enabled_validators: Optional[Dict[str, bool]] = None,
-                 max_compile_repair_attempts: int = 2):
+                 max_compile_repair_attempts: int = 2,
+                 seed: Optional[int] = None):
 
         # 'none' disables image generation entirely for this run: no image
         # model is loaded, and the planner is instructed (and validated) to
@@ -221,23 +225,28 @@ class DocGenPipeline:
         self.text_model = text_model
         self.image_model = image_model
         self.integrator_model = integrator_model
+        # Recorded into RunResult so a run_result.json can be traced back to
+        # the seed that produced it -- see get_client()/LLMClient for what
+        # this actually does per provider (Gemini: real seed; OpenAI: no
+        # seed support, forced temperature=0 instead).
+        self.seed = seed
 
         clients = {}
         agents = {
             'planner_agent': PlannerAgent(
-                llm_client=get_client(clients, planner_model),
+                llm_client=get_client(clients, planner_model, seed=seed),
                 enabled_validators=planner_enabled_validators,
             ),
             'text_agent': TextAgent(
-                llm_client=get_client(clients, text_model),
+                llm_client=get_client(clients, text_model, seed=seed),
                 enabled_validators=text_agent_enabled_validators,
             ),
             'assembler': LatexAssembler(
-                llm_client=get_client(clients, integrator_model),
+                llm_client=get_client(clients, integrator_model, seed=seed),
                 enabled_validators=assembler_enabled_validators,
             ),
             'compiler': LatexCompiler(
-                llm_client=get_client(clients, integrator_model),
+                llm_client=get_client(clients, integrator_model, seed=seed),
             ),
         }
         _warn_verifier_pairing_mismatches(
@@ -248,7 +257,7 @@ class DocGenPipeline:
                 image_generator = SDXLGenerator()
             elif image_model == 'flux':
                 image_generator = FluxGenerator()
-            agents['image_agent'] = ImageAgent(llm_client=get_client(clients, text_model), image_generator=image_generator)
+            agents['image_agent'] = ImageAgent(llm_client=get_client(clients, text_model, seed=seed), image_generator=image_generator)
         else:
             agents['image_agent'] = None
 
@@ -298,7 +307,7 @@ class DocGenPipeline:
             _write_run_log(
                 project_dir, request_id, status=status, error=error, compile_log_path=compile_log_path,
                 event_logger=event_logger, start_time=start_time, token_usage_records=token_usage_records,
-                benchmark_item=benchmark_item, producer_models=producer_models,
+                benchmark_item=benchmark_item, producer_models=producer_models, seed=self.seed,
             )
 
         # 1. Initialize Shared Document Graph via Planner
@@ -572,6 +581,16 @@ def main():
              "re-assemble, recompile) before giving up (default 2).",
     )
     parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Fix the LLM sampling seed for every agent's LLMClient in this run, for "
+             "reproducibility across runs on the same data. Gemini models honor a real "
+             "seed (best effort, per Gemini's own docs). OpenAI models are called via "
+             "the Responses API, which has no seed parameter at all -- passing --seed "
+             "forces temperature=0 for OpenAI calls instead, as the closest available "
+             "approximation; this is not a guaranteed-identical-output determinism, only "
+             "a reduction in sampling randomness.",
+    )
+    parser.add_argument(
         "--disable-text-validator",
         action="append",
         choices=sorted(DEFAULT_ENABLED_VALIDATORS),
@@ -655,6 +674,7 @@ def main():
         planner_enabled_validators=planner_enabled_validators,
         assembler_enabled_validators=assembler_enabled_validators,
         max_compile_repair_attempts=args.max_compile_repair_attempts,
+        seed=args.seed,
     )
 
     if args.dataset:
