@@ -596,9 +596,12 @@ def main():
         choices=sorted(DEFAULT_ENABLED_VALIDATORS),
         metavar="CODE",
         help=(
-            "Turn off one TextAgent content-quality verifier by code, for "
-            "verifier ablation experiments (repeatable). Structural checks "
-            "(block id/order/type, non-empty content) are never disabled. "
+            "Turn off one TextAgent verifier by code, for verifier ablation "
+            "experiments (repeatable), including type_mismatch/empty_content "
+            "(structural checks -- LatexAssembler's composer_semantic_block_"
+            "validator gate re-checks both unconditionally, so disabling "
+            "these surfaces a defect at the composer instead of here, not "
+            "silently). "
             f"Codes: {', '.join(sorted(DEFAULT_ENABLED_VALIDATORS))}"
         ),
     )
@@ -608,11 +611,14 @@ def main():
         choices=sorted(DEFAULT_ENABLED_PLANNER_VALIDATORS),
         metavar="CODE",
         help=(
-            "Turn off one Planner content-quality verifier by code, for "
-            "verifier ablation experiments (repeatable). Referential-integrity "
-            "checks (duplicate/unknown ids, empty section blocks, orphan "
-            "figures, figure slot mismatches, ...) are never disabled -- the "
-            "composer cannot build a document without them holding. "
+            "Turn off one Planner verifier by code, for verifier ablation "
+            "experiments (repeatable), including the referential-integrity "
+            "checks (duplicate_ids, section_graph_consistency, "
+            "non_empty_sections, figure_reference_integrity, "
+            "document_title_required). Unlike TextAgent's structural checks, "
+            "most of these have no redundant always-on re-check downstream, "
+            "so disabling one risks an unhandled exception later in "
+            "TextAgent or the composer instead of this stage's clean error. "
             f"Codes: {', '.join(sorted(DEFAULT_ENABLED_PLANNER_VALIDATORS))}"
         ),
     )

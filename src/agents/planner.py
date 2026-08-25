@@ -370,6 +370,19 @@ DEFAULT_ENABLED_PLANNER_VALIDATORS: Dict[str, bool] = {
     "leading_section_number": True,
     "required_sections": True,
     "component_kind_pairing": True,
+    # The five codes below are referential-integrity checks over the raw
+    # planner output (duplicate/orphan/mismatched identifiers), not
+    # content-quality judgments -- toggleable for the same ablation reason as
+    # the others, but disabling one doesn't have a redundant always-on
+    # safety net the way TextAgent's type_mismatch/empty_content do: a
+    # defect that slips past here surfaces later as a less specific,
+    # possibly uncaught exception in TextAgent or the composer, not a clean
+    # ValueError. See _validate_blueprint's docstring.
+    "duplicate_ids": True,
+    "section_graph_consistency": True,
+    "non_empty_sections": True,
+    "figure_reference_integrity": True,
+    "document_title_required": True,
 }
 
 # Which `LatexComponent` values are meaningful for a given `LayoutBlockKind`
@@ -726,10 +739,15 @@ class PlannerAgent:
 
         The LLM chooses the layout, but this deterministic validation prevents a
         later composer from receiving orphaned sections, invalid figure anchors,
-        or a figure that has more than one planned location.
+        or a figure that has more than one planned location. Every check here
+        is gated by ``self.enabled_validators`` so a full verifier-ablation run
+        can disable them too -- unlike TextAgent's structural checks, most of
+        these have no redundant always-on re-check downstream, so disabling one
+        means a defect surfaces later as a less specific (possibly uncaught)
+        exception rather than this method's clean, early ``ValueError``.
         """
         node_ids = [node.get("id") for node in plan.nodes_to_create if node.get("id")]
-        if len(node_ids) != len(set(node_ids)):
+        if self.enabled_validators.get("duplicate_ids", True) and len(node_ids) != len(set(node_ids)):
             raise ValueError("Planner output contains duplicate node IDs.")
 
         nodes_by_id: Dict[str, Dict] = {
@@ -753,16 +771,24 @@ class PlannerAgent:
             )
         blueprint = plan.blueprint
 
-        if blueprint.document.kind != DocumentKind.SECTION_DRAFT and not blueprint.document.title:
+        if (
+            self.enabled_validators.get("document_title_required", True)
+            and blueprint.document.kind != DocumentKind.SECTION_DRAFT
+            and not blueprint.document.title
+        ):
             raise ValueError("A report or article blueprint must define a document title.")
         if self.enabled_validators.get("plain_title", True):
             validate_plain_title(blueprint.document.title, "Document")
             validate_plain_title(blueprint.document.subtitle, "Document subtitle")
 
         layouts_by_id = {layout.section_id: layout for layout in blueprint.sections}
-        if len(layouts_by_id) != len(blueprint.sections):
+        if self.enabled_validators.get("duplicate_ids", True) and len(layouts_by_id) != len(
+            blueprint.sections
+        ):
             raise ValueError("DocumentBlueprint contains duplicate section layouts.")
-        if set(layouts_by_id) != section_ids:
+        if self.enabled_validators.get("section_graph_consistency", True) and set(
+            layouts_by_id
+        ) != section_ids:
             missing = sorted(section_ids - set(layouts_by_id))
             unexpected = sorted(set(layouts_by_id) - section_ids)
             raise ValueError(
@@ -795,14 +821,17 @@ class PlannerAgent:
             # Planner's own AttemptTracker retries it with feedback instead,
             # which is also the only place that can actually fix it (the
             # blueprint, not TextAgent's output, is what's empty).
-            if not layout.blocks:
+            if self.enabled_validators.get("non_empty_sections", True) and not layout.blocks:
                 raise ValueError(
                     f"Section '{section_id}' has no layout blocks -- every SECTION/SUBSECTION "
                     "must have at least one block for TextAgent to draft."
                 )
             block_ids = set()
             for block in layout.blocks:
-                if block.id in all_block_ids:
+                if (
+                    self.enabled_validators.get("duplicate_ids", True)
+                    and block.id in all_block_ids
+                ):
                     raise ValueError(f"DocumentBlueprint contains duplicate block ID '{block.id}'.")
                 all_block_ids.add(block.id)
                 block_ids.add(block.id)
@@ -818,12 +847,13 @@ class PlannerAgent:
                         f"component '{block.component.value}', which doesn't apply to that "
                         f"kind -- allowed component(s) for '{block.kind.value}': {allowed}."
                     )
-                if block.kind == LayoutBlockKind.FIGURE and not block.asset_id:
-                    raise ValueError(f"Figure block '{block.id}' must declare an asset_id.")
-                if block.asset_id and block.asset_id not in figure_ids:
-                    raise ValueError(
-                        f"Layout block '{block.id}' refers to unknown figure '{block.asset_id}'."
-                    )
+                if self.enabled_validators.get("figure_reference_integrity", True):
+                    if block.kind == LayoutBlockKind.FIGURE and not block.asset_id:
+                        raise ValueError(f"Figure block '{block.id}' must declare an asset_id.")
+                    if block.asset_id and block.asset_id not in figure_ids:
+                        raise ValueError(
+                            f"Layout block '{block.id}' refers to unknown figure '{block.asset_id}'."
+                        )
                 if block.kind == LayoutBlockKind.FIGURE:
                     referenced_figure_ids.add(block.asset_id)
 
@@ -837,7 +867,9 @@ class PlannerAgent:
         # asset_id/block link TextAgent's figure_reference type already
         # relies on closes that gap structurally instead of trusting the
         # model to remember to add one.
-        if figure_ids - referenced_figure_ids:
+        if self.enabled_validators.get("figure_reference_integrity", True) and (
+            figure_ids - referenced_figure_ids
+        ):
             raise ValueError(
                 "Every FIGURE node must be referenced by a `figure`-kind LayoutBlock "
                 "(matching asset_id) in some section, so the drafted prose actually "
@@ -847,7 +879,9 @@ class PlannerAgent:
                 "instead of a FIGURE node."
             )
 
-        if set(blueprint.figure_slots) != figure_ids:
+        if self.enabled_validators.get("figure_reference_integrity", True) and set(
+            blueprint.figure_slots
+        ) != figure_ids:
             missing = sorted(figure_ids - set(blueprint.figure_slots))
             unexpected = sorted(set(blueprint.figure_slots) - figure_ids)
             raise ValueError(
@@ -855,23 +889,24 @@ class PlannerAgent:
                 f"Missing: {missing}; unexpected: {unexpected}."
             )
 
-        for figure_id, placement in blueprint.figure_slots.items():
-            if placement.figure_id != figure_id:
-                raise ValueError(
-                    f"Figure slot key '{figure_id}' does not match figure_id '{placement.figure_id}'."
-                )
-            if placement.owner_section not in section_ids:
-                raise ValueError(
-                    f"Figure '{figure_id}' has unknown owner section '{placement.owner_section}'."
-                )
-            if placement.anchor_after_block:
-                owner_layout = layouts_by_id[placement.owner_section]
-                owner_block_ids = {block.id for block in owner_layout.blocks}
-                if placement.anchor_after_block not in owner_block_ids:
+        if self.enabled_validators.get("figure_reference_integrity", True):
+            for figure_id, placement in blueprint.figure_slots.items():
+                if placement.figure_id != figure_id:
                     raise ValueError(
-                        f"Figure '{figure_id}' has an invalid anchor "
-                        f"'{placement.anchor_after_block}' in section '{placement.owner_section}'."
+                        f"Figure slot key '{figure_id}' does not match figure_id '{placement.figure_id}'."
                     )
+                if placement.owner_section not in section_ids:
+                    raise ValueError(
+                        f"Figure '{figure_id}' has unknown owner section '{placement.owner_section}'."
+                    )
+                if placement.anchor_after_block:
+                    owner_layout = layouts_by_id.get(placement.owner_section)
+                    owner_block_ids = {block.id for block in owner_layout.blocks} if owner_layout else set()
+                    if placement.anchor_after_block not in owner_block_ids:
+                        raise ValueError(
+                            f"Figure '{figure_id}' has an invalid anchor "
+                            f"'{placement.anchor_after_block}' in section '{placement.owner_section}'."
+                        )
 
         if required_sections and self.enabled_validators.get("required_sections", True):
             # Same matcher evaluate_contract uses post-hoc (section_id, then

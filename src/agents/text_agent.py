@@ -96,6 +96,14 @@ DEFAULT_ENABLED_VALIDATORS: Dict[str, bool] = {
     "bare_math_notation": True,
     "table_shape": True,
     "equation_shape": True,
+    # Disabling either of these still leaves the composer's own
+    # composer_semantic_block_validator gate (LatexAssembler.
+    # _validate_semantic_blocks) as a non-toggleable safety net -- it
+    # re-checks type/non-emptiness unconditionally, so a defect that slips
+    # past here surfaces as a clean assembler error instead of silently
+    # corrupting the assembled document. See that method's docstring.
+    "type_mismatch": True,
+    "empty_content": True,
 }
 
 # A raw Unicode Greek letter or math symbol renders correctly by pure luck
@@ -1007,17 +1015,20 @@ Figures owned by this section; refer to these only when relevant:
     ) -> List[SemanticBlockError]:
         """Check one block's content, returning every violation found.
 
-        Structural contract checks (required type, non-empty content) always
-        run -- the composer's single-sole-input contract depends on them.
-        Everything else here is a content-quality verifier gated by
-        ``self.enabled_validators``, so a verifier ablation run can disable
-        one named check without touching the others.
+        Every check here, including the structural ones (required type,
+        non-empty content), is gated by ``self.enabled_validators`` so a full
+        ablation run can disable them too. The composer's single-sole-input
+        contract still holds even then: LatexAssembler._validate_semantic_blocks
+        (the composer_semantic_block_validator gate) re-checks type/order/
+        non-emptiness unconditionally and is deliberately not toggleable, so a
+        defect that slips past here surfaces there instead of silently
+        corrupting the assembled document.
         """
         block_id = layout_block.id
         errors: List[SemanticBlockError] = []
 
         expected_type = SEMANTIC_TYPE_BY_LAYOUT_KIND[layout_block.kind]
-        if content_block.type != expected_type:
+        if self.enabled_validators.get("type_mismatch", True) and content_block.type != expected_type:
             errors.append(
                 SemanticBlockError(
                     "type_mismatch",
@@ -1030,7 +1041,7 @@ Figures owned by this section; refer to these only when relevant:
             # (e.g. checking the wrong type's environment allowlist) --
             # report just this and let the next attempt fix it first.
             return errors
-        if not content_block.content.strip():
+        if self.enabled_validators.get("empty_content", True) and not content_block.content.strip():
             errors.append(
                 SemanticBlockError("empty_content", block_id, f"Block '{block_id}' has empty content.")
             )
