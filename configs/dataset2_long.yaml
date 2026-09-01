@@ -1,0 +1,100 @@
+# Configuration for the long-form benchmark dataset under dataset2/long_benchmark.
+#
+# Companion to configs/dataset2.yaml: that config builds the short-form
+# benchmark at dataset2/benchmark (long_form: false). This config builds a
+# long-form benchmark from the SAME manual seed bank, now extended with a
+# fourth "extreme" difficulty tier (see src/dataset/instruction_builder.py's
+# _DIFFICULTY_TARGETS / _DIFFICULTY_BODY_COUNT and
+# src/dataset/source_adapters/manual_seed.py's "extreme" seeds), so every
+# domain has 40 seeds (10 basic / 10 intermediate / 10 advanced / 10 extreme)
+# instead of 30.
+#
+# Writes to its own dataset2/long_* output subtrees (long_benchmark,
+# long_normalized_seeds, long_metadata) so it never touches dataset2/benchmark,
+# dataset2/normalized_seeds, or dataset2/metadata (the short-form outputs).
+#
+# This dataset is for test-time / inference-time evaluation only. It is not
+# used for model training, and no train/validation/test splits are produced
+# (see build_dataset.py).
+#
+# Run with:
+#   python -m src.dataset.build_dataset --config configs/dataset2_long.yaml --output-dir dataset2 --seed 42
+
+benchmark_version: v2_long
+target_total: 160
+seed: 42
+
+# Selects _DIFFICULTY_TARGETS / _DIFFICULTY_BODY_COUNT (the long-form dicts,
+# now including "extreme") and includes the explicit word-/page-count
+# sentence in natural_language_instruction.
+long_form: true
+
+# Standard long-form threshold (validators.MIN_WORDS_FOR_LONG_FORM); every
+# difficulty tier's min_words (1200/2200/3500/5000) clears this with margin.
+long_form_word_threshold: 800
+
+# Same offline/deterministic manual-seed bank as dataset2.yaml -- only the
+# length contract (and the addition of "extreme" seeds) differs.
+network_sources_enabled: false
+
+domains:
+  mathematics:
+    count: 40
+    enabled_sources:
+      - manual_seed
+      - openstax
+      - arxiv_metadata
+
+  statistics_ml:
+    count: 40
+    enabled_sources:
+      - manual_seed
+      - openstax
+      - arxiv_metadata
+
+  scientific_engineering:
+    count: 40
+    enabled_sources:
+      - manual_seed
+      - nasa_metadata
+      - arxiv_metadata
+
+  financial_economic:
+    count: 40
+    enabled_sources:
+      - manual_seed
+      - sec_metadata
+      - fred_metadata
+      - world_bank_metadata
+
+difficulty_distribution:
+  basic: 0.25
+  intermediate: 0.25
+  advanced: 0.25
+  extreme: 0.25
+
+quality_thresholds:
+  specificity: 0.8
+  evaluability: 0.85
+  latex_relevance: 0.8
+  long_form_suitability: 0.8
+  constraint_clarity: 0.85
+  source_safety: 1.0
+
+# Debug-only subset for smoke-testing consumers of the dataset. Never a
+# training split.
+dev_debug_size: 16
+
+# HTTP behavior for source_adapters/base.py when network_sources_enabled is true.
+http:
+  timeout_seconds: 15
+  max_retries: 4
+  backoff_seconds: 1.0
+  cache_dir: dataset2/raw_sources
+  user_agent: "docgen-benchmark-builder/1.0 (+internal research use)"
+
+output:
+  benchmark_dirname: long_benchmark
+  seeds_dirname: long_normalized_seeds
+  metadata_dirname: long_metadata
+  raw_sources_dirname: raw_sources

@@ -1,0 +1,102 @@
+# Configuration for the long-form benchmark dataset WITHOUT the "extreme"
+# difficulty tier, under dataset2/long_benchmark_no_extreme.
+#
+# Companion to:
+#   - configs/dataset2.yaml       -> dataset2/benchmark            (short-form, basic/intermediate/advanced)
+#   - configs/dataset2_long.yaml  -> dataset2/long_benchmark        (long-form, basic/intermediate/advanced/extreme)
+#   - this file                   -> dataset2/long_benchmark_no_extreme (long-form, basic/intermediate/advanced only)
+#
+# Same manual seed bank as dataset2_long.yaml, but each domain's count is
+# capped at 30 (not 40) so only the original basic/intermediate/advanced
+# seeds are collected -- the 10 "extreme" seeds appended at the end of each
+# domain list in src/dataset/source_adapters/manual_seed.py are never reached
+# (ManualSeedAdapter.fetch_seeds_for_domain takes the first `limit` seeds).
+#
+# Writes to its own dataset2/long_*_no_extreme output subtree so it never
+# touches dataset2/benchmark, dataset2/normalized_seeds, dataset2/metadata,
+# or dataset2/long_benchmark / long_normalized_seeds / long_metadata.
+#
+# This dataset is for test-time / inference-time evaluation only. It is not
+# used for model training, and no train/validation/test splits are produced
+# (see build_dataset.py).
+#
+# Run with:
+#   python -m src.dataset.build_dataset --config configs/dataset2_long_no_extreme.yaml --output-dir dataset2 --seed 42
+
+benchmark_version: v2_long_no_extreme
+target_total: 120
+seed: 42
+
+# Selects _DIFFICULTY_TARGETS / _DIFFICULTY_BODY_COUNT (the long-form dicts)
+# and includes the explicit word-/page-count sentence in
+# natural_language_instruction. Only basic/intermediate/advanced are ever
+# reached here since each domain's count below is capped at 30.
+long_form: true
+
+# Standard long-form threshold (validators.MIN_WORDS_FOR_LONG_FORM); every
+# difficulty tier's min_words (1200/2200/3500) clears this with margin.
+long_form_word_threshold: 800
+
+# Same offline/deterministic manual-seed bank as dataset2.yaml / dataset2_long.yaml.
+network_sources_enabled: false
+
+domains:
+  mathematics:
+    count: 30
+    enabled_sources:
+      - manual_seed
+      - openstax
+      - arxiv_metadata
+
+  statistics_ml:
+    count: 30
+    enabled_sources:
+      - manual_seed
+      - openstax
+      - arxiv_metadata
+
+  scientific_engineering:
+    count: 30
+    enabled_sources:
+      - manual_seed
+      - nasa_metadata
+      - arxiv_metadata
+
+  financial_economic:
+    count: 30
+    enabled_sources:
+      - manual_seed
+      - sec_metadata
+      - fred_metadata
+      - world_bank_metadata
+
+difficulty_distribution:
+  basic: 0.3333
+  intermediate: 0.3333
+  advanced: 0.3334
+
+quality_thresholds:
+  specificity: 0.8
+  evaluability: 0.85
+  latex_relevance: 0.8
+  long_form_suitability: 0.8
+  constraint_clarity: 0.85
+  source_safety: 1.0
+
+# Debug-only subset for smoke-testing consumers of the dataset. Never a
+# training split.
+dev_debug_size: 12
+
+# HTTP behavior for source_adapters/base.py when network_sources_enabled is true.
+http:
+  timeout_seconds: 15
+  max_retries: 4
+  backoff_seconds: 1.0
+  cache_dir: dataset2/raw_sources
+  user_agent: "docgen-benchmark-builder/1.0 (+internal research use)"
+
+output:
+  benchmark_dirname: long_benchmark_no_extreme
+  seeds_dirname: long_normalized_seeds_no_extreme
+  metadata_dirname: long_metadata_no_extreme
+  raw_sources_dirname: raw_sources
