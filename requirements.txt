@@ -1,4 +1,8 @@
-# LLM clients used by every language-model agent (OpenAI Responses API / Google Gemini).
+# LLM clients used by every language-model agent (OpenAI Responses API / Google
+# Gemini / local vLLM via Chat Completions -- the `openai` SDK talks to all of
+# OpenAI and vLLM, see scripts/llm_client.py). vLLM itself is NOT a dependency
+# here: the local model is served by a separate process in its own conda env
+# (qwen_vllm), reached over HTTP, not imported into this one.
 openai>=1.66.0
 google-genai>=1.0.0
 python-dotenv>=1.0.0

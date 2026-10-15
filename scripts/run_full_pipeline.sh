@@ -42,7 +42,26 @@ python3 scripts/run_full_pipeline.py \
   --disable-assembler-validator layout_policy \
   --disable-assembler-validator manual_label \
   --disable-assembler-validator reference \
-  --disable-assembler-validator table_columns 
+  --disable-assembler-validator table_columns
 
-  # 가능 모델: gemini-*-preview / gemini-*.* (Google) or gpt-* (OpenAI)
+# Local Qwen3.6-35B-A3B via vLLM, on data/benchmark/dev_debug.jsonl (12 items,
+# "약 10개" smoke-test subset -- use benchmark_v1.jsonl/benchmark_v2.jsonl for
+# the full 120-item set instead).
+#
+# Prerequisite: the vLLM server must already be running --
+#   /data1/home/chelsy211/qwen_vllm/start_server.sh
+#   curl http://localhost:8911/v1/models   # sanity check it's up
+# (see memory "Qwen3.6 local vLLM setup" for troubleshooting). This still
+# calls scripts/run_full_pipeline.py with python3 like every block above --
+# run it from the `agents` conda env, not base.
+python3 scripts/run_full_pipeline.py \
+  --dataset "data/benchmark/dev_debug.jsonl" \
+  --image-model none \
+  --planner-model qwen3.6-35b-a3b \
+  --text-model qwen3.6-35b-a3b \
+  --integrator-model qwen3.6-35b-a3b \
+  --out-dir "outputs/qwen_smoke_test/" \
+  --seed 42
+
+  # 가능 모델: gemini-*-preview / gemini-*.* (Google) / gpt-* (OpenAI) / qwen3.6-35b-a3b (local vLLM, GPU 3)
 

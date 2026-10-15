@@ -1,9 +1,10 @@
-"""Shared LLM client (OpenAI Responses API / Google Gemini) used by every language-model agent."""
+"""Shared LLM client (OpenAI Responses API / Google Gemini / local vLLM) used by every language-model agent."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from typing import List, Optional, Type
 
 from dotenv import load_dotenv
@@ -17,7 +18,11 @@ load_dotenv(override=True)
 
 
 # DEFAULT_MODEL = "gemini-3-flash-preview"
-DEFAULT_MODEL = "gpt-4o-mini"
+# DEFAULT_MODEL = "gpt-4o-mini"
+# Main model for experiments: Qwen3.6-35B-A3B served locally behind vLLM
+# (see _init_local/_generate_local). Must match the server's
+# --served-model-name (see the vllm serve command in the deployment notes).
+DEFAULT_MODEL = "qwen3.6-35b-a3b"
 
 
 def _infer_provider(model_name: str) -> str:
@@ -30,6 +35,8 @@ def _infer_provider(model_name: str) -> str:
     lowered = model_name.lower()
     if lowered.startswith("gemini"):
         return "gemini"
+    if lowered.startswith("qwen"):
+        return "local"
     return "openai"
 
 
@@ -104,14 +111,25 @@ def _repair_bare_latex_backslashes(text: str) -> str:
     return "".join(output)
 
 
+# Qwen3.6 (and Qwen3 before it) reasons inside a <think>...</think> block by
+# default. _generate_local asks the server to turn that off via
+# chat_template_kwargs, but strips it here too in case a given vLLM version
+# doesn't honor that flag -- every other provider returns plain text, and
+# every downstream agent (JSON parsing, LaTeX assembly) assumes that shape.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
 class LLMClient:
-    """Stateless wrapper around the OpenAI Responses API or Google Gemini API.
+    """Stateless wrapper around the OpenAI Responses API, Google Gemini API,
+    or a local OpenAI-compatible server (vLLM) for self-hosted models (Qwen).
 
     It preserves the original ``generate`` interface used by the existing
-    agents, while moving inference off the local GPU. No tokenizer, checkpoint,
-    CUDA device, or quantization configuration is loaded by this client. The
-    backing provider is picked from ``model_name`` (see ``_infer_provider``),
-    so callers select a model, not an SDK.
+    agents. No tokenizer, checkpoint, CUDA device, or quantization
+    configuration is loaded by this client itself -- a local model still runs
+    in its own vLLM server process, reached over HTTP, so this stays a thin,
+    stateless wrapper regardless of provider. The backing provider is picked
+    from ``model_name`` (see ``_infer_provider``), so callers select a model,
+    not an SDK.
     """
 
     def __init__(
@@ -134,16 +152,20 @@ class LLMClient:
 
         if self.provider == "gemini":
             self._init_gemini(api_key=api_key)
+        elif self.provider == "local":
+            self._init_local(api_key=api_key, timeout=timeout, max_retries=max_retries)
         else:
             self._init_openai(api_key=api_key, timeout=timeout, max_retries=max_retries)
             # The Responses API (client.responses.create) has no `seed`
             # parameter at all -- confirmed directly against the API, which
             # rejects it with "Unknown parameter: 'seed'" even via
             # extra_body. `seed` is a Chat Completions-only feature this
-            # client doesn't use. temperature=0 (forced in _generate_openai/
-            # _generate_openai_structured below) is the closest available
-            # approximation, and even that is not a true determinism
-            # guarantee -- see those methods' docstrings.
+            # client doesn't use for OpenAI. (The local/vLLM provider below
+            # *does* use Chat Completions, so it passes `seed` through
+            # directly instead of needing this workaround.) temperature=0
+            # (forced in _generate_openai/_generate_openai_structured below)
+            # is the closest available approximation, and even that is not a
+            # true determinism guarantee -- see those methods' docstrings.
             if self.seed is not None:
                 print(
                     f"[LLMClient] WARNING: seed={self.seed} was requested for the model "
@@ -186,6 +208,32 @@ class LLMClient:
             )
         self.client = genai.Client(api_key=api_key)
 
+    def _init_local(self, *, api_key: Optional[str], timeout: float, max_retries: int) -> None:
+        """Point the OpenAI SDK at a local OpenAI-compatible server (vLLM) instead of api.openai.com.
+
+        vLLM's OpenAI-compatible server implements Chat Completions, not the
+        Responses API ``_init_openai``/``_generate_openai`` use, so this is a
+        separate provider rather than just swapping ``base_url`` on that path
+        -- see ``_generate_local``. No real API key is needed for a local
+        server; a placeholder is sent because the OpenAI SDK requires a
+        non-empty value.
+        """
+        try:
+            from openai import OpenAI
+        except ImportError as exc:  # pragma: no cover - depends on the deployment environment
+            raise ImportError(
+                "The OpenAI SDK is required (it also talks to the local vLLM server). "
+                "Install the project dependencies with `python3 -m pip install -r requirements.txt`."
+            ) from exc
+
+        base_url = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:8911/v1")
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key or os.getenv("LOCAL_LLM_API_KEY", "not-needed"),
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+
     def generate(
         self,
         system_prompt: str,
@@ -209,6 +257,10 @@ class LLMClient:
 
         if self.provider == "gemini":
             return self._generate_gemini(
+                system_prompt, user_prompt, temperature, top_p, target_max_tokens, usage_sink
+            )
+        if self.provider == "local":
+            return self._generate_local(
                 system_prompt, user_prompt, temperature, top_p, target_max_tokens, usage_sink
             )
         return self._generate_openai(
@@ -420,6 +472,25 @@ class LLMClient:
         except AttributeError:
             pass
 
+    @staticmethod
+    def _record_local_usage(response, usage_sink: Optional[List[dict]]) -> None:
+        """Best-effort token-usage capture; never raises on its own (see
+        ``_record_openai_usage``). The Chat Completions API (what vLLM's
+        OpenAI-compatible server implements) exposes usage on
+        ``response.usage.{prompt_tokens,completion_tokens,total_tokens}`` --
+        different field names than the Responses API above."""
+        if usage_sink is None:
+            return
+        try:
+            usage = response.usage
+            usage_sink.append({
+                "input_tokens": usage.prompt_tokens,
+                "output_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            })
+        except AttributeError:
+            pass
+
     def _generate_openai(
         self,
         system_prompt: str,
@@ -481,6 +552,59 @@ class LLMClient:
         text = (response.text or "").strip()
         if not text:
             raise RuntimeError("Gemini returned no text output for this request.")
+        return text
+
+    def _generate_local(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        top_p: float,
+        target_max_tokens: int,
+        usage_sink: Optional[List[dict]] = None,
+    ) -> str:
+        """Generate via Chat Completions against a local vLLM server.
+
+        Unlike ``_generate_openai``, this provider's `seed` is passed straight
+        through -- vLLM's Chat Completions endpoint, unlike the Responses
+        API, actually accepts one (see the comment in ``__init__``).
+        """
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=target_max_tokens,
+                seed=self.seed,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+        except APIStatusError as exc:
+            raise RuntimeError(
+                f"Local LLM server returned HTTP {exc.status_code}: {exc.message}"
+            ) from exc
+        except APITimeoutError as exc:
+            raise RuntimeError("Local LLM request timed out after configured retries.") from exc
+        except APIConnectionError as exc:
+            raise RuntimeError(
+                f"Could not connect to the local LLM server at {self.client.base_url} -- "
+                "is the vLLM server running?"
+            ) from exc
+
+        self._record_local_usage(response, usage_sink)
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError(
+                "Local LLM response was truncated by max_tokens; increase the token budget."
+            )
+        text = _THINK_BLOCK_RE.sub("", (choice.message.content or "")).strip()
+        if not text:
+            raise RuntimeError("Local LLM returned no text output for this request.")
         return text
 
     @staticmethod
