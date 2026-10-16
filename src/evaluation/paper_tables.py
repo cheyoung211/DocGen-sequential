@@ -6,8 +6,11 @@ into the two tables the write-up tracks across experiments:
 - **Table 4** -- compile success rate and overall contract satisfaction,
   broken down by *trajectory group* (A: no recorded failure, B: resolved
   failures, C: unresolved failures, D: failures without verifier-specific
-  recovery), compared across verifier conditions (e.g. "All verifiers" vs.
-  "No verifier").
+  recovery, U: run_result.json missing/unreadable so failure status is
+  unknown -- never folded into A), compared across verifier conditions
+  (e.g. "All verifiers" vs. "No verifier"). Every group's sample count,
+  compile rate, and contract mean is always reported as real numbers -- no
+  group is ever hidden or shown as N/A regardless of condition.
 - **Table 5** -- document-level contract-satisfaction quality (mean +-
   sd), generation robustness (compile-reached / compile-success rates),
   and generation cost (LLM calls, tokens), compared across the same
@@ -56,6 +59,7 @@ from src.evaluation.metrics.contract_satisfaction import (  # noqa: E402
     aggregate_contract_satisfaction,
     evaluate_contract,
 )
+from src.evaluation.metrics.recovery_success import compute_recovery_success_rate  # noqa: E402
 from src.evaluation.schemas import CompileResult, ContractResult, RunResult  # noqa: E402
 
 
@@ -69,6 +73,16 @@ class TrajectoryGroup(str, Enum):
     B_RESOLVED = "B"
     C_UNRESOLVED = "C"
     D_NO_RECOVERY_PATH = "D"
+    #: Not one of the paper's A--D groups -- a trajectory whose
+    #: run_result.json is missing or failed to parse (see
+    #: ``aggregate._load_run_result``'s ``None`` return). There is *no
+    #: evidence either way* about whether this trajectory recorded a
+    #: failure, so it must never be folded into A ("no recorded failure" is
+    #: a positive claim that the record was checked and was clean, not the
+    #: absence of a record). Kept as its own row in every rendered table so
+    #: these trajectories stay visible instead of silently vanishing from
+    #: the A--D breakdown or silently inflating A.
+    U_UNKNOWN = "U"
 
 
 #: Best-available proxy for "this recovery came from generic JSON-schema
@@ -103,14 +117,13 @@ def classify_trajectory(run_result: Optional[RunResult]) -> TrajectoryClassifica
     """One trajectory (= one generated document / run_result.json) -> its
     Table 4 group.
 
-    Priority, applied in this order because each check is a structural fact
-    about the trajectory, not a preference:
-
-    1. **No verification_events recorded a failure at all** -> Group A
-       ("no recorded failure"). Includes a trajectory with zero verification
-       events whatsoever (e.g. no run_result.json) -- it recorded no
-       failure, which is the group's literal definition, even though that
-       usually also means it never finished.
+    0. **``run_result`` is ``None``** (file missing, or present but failed to
+       parse -- see ``aggregate._load_run_result``) -> Group U ("unknown").
+       There is no verification_events trail to read at all here, so
+       whether a failure occurred is genuinely unknown -- this must not be
+       reported as Group A, which specifically means "checked, and clean".
+    1. **No verification_events recorded a failure** -> Group A ("no
+       recorded failure").
     2. **At least one failure has no ``failure_id``** -> Group D ("failures
        without verifier-specific recovery"). ``failure_id`` is only ever set
        by stages that *have* a recovery mechanism (see
@@ -128,7 +141,7 @@ def classify_trajectory(run_result: Optional[RunResult]) -> TrajectoryClassifica
        failures").
     """
     if run_result is None:
-        return TrajectoryClassification(TrajectoryGroup.A_NO_FAILURE, False)
+        return TrajectoryClassification(TrajectoryGroup.U_UNKNOWN, False)
 
     failures = [e for e in run_result.verification_events if e.result == "fail"]
     if not failures:
@@ -170,10 +183,6 @@ class SampleRecord:
 class Condition:
     label: str
     batch_dir: Path
-    #: Marks this condition as the one where verifier-driven recovery is
-    #: disabled -- controls Table 4's B/C shading, nothing else. Set by the
-    #: caller (``--no-verifier-condition``), never inferred.
-    is_no_verifier: bool
     samples: List[SampleRecord] = field(default_factory=list)
 
 
@@ -181,7 +190,6 @@ def load_condition(
     label: str,
     batch_dir: Path,
     benchmark_items: Optional[Dict[str, BenchmarkItem]] = None,
-    is_no_verifier: bool = False,
 ) -> Condition:
     """Mirrors ``aggregate.aggregate_batch``'s per-sample loading (same
     fallback rules for a missing/legacy run_result.json) but keeps the full
@@ -190,7 +198,7 @@ def load_condition(
     ``per_sample`` summary does not retain.
     """
     benchmark_items = benchmark_items or {}
-    condition = Condition(label=label, batch_dir=batch_dir, is_no_verifier=is_no_verifier)
+    condition = Condition(label=label, batch_dir=batch_dir)
 
     for sample_dir in discover_sample_dirs(batch_dir):
         relative_path = sample_dir.relative_to(batch_dir)
@@ -229,15 +237,28 @@ def load_condition(
 @dataclass
 class GroupCell:
     n: int
+    #: n and compiled_n are always both shown -- never collapse to a bare
+    #: rate without the underlying counts (the user who commissioned this
+    #: script explicitly asked that success counts/denominators never be
+    #: dropped from the table or its accompanying aggregate).
+    compiled_n: int
     compile_rate: Optional[float]
     overall_contract: Optional[float]
-    #: Table 4 only shades/NA's a B or C cell for a no-verifier condition
-    #: when every sample behind it got there via generic JSON-schema
-    #: recovery only (see ``classify_trajectory``'s ``generic_schema_only``).
-    #: If some samples in the bucket are *not* generic-only, this is False
-    #: and the real numbers are shown -- shading never hides a genuine
-    #: verifier-driven recovery just because the condition is "no verifier".
-    shaded_na: bool
+    #: How many of this group's trajectories got there via generic
+    #: JSON-schema recovery only, not a named domain verifier (see
+    #: ``classify_trajectory``'s ``generic_schema_only``) -- reported
+    #: alongside the group, never used to hide or N/A it.
+    generic_schema_only_n: int
+    #: Recovery-attempt success counts/denominators for this group, pooled
+    #: from every member's verification_events/recovery_events via the same
+    #: ``compute_recovery_success_rate`` Metric 2 uses on a whole batch (see
+    #: ``recovery_success.py``) -- the real numbers behind "resolved" (B)
+    #: vs. "unresolved" (C), always kept rather than only showing the group
+    #: label.
+    recovery_successfully_recovered: int
+    recovery_failures_with_recovery_attempt: int
+    recovery_without_recovery_path: int
+    recovery_without_recovery_attempt: int
 
 
 def _mean(values: Sequence[Optional[float]]) -> Optional[float]:
@@ -260,25 +281,29 @@ def build_table4(conditions: Sequence[Condition]) -> Dict[str, Dict[TrajectoryGr
             # whole batch -- guarantees a group's compile rate / contract
             # mean is computed identically to the batch-level Foundation
             # metrics, not a parallel reimplementation of the same formula.
-            compile_rate = (
-                compute_compile_success_rate([m.compile_result for m in members])["compile_success_rate"]
-                if n else None
-            )
+            compile_summary = compute_compile_success_rate([m.compile_result for m in members]) if n else None
             overall_contract = (
                 aggregate_contract_satisfaction(
                     [m.contract_result for m in members if m.contract_result is not None]
                 )["overall"]
                 if n else None
             )
-
-            shaded_na = (
-                condition.is_no_verifier
-                and group in (TrajectoryGroup.B_RESOLVED, TrajectoryGroup.C_UNRESOLVED)
-                and n > 0
-                and all(m.classification.generic_schema_only for m in members)
+            recovery_summary = compute_recovery_success_rate(
+                [e for m in members if m.run_result for e in m.run_result.verification_events],
+                [e for m in members if m.run_result for e in m.run_result.recovery_events],
             )
-            cells[group] = GroupCell(n=n, compile_rate=compile_rate,
-                                      overall_contract=overall_contract, shaded_na=shaded_na)
+
+            cells[group] = GroupCell(
+                n=n,
+                compiled_n=compile_summary["successfully_compiled"] if compile_summary else 0,
+                compile_rate=compile_summary["compile_success_rate"] if compile_summary else None,
+                overall_contract=overall_contract,
+                generic_schema_only_n=sum(1 for m in members if m.classification.generic_schema_only),
+                recovery_successfully_recovered=recovery_summary["successfully_recovered"],
+                recovery_failures_with_recovery_attempt=recovery_summary["failures_with_recovery_attempt"],
+                recovery_without_recovery_path=recovery_summary["detected_failures_without_recovery_path"],
+                recovery_without_recovery_attempt=recovery_summary["detected_failures_without_recovery_attempt"],
+            )
         table[condition.label] = cells
     return table
 
@@ -394,10 +419,15 @@ _GROUP_CAPTION = {
     TrajectoryGroup.B_RESOLVED: "Resolved failures",
     TrajectoryGroup.C_UNRESOLVED: "Unresolved failures",
     TrajectoryGroup.D_NO_RECOVERY_PATH: "Failures without verifier-specific recovery",
+    TrajectoryGroup.U_UNKNOWN: "run_result.json missing/unreadable (failure status unknown -- not counted as A)",
 }
 
 
 def render_table4_markdown(table: Dict[str, Dict[TrajectoryGroup, GroupCell]]) -> str:
+    """Main n / compile rate / overall contract view -- every cell is always
+    the real computed number, no condition ever substitutes N/A. See
+    ``render_table4_detail_markdown`` for the compiled_n, recovery success/
+    denominator, and generic-schema-only counts behind these cells."""
     labels = list(table.keys())
     header = "| Group | " + " | ".join(f"{lbl} n | {lbl} Compile rate | {lbl} Overall contract" for lbl in labels) + " |"
     sep = "|---" * (1 + 3 * len(labels)) + "|"
@@ -406,13 +436,36 @@ def render_table4_markdown(table: Dict[str, Dict[TrajectoryGroup, GroupCell]]) -
         row = [group.value]
         for lbl in labels:
             cell = table[lbl][group]
-            if cell.shaded_na:
-                row += ["N/A", "N/A", "N/A"]
-            else:
-                row += [str(cell.n), _pct(cell.compile_rate), _num(cell.overall_contract)]
+            row += [str(cell.n), _pct(cell.compile_rate), _num(cell.overall_contract)]
         lines.append("| " + " | ".join(row) + " |")
     caption = "\n".join(f"- **{g.value}**: {c}" for g, c in _GROUP_CAPTION.items())
     return "\n".join(lines) + "\n\n" + caption
+
+
+def render_table4_detail_markdown(table: Dict[str, Dict[TrajectoryGroup, GroupCell]]) -> str:
+    """The success counts/denominators behind Table 4's rates: compiled_n/n,
+    and -- for every group, not just B/C -- the pooled recovery-attempt
+    success count and denominator (``compute_recovery_success_rate``'s own
+    ``successfully_recovered``/``failures_with_recovery_attempt``, plus the
+    two no-recovery-path/no-recovery-attempt buckets) and how many of the
+    group's trajectories were generic-JSON-schema-only. Nothing here is
+    hidden or marked N/A; this is the auxiliary aggregate the compact
+    render_table4_* views summarize into a single rate."""
+    lines = [
+        "| Condition | Group | n | Compiled/n | Recovered/Attempted | Without recovery path | "
+        "Without recovery attempt | Generic-schema-only n |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for lbl, groups in table.items():
+        for group in TrajectoryGroup:
+            cell = groups[group]
+            lines.append(
+                f"| {lbl} | {group.value} | {cell.n} | {cell.compiled_n}/{cell.n} | "
+                f"{cell.recovery_successfully_recovered}/{cell.recovery_failures_with_recovery_attempt} | "
+                f"{cell.recovery_without_recovery_path} | {cell.recovery_without_recovery_attempt} | "
+                f"{cell.generic_schema_only_n} |"
+            )
+    return "\n".join(lines)
 
 
 def render_table4_latex(
@@ -420,9 +473,10 @@ def render_table4_latex(
     caption: str = (
         "Comparison of compilation success rate and overall contract by trajectory group. "
         "Groups A--D denote no recorded failure, resolved failures, unresolved failures, and "
-        "failures without verifier-specific recovery, respectively. Shaded cells in Groups B "
-        "and C indicate groups whose recovery attempts arise only from generic JSON-schema, "
-        "not verifier-induced. $n$ denotes the number of trajectories in each group."
+        "failures without verifier-specific recovery, respectively; Group U is trajectories "
+        "whose run\\_result.json is missing or unreadable (failure status unknown). $n$ denotes "
+        "the number of trajectories in each group; per-group compiled/recovered counts and "
+        "denominators, and generic-JSON-schema-only counts, are in the accompanying CSV."
     ),
     label: str = "tab:trajectory_groups",
 ) -> str:
@@ -448,10 +502,7 @@ def render_table4_latex(
         cells = [group.value]
         for lbl in labels:
             cell = table[lbl][group]
-            if cell.shaded_na:
-                cells += ["\\cellcolor{gray!15}N/A", "\\cellcolor{gray!15}N/A", "\\cellcolor{gray!15}N/A"]
-            else:
-                cells += [str(cell.n), _pct(cell.compile_rate, latex=True), _num(cell.overall_contract)]
+            cells += [str(cell.n), _pct(cell.compile_rate, latex=True), _num(cell.overall_contract)]
         lines.append(" & ".join(cells) + " \\\\")
     lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
     return "\n".join(lines)
@@ -460,10 +511,20 @@ def render_table4_latex(
 def render_table4_csv(table: Dict[str, Dict[TrajectoryGroup, GroupCell]], out_path: Path) -> None:
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["condition", "group", "n", "compile_rate", "overall_contract", "shaded_na"])
+        writer.writerow([
+            "condition", "group", "n", "compiled_n", "compile_rate", "overall_contract",
+            "generic_schema_only_n", "recovery_successfully_recovered",
+            "recovery_failures_with_recovery_attempt", "recovery_without_recovery_path",
+            "recovery_without_recovery_attempt",
+        ])
         for lbl, groups in table.items():
             for group, cell in groups.items():
-                writer.writerow([lbl, group.value, cell.n, cell.compile_rate, cell.overall_contract, cell.shaded_na])
+                writer.writerow([
+                    lbl, group.value, cell.n, cell.compiled_n, cell.compile_rate, cell.overall_contract,
+                    cell.generic_schema_only_n, cell.recovery_successfully_recovered,
+                    cell.recovery_failures_with_recovery_attempt, cell.recovery_without_recovery_path,
+                    cell.recovery_without_recovery_attempt,
+                ])
 
 
 _T5_ROW_LABELS = {
@@ -642,9 +703,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-verifier-condition", default=None, metavar="LABEL",
-        help="Which --condition LABEL is the no-verifier run (controls Table 4's B/C shading "
-        "and Table 5's Relative Change baseline). Defaults to the label containing 'no' "
-        "case-insensitively if exactly one matches.",
+        help="Which --condition LABEL is the no-verifier run (Table 5's Relative Change "
+        "baseline). Defaults to the label containing 'no' case-insensitively if exactly one "
+        "matches.",
     )
     parser.add_argument(
         "--all-verifiers-condition", default=None, metavar="LABEL",
@@ -681,10 +742,7 @@ def main() -> None:
     for label, batch_dir in conditions_raw:
         if not batch_dir.exists():
             raise FileNotFoundError(f"--condition {label!r}: directory not found: {batch_dir}")
-        condition = load_condition(
-            label, batch_dir, benchmark_items,
-            is_no_verifier=(label == no_verifier_label),
-        )
+        condition = load_condition(label, batch_dir, benchmark_items)
         print(f"[paper_tables] {label}: {len(condition.samples)} sample(s) discovered under {batch_dir}")
         conditions.append(condition)
 
@@ -695,6 +753,8 @@ def main() -> None:
     (out_dir / "table4.tex").write_text(render_table4_latex(table4) + "\n", encoding="utf-8")
     render_table4_csv(table4, out_dir / "table4.csv")
     print("\n" + render_table4_markdown(table4) + "\n")
+    print("\n[paper_tables] Table 4 detail (success counts/denominators behind each rate):\n")
+    print(render_table4_detail_markdown(table4) + "\n")
 
     table5 = build_table5(conditions)
     if no_verifier_label and all_verifiers_label:
