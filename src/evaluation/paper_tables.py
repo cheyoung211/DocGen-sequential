@@ -32,7 +32,6 @@ functions. Also directly runnable as a CLI -- see ``main()``.
 """
 
 from __future__ import annotations
-
 import argparse
 import csv
 import json

@@ -42,6 +42,7 @@ from src.core.schemas import (
     Constraint,
     Evidence,
     FinalEvaluationResult,
+    ProductionResult,
     RepairAction,
 )
 
@@ -58,9 +59,21 @@ class Producer(Protocol):
     generic here because today's agents each need a different set of
     pipeline-specific objects that this Stage does not standardize away
     (that standardization is Stage 2's artifact graph).
+
+    Returns ``ProductionResult``, not a bare ``ArtifactRef``: today's agents
+    disagree on how they signal "ran out of retries" (``TextAgent.process_node``
+    returns ``None``; ``PlannerAgent.generate_plan`` raises instead -- see
+    ``ProductionResult``'s docstring), and a bare ``ArtifactRef`` return
+    would let an adapter paper over either failure mode by constructing a
+    reference to content that was never actually produced. A conforming
+    ``produce()`` must translate *every* underlying failure mode into
+    ``ProductionResult(status=FAILED, ...)`` -- never let one slip through
+    as a silently-successful-looking ``ArtifactRef``, and never raise past
+    this boundary for an expected, routine failure (exhausted retries) that
+    a controller needs to see and act on, not catch as an exception.
     """
 
-    def produce(self, artifact_id: str, context: Dict[str, Any]) -> ArtifactRef:
+    def produce(self, artifact_id: str, context: Dict[str, Any]) -> ProductionResult:
         ...
 
 
@@ -80,7 +93,33 @@ class Validator(Protocol):
     """Checks one artifact against a set of constraints and returns
     structured ``Evidence`` -- never a bare bool, and never the artifact's
     final quality score (that is ``FinalEvaluator``'s job, kept separate on
-    purpose -- see its docstring below)."""
+    purpose -- see its docstring below).
+
+    ``config`` is a **read-only snapshot** of which checks are currently
+    enabled (the *trigger* axis) -- mutating the object this attribute
+    returns is not guaranteed to, and in general will not, change what
+    ``check()`` actually runs next. A ``Validator`` that supports changing
+    its trigger configuration at runtime must expose that as a separate,
+    explicitly-named method (e.g. ``adapters.TextAgentValidatorAdapter.
+    set_enabled``); a ``Validator`` that does not expose such a method is
+    fixed for its lifetime, and that is a valid, conforming implementation
+    too -- the Protocol does not require mutability, only that ``config``
+    truthfully reflects the current configuration at the moment it is read.
+
+    ``check()`` must account for every ``Constraint`` it is given, not only
+    the ones its underlying checker happens to compute something for: a
+    requested constraint this ``Validator`` can evaluate gets a PASS/FAIL
+    ``Evidence``; one it recognizes but did not actually run this call
+    (trigger disabled, short-circuited by an earlier failure, ...) gets
+    UNKNOWN with ``unknown_reason=NOT_CHECKED``; one it has no way to
+    evaluate at all gets UNKNOWN with ``unknown_reason=NOT_REPRESENTABLE``.
+    Silently dropping a requested constraint from the returned list -- or
+    silently ignoring ``constraints`` altogether and just reporting
+    whatever the underlying checker happens to produce -- is not a
+    conforming implementation, since a later stage's per-constraint
+    evaluation and re-verification (Stage 3+) needs a 1:1 answer for every
+    constraint it asked about.
+    """
 
     config: ValidatorConfig
 
@@ -107,6 +146,24 @@ class RepairPolicy(Protocol):
     widen or narrow scope using them -- a policy that does not use the
     dependency graph at all (e.g. ``adapters.BlindRetryRepairPolicy``) is
     simply one that ignores this argument too.
+
+    Within one call, ``evidence`` for the same target artifact must not
+    produce more than one ``RepairAction`` for it -- group by target first.
+
+    ``decide()`` itself must have **no side effect on any retry-count or
+    budget-spent bookkeeping** a policy keeps internally: it can (and in
+    the real execution loop, will) be called speculatively, more than once,
+    without every -- or any -- returned action actually being carried out.
+    A policy that caps retries per artifact must only advance that counter
+    in response to an explicit, separate signal that an action actually
+    began executing (see ``adapters.BlindRetryRepairPolicy.
+    record_attempt_started`` for the pattern); incrementing it inside
+    ``decide()`` itself double-counts on a repeated call and can exhaust the
+    cap before a single repair has actually run. The next ``decide()`` call
+    in a real loop is expected to receive fresh ``Evidence`` from
+    re-verifying after execution, not the same evidence replayed -- a
+    policy may assume it is driven that way, but must not corrupt its own
+    state if called again before that happens.
     """
 
     def decide(

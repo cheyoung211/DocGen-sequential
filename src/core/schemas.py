@@ -55,6 +55,38 @@ class ArtifactRef(BaseModel):
     read_input_versions: List["ArtifactRef"] = Field(default_factory=list)
 
 
+class ProductionStatus(str, Enum):
+    """Whether a ``Producer.produce()`` call actually generated the
+    artifact. Added because today's two real producers disagree on how they
+    signal running out of retries: ``TextAgent.process_node`` returns
+    ``None`` (``src/agents/text_agent.py:818-821``), while
+    ``PlannerAgent.generate_plan`` raises instead
+    (``src/agents/planner.py:714-716``). A ``Producer`` adapter must
+    normalize both into this one explicit outcome -- a caller must never
+    have to know which legacy failure mechanism a given agent happens to
+    use."""
+
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class ProductionResult(BaseModel):
+    """``Producer.produce()``'s return shape. ``artifact`` is set if and
+    only if ``status`` is ``SUCCESS`` -- enforced below, so a controller
+    reading this can never mistake a failed generation for a real artifact
+    reference."""
+
+    status: ProductionStatus
+    artifact: Optional[ArtifactRef] = None
+    error: Optional[str] = None
+
+    def model_post_init(self, __context: object) -> None:
+        if self.status == ProductionStatus.SUCCESS and self.artifact is None:
+            raise ValueError("ProductionResult with status=SUCCESS requires an artifact.")
+        if self.status == ProductionStatus.FAILED and self.artifact is not None:
+            raise ValueError("ProductionResult with status=FAILED must not carry an artifact.")
+
+
 class DependencyRelationKind(str, Enum):
     EXPLICIT = "explicit"
     INFERRED = "inferred"
