@@ -205,11 +205,27 @@ class Evidence(BaseModel):
     ``input_versions``' liveness rule requires the referenced version to
     currently exist), and, backwards, started being treated as *live again*
     the moment X was finally produced -- exactly backwards from "the thing
-    this verdict depends on changed, so it needs rechecking". An entry here
-    stays live only while ``artifact_id`` is still, right now, never-stored
-    (``ArtifactGraphStore._still_missing``); the moment it starts existing,
-    this verdict must invalidate, the same direction ``input_versions``
-    invalidates when its ref moves to a different version.
+    this verdict depends on changed, so it needs rechecking".
+
+    Holds the full ``ArtifactRef`` (artifact_id **and** version), not just
+    an artifact_id -- a third Stage 3 review found that id-only tracking
+    conflated two different facts: "this artifact_id has never been
+    stored at all" and "this artifact_id exists, but not at the exact
+    version a constraint required" (e.g. ``table@1`` is stored but
+    ``table@2`` was required). With id-only tracking, the moment *any*
+    version of that id appeared (``table@1``, already present before the
+    check even ran), the FAIL was wrongly invalidated even though the
+    specific missing thing it named -- ``table@2`` -- still did not
+    exist. An entry here stays live only while that *exact*
+    ``(artifact_id, version)`` is still, right now, never-stored
+    (``ArtifactGraphStore._still_missing``); the moment that exact version
+    appears, this verdict must invalidate, the same direction
+    ``input_versions`` invalidates when its ref moves to a different
+    version. Never put the same ``ArtifactRef`` on both lists at once --
+    see ``constraint_checks.BasicConstraintChecker._resolve_input_refs``
+    for why every input must be existence-checked before being routed to
+    either list, not assumed from which API a caller happened to declare
+    it through.
     """
 
     constraint_id: str
@@ -218,7 +234,7 @@ class Evidence(BaseModel):
     detail: str = ""
     unknown_reason: Optional[UnknownReason] = None
     input_versions: List[ArtifactRef] = Field(default_factory=list)
-    missing_inputs: List[str] = Field(default_factory=list)
+    missing_inputs: List[ArtifactRef] = Field(default_factory=list)
 
     def model_post_init(self, __context: object) -> None:
         if self.outcome == CheckOutcome.UNKNOWN and self.unknown_reason is None:

@@ -146,6 +146,61 @@ def test_check_through_the_real_executor_a_missing_required_table_stays_live_unt
     assert len(live2) == 1 and live2[0].outcome.value == "pass"
 
 
+def test_check_through_the_real_executor_a_fail_for_a_missing_specific_version_stays_live_even_when_an_older_version_already_exists() -> None:
+    """End-to-end reproduction of a third user-caught repro: table@1
+    already exists, but the constraint requires table@2 (missing).
+    live_evidence must keep the resulting FAIL live -- table@1 already
+    existing must not count as "the required version appeared" -- until
+    table@2 itself is actually produced."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    store.add_version("table", ArtifactKind.TABLE, content="v1")
+    checked_ref = store.latest("checked").ref
+    executor = _executor(store)
+    required_v2 = ArtifactRef(artifact_id="table", version=2, kind=ArtifactKind.TABLE)
+    constraint = Constraint(
+        constraint_id="req_table_v2", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[required_v2]
+    )
+
+    obs = executor.execute(CheckCall(artifact=checked_ref, constraints=[constraint]))
+    assert obs.output.evidence[0].outcome.value == "fail"
+    live = store.live_evidence("checked")
+    assert len(live) == 1 and live[0].outcome.value == "fail"  # table@1 existing does not satisfy "table@2 exists"
+
+    store.add_version("table", ArtifactKind.TABLE, content="v2")
+    assert store.live_evidence("checked") == []  # table@2 now actually appeared -- needs recheck
+
+
+def test_check_through_the_real_executor_declaring_the_same_missing_source_via_applies_to_and_source_ref_is_still_live() -> None:
+    """End-to-end reproduction of a third user-caught repro: the same
+    not-yet-created source declared via both Constraint.applies_to and
+    the RECOMPUTE context's source_ref must not produce a self-
+    contradictory Evidence (required to both exist and not exist) --
+    the resulting UNKNOWN/MISSING_DEPENDENCY must still be live."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    checked_ref = store.latest("checked").ref
+    executor = _executor(store)
+    missing_source = ArtifactRef(artifact_id="source", version=1, kind=ArtifactKind.SOURCE_DATA)
+    constraint = Constraint(
+        constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x", applies_to=[missing_source]
+    )
+
+    obs = executor.execute(
+        CheckCall(
+            artifact=checked_ref,
+            constraints=[constraint],
+            context={"recompute": {"r1": {"source_ref": missing_source, "operation": "sum", "observed": 1.0}}},
+        )
+    )
+    assert obs.output.evidence[0].outcome.value == "unknown"
+    live = store.live_evidence("checked")
+    assert len(live) == 1 and live[0].outcome.value == "unknown"
+
+    store.add_version("source", ArtifactKind.SOURCE_DATA, content="[1, 2, 3]")
+    assert store.live_evidence("checked") == []  # source now exists -- needs recheck
+
+
 def test_check_runs_fresh_every_time_never_reuses_a_prior_result() -> None:
     """Completion criterion: "오래된 검증 결과를 재사용하지 않으며" --
     calling check() twice on evidence that is designed to change (by

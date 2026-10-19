@@ -325,12 +325,13 @@ def test_live_evidence_returns_a_fail_that_correctly_found_its_declared_input_mi
     store.add_version("checked", ArtifactKind.BLOCK, content="x")
     checked_ref = store.latest("checked").ref
 
+    missing_ref = _ref("table_foo", 1, ArtifactKind.TABLE)
     failing = Evidence(
         constraint_id="req_table",
         outcome=CheckOutcome.FAIL,
         checked_artifact=checked_ref,
         detail="required table is missing",
-        missing_inputs=["table_foo"],
+        missing_inputs=[missing_ref],
     )
     store.record_evidence(failing)
     assert store.live_evidence("checked") == [failing]
@@ -345,12 +346,13 @@ def test_live_evidence_invalidates_a_missing_input_fail_once_that_input_starts_e
     store = ArtifactGraphStore()
     store.add_version("checked", ArtifactKind.BLOCK, content="x")
     checked_ref = store.latest("checked").ref
+    missing_ref = _ref("table_foo", 1, ArtifactKind.TABLE)
     failing = Evidence(
         constraint_id="req_table",
         outcome=CheckOutcome.FAIL,
         checked_artifact=checked_ref,
         detail="required table is missing",
-        missing_inputs=["table_foo"],
+        missing_inputs=[missing_ref],
     )
     store.record_evidence(failing)
     assert store.live_evidence("checked") == [failing]
@@ -358,6 +360,32 @@ def test_live_evidence_invalidates_a_missing_input_fail_once_that_input_starts_e
     store.add_version("table_foo", ArtifactKind.TABLE, content="now present")
     assert store.live_evidence("checked") == []  # not the stale FAIL
     assert store.evidence_history("checked") == [failing]  # history is untouched
+
+
+def test_live_evidence_treats_a_missing_input_as_version_specific_not_id_specific() -> None:
+    """Regression for a third user-caught repro: table@1 already exists,
+    but the FAIL's missing_inputs correctly names table@2 (the exact
+    version a constraint required). live_evidence must keep this FAIL
+    live until table@2 specifically appears -- table@1 already having
+    existed before the check ran must not count as "no longer missing"."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    store.add_version("table", ArtifactKind.TABLE, content="v1")  # table@1 already exists
+    checked_ref = store.latest("checked").ref
+
+    required_v2 = _ref("table", 2, ArtifactKind.TABLE)
+    failing = Evidence(
+        constraint_id="req_table_v2",
+        outcome=CheckOutcome.FAIL,
+        checked_artifact=checked_ref,
+        detail="table@2 is missing",
+        missing_inputs=[required_v2],
+    )
+    store.record_evidence(failing)
+    assert store.live_evidence("checked") == [failing]  # table@1 existing already does not satisfy this
+
+    store.add_version("table", ArtifactKind.TABLE, content="v2")  # table@2 now actually appears
+    assert store.live_evidence("checked") == []  # now invalidated -- needs recheck
 
 
 def test_live_evidence_does_not_fall_back_to_an_earlier_verdict_when_the_latest_one_for_the_same_constraint_is_invalidated() -> None:

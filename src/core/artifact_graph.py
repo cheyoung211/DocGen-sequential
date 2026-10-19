@@ -561,26 +561,38 @@ class ArtifactGraphStore:
             return False
         return not self.is_stale(ref.artifact_id)
 
-    def _still_missing(self, artifact_id: str) -> bool:
+    def _still_missing(self, ref: ArtifactRef) -> bool:
         """The live counterpart to ``Evidence.missing_inputs``: whether
-        ``artifact_id`` is still, right now, never-stored. Mirrors
-        ``_ref_is_live``'s role for ``Evidence.input_versions``, but for
-        the opposite fact -- a verdict that depends on something's
-        *absence* must invalidate the moment that thing starts existing,
-        not the moment some version number changes."""
-        return self.latest(artifact_id) is None
+        the *exact* ``(ref.artifact_id, ref.version)`` is still, right
+        now, never-stored. Mirrors ``_ref_is_live``'s role for
+        ``Evidence.input_versions``, but for the opposite fact -- a
+        verdict that depends on something's *absence* must invalidate the
+        moment that exact thing starts existing, not the moment some
+        other version number changes.
+
+        Deliberately checks the exact version via ``get_version``, not
+        "does this artifact_id have any version at all" via ``latest()``
+        -- a third Stage 3 review found that the latter wrongly
+        invalidated (treated as "no longer missing") a FAIL correctly
+        reporting ``table@2`` absent as soon as *any* version of ``table``
+        existed, even ``table@1`` -- a different, already-stored version
+        that does nothing to satisfy what the constraint actually
+        required. The exact version is what was asserted missing, so the
+        exact version is what must appear for that assertion to stop
+        holding."""
+        return self.get_version(ref.artifact_id, ref.version) is None
 
     def _evidence_is_live(self, item: Evidence) -> bool:
         """Whether every input a verdict actually depended on still holds
         -- every ``input_versions`` entry is still live (``_ref_is_live``)
-        *and* every ``missing_inputs`` entry is still missing
-        (``_still_missing``). Split out of ``live_evidence`` so it can be
-        applied strictly *after* the single most-recent-per-``constraint_id``
-        entry has already been picked -- see that method's docstring for
-        why the order between "pick latest" and "check validity" is not
-        interchangeable."""
+        *and* every ``missing_inputs`` entry is still missing at that
+        exact version (``_still_missing``). Split out of ``live_evidence``
+        so it can be applied strictly *after* the single
+        most-recent-per-``constraint_id`` entry has already been picked --
+        see that method's docstring for why the order between "pick
+        latest" and "check validity" is not interchangeable."""
         return all(self._ref_is_live(ref) for ref in item.input_versions) and all(
-            self._still_missing(artifact_id) for artifact_id in item.missing_inputs
+            self._still_missing(ref) for ref in item.missing_inputs
         )
 
     def live_evidence(self, artifact_id: str) -> List[Evidence]:

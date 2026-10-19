@@ -14,10 +14,11 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 
 ## 0. 코드 위치
 
-> **2026.10.19 사용자 재검토 반영 (2회)**: 1차 구현 공개 후 사용자가 두 차례에 걸쳐 재현 중심으로
+> **2026.10.19 사용자 재검토 반영 (3회)**: 1차 구현 공개 후 사용자가 세 차례에 걸쳐 재현 중심으로
 > 결함을 발견했다 — 1차는 4가지 핵심 결함 + 추가 2건(§5), 2차는 그중 "evidence 유효성"·"budget
-> hard cap"·"checkpoint JSON 직렬화" 세 영역에서 추가 3건(§6). 이 문서는 **현재(두 차례 수정 후)
-> 구현**을 기준으로 적는다 — 무엇이 어떻게 바뀌었는지는 §5/§6에 리뷰 이력으로 남긴다.
+> hard cap"·"checkpoint JSON 직렬화" 세 영역에서 추가 3건(§6), 3차는 2차가 도입한
+> `Evidence.missing_inputs` 메커니즘 자체의 결함 2건(§7). 이 문서는 **현재(세 차례 수정 후)
+> 구현**을 기준으로 적는다 — 무엇이 어떻게 바뀌었는지는 §5/§6/§7에 리뷰 이력으로 남긴다.
 
 | 구분 | 위치 |
 |---|---|
@@ -25,11 +26,12 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 | 도구 실행기 (dispatch, `run_generation`, budget/max-actions/suspend-resume 강제, 모든 호출 로깅) | `src/core/tool_executor.py::ToolExecutor` |
 | 기본 제약 검사 (`schema_contract`: kind까지 확인 / `recompute`: 비교+실제 재계산 두 모드, `Validator` 구현) | `src/core/constraint_checks.py::BasicConstraintChecker` |
 | 비용·지연·GPU 측정, 로컬/API 공통 모델 adapter | `src/core/cost_tracking.py::GpuUtilizationSampler`, `CostTrackingProducer` |
-| `live_evidence`(입력 버전+결측 여부까지 확인, constraint당 최신 1건을 먼저 고른 뒤 유효성 검사)/`evidence_history`(전체 이력)/`record_tool_call` | `src/core/artifact_graph.py::ArtifactGraphStore` (Stage 2 소유 파일에 Stage 3가 추가) |
+| `live_evidence`(입력 버전+정확한 버전 단위의 결측 여부까지 확인, constraint당 최신 1건을 먼저 고른 뒤 유효성 검사)/`evidence_history`(전체 이력)/`record_tool_call` | `src/core/artifact_graph.py::ArtifactGraphStore` (Stage 2 소유 파일에 Stage 3가 추가) |
+| `Evidence.missing_inputs`는 `List[str]`(artifact_id)가 아니라 `List[ArtifactRef]`(artifact_id+version) | `src/core/schemas.py::Evidence` |
 | `RunLog.tool_calls`/`log_tool_call`, `Checkpoint.tool_calls` | `src/core/run_log.py`, `src/core/schemas.py::Checkpoint` |
 | 실제 compile timeout (`subprocess.run(timeout=...)`, 전파만 함) | `src/agents/latex_compiler.py::LatexCompiler.compile_pdf` (신규 `timeout` 파라미터, 기본값 `None`=기존 동작 그대로 — Stage 3에서 유일하게 agent 코드를 수정한 지점) |
 | `CompileToolResult.compile_result`는 `Optional[Any]`가 아니라 `Optional[CompileResult]`(`src/evaluation/schemas.py`에서 import) | `src/core/schemas.py::CompileToolResult` |
-| 테스트 | `test/core/test_tool_executor.py` (42개), `test/core/test_constraint_checks.py` (27개), `test/core/test_cost_tracking.py` (13개), `test/core/test_artifact_graph.py` (47개) |
+| 테스트 | `test/core/test_tool_executor.py` (44개), `test/core/test_constraint_checks.py` (30개), `test/core/test_cost_tracking.py` (13개), `test/core/test_artifact_graph.py` (48개) |
 
 ---
 
@@ -74,8 +76,13 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
   "지금 존재하는 버전"인 것처럼 기록해 `live_evidence()`의 무효화 방향을 거꾸로 뒤집었다 — 누락을
   찾아낸 FAIL이 즉시 무효로 취급되고, 누락이 해소되는 순간 오히려 "유효"로 되살아났다(§6/§2).
   **수정**: 실제로 존재하는(단, kind가 틀린 경우 포함) 참조만 `input_versions`에, 아예 존재하지
-  않는 참조는 버전 없이 artifact_id만 `Evidence.missing_inputs`에 분리해서 담는다 — PASS여도 그
-  참조들이 나중에 바뀌면 이 판정이 더 이상 유효하지 않아야 하기 때문. **이 체커는 artifact의
+  않는 참조는 `Evidence.missing_inputs`에 분리해서 담는다 — PASS여도 그 참조들이 나중에 바뀌면 이
+  판정이 더 이상 유효하지 않아야 하기 때문. **3차 사용자 재검토에서 발견된 결함(§7)**:
+  `missing_inputs`를 artifact_id만으로(버전 없이) 기록해, table@1이 이미 존재하는 상태에서
+  table@2가 요구되어도 "table이라는 id는 존재한다"는 이유로 FAIL이 즉시 무효화됐다. **수정**:
+  `missing_inputs`를 `List[str]`에서 `List[ArtifactRef]`로 바꿔 artifact_id와 version을 모두
+  기록하고, `_still_missing()`이 정확히 그 version을 `get_version()`으로 확인하도록 고쳤다.
+  **이 체커는 artifact의
   content가 실제로 그 참조를 인용하는지는 검사하지 않는다** — 그건 레퍼런스 스캐너가 할 일이고,
   Stage 2가 이미 명시적으로 미룬 범위다(`docs/stage2_artifact_graph.md` §3, "실제 레퍼런스 스캔
   기반 INFERRED edge 자동 탐지").
@@ -90,14 +97,21 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
      `source_ref`의 저장된 content를 직접 읽어 JSON 숫자 배열로 파싱하고 `operation`으로 지정한
      연산(현재는 `"sum"` 하나만 — 일반 수식 평가기가 아니라 좁고 구체적인 사례 하나)을 실행해
      `expected`를 **실제로 재계산**한다 — 이것이 "숫자 재계산"이라는 이름에 부합하는 모드다.
-  두 모드 모두 **`constraint.applies_to`와 각 모드 고유의 source 참조를 합쳐**(`_merge_input_refs`,
-  `(artifact_id, version)` 기준 중복 제거) `Evidence.input_versions`에 담는다(직접 모드:
+  두 모드 모두 **`constraint.applies_to`와 각 모드 고유의 source 참조를 합친 뒤 지금 실제로
+  존재하는지 하나씩 확인해서 분리**(`_resolve_input_refs`, `(artifact_id, version)` 기준 중복
+  제거 후 존재하면 `input_versions`, 존재하지 않으면 `missing_inputs`)한다(직접 모드:
   `applies_to` + 호출자가 선언한 `source_refs`; 재계산 모드: `applies_to` + `source_ref` 자신).
   **2차 사용자 재검토에서 발견된 결함**: 원래는 `source_refs`로만 기록해, source를 `applies_to`
   에만 선언한 호출자의 경우 `input_versions`가 비어 source가 바뀌어도 PASS가 영원히 live로
-  남았다. 값이 없으면 FAIL이 아니라 UNKNOWN/NOT_CHECKED, source artifact가 아예 없으면
-  (artifact_id만 `missing_inputs`에) UNKNOWN/MISSING_DEPENDENCY, content가 숫자 배열이 아니면
-  UNKNOWN/NOT_REPRESENTABLE.
+  남았다 — 이를 "무조건 합쳐서 `input_versions`에" 담는 것으로 고쳤다(당시 이름: `_merge_input_refs`).
+  **3차 사용자 재검토에서 발견된 결함(§7)**: 그 수정이 존재 여부를 확인하지 않고 무조건
+  `input_versions`에 담았기 때문에, 아직 생성되지 않은 같은 source를 `Constraint.applies_to`와
+  재계산의 `source_ref`에 동시에 지정하면 그 참조가 `input_versions`(존재해야 유효)와
+  `missing_inputs`(존재하지 않아야 유효)에 동시에 들어가 evidence가 영원히 유효할 수 없는
+  자기 모순이 발생했다. **수정**: `_resolve_input_refs`로 이름을 바꾸고, 합친 뒤 각 참조의 존재
+  여부를 실제로 확인해 정확히 한쪽에만 들어가도록 했다. 값이 없으면 FAIL이 아니라
+  UNKNOWN/NOT_CHECKED, source artifact가 아예 없으면 UNKNOWN/MISSING_DEPENDENCY, content가
+  숫자 배열이 아니면 UNKNOWN/NOT_REPRESENTABLE.
 - **CSP_SMT·SYMBOLIC**: 이번 단계는 미구현으로 남겼다 — 체크할 구체적인 narrow 제약 사례가 아직
   없고, z3/sympy 모두 `requirements.txt`에 없다. 항상 UNKNOWN/NOT_REPRESENTABLE을 반환하며
   (`_IMPLEMENTED_KINDS`에 없는 kind는 `check()`의 첫 분기에서 걸러짐), `set_enabled()`로도 켤 수
@@ -210,6 +224,13 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
   필드를 추가해 "참조가 없어야 유효"라는 반대 방향 조건을 별도로 표현하고(`_still_missing`),
   `live_evidence()`를 "constraint_id당 최신 선택 → 그 다음에만 유효성 검사"로 순서를 바꿨다
   (`_evidence_is_live`). 세부는 §6.
+  **3차 사용자 재검토에서 발견된 결함(§7)**: `missing_inputs`를 artifact_id만으로 기록해 ①
+  요청한 버전이 아닌 다른 버전이 이미 존재해도 FAIL이 무효화됐고, ② 같은 참조를 `applies_to`와
+  recompute의 `source_ref`에 동시에 지정하면 `input_versions`·`missing_inputs` 양쪽에 모두
+  들어가 "존재해야 유효"와 "없어야 유효"가 동시에 요구되는 자기 모순이 생겼다. **3차 수정**:
+  `missing_inputs`를 `List[ArtifactRef]`로 바꿔 정확한 버전까지 기록하고(`_still_missing`이
+  `get_version(artifact_id, version)`으로 그 버전 자체를 확인), 모든 참조를 합친 뒤 실제
+  존재 여부를 확인해서 정확히 한쪽에만 넣도록(`_resolve_input_refs`) 했다. 세부는 §7.
 - **실패한 도구 호출도 비용에서 누락되지 않음**: `execute()`의 dispatch 단계에서 예외가 나도
   (`EXECUTION_FAILED`) `succeeded=False`인 `CostRecord`를 만들어 charge한다
   (`test_dispatch_exception_is_converted_to_a_structured_error_not_raised`). `CostTrackingProducer`도
@@ -376,3 +397,57 @@ end-to-end 재현), `test_budget_admission_bounds_overspend_to_at_most_one_calls
 결함) 제외 700 passed / 57 failed로, 57건은 1차 수정 때와 정확히 동일한 기존 무관 결함 목록이라
 회귀 없음을 확인했다. `scripts/run_full_pipeline.py`와 agent 코드는 이번 차수에서 전혀 수정하지
 않았다.
+
+---
+
+## 7. 사용자 재검토 후 수정 (3차, 2026.10.19)
+
+2차 수정으로 도입한 `Evidence.missing_inputs` 메커니즘 자체에 재현 중심 리뷰로 2건을 더 발견해
+수정했다 — `src/core/{schemas,artifact_graph,constraint_checks}.py` 수정(이번 차수도 agent 코드
+변경 없음), `test/core/`에 재현 테스트 추가(`test_tool_executor.py` 42→44개,
+`test_constraint_checks.py` 27→30개, `test_artifact_graph.py` 47→48개).
+
+두 문제 모두 "누락 상태를 evidence에 기록하는 방식" 하나에서 비롯됐다 — 2차 수정 자체의 근본
+원인이었다.
+
+1. **artifact는 존재하지만 요청한 버전이 없으면 유효한 FAIL이 숨겨짐** — §1.2/§2에 기록. 재현:
+   `table@1`만 저장된 상태에서 `table@2`를 요구하면 checker는 정상적으로 FAIL을 반환하지만, 2차
+   수정은 이를 `missing_inputs=["table"]`(artifact_id만)로 기록했다. `_still_missing()`은 "그
+   artifact_id의 **어떤** 버전이든 존재하는가"만 확인했으므로, `table@1`이 이미 (체크 전부터)
+   존재한다는 사실 자체가 "더 이상 누락이 아님"으로 잘못 해석되어 FAIL이 즉시 무효화됐다 —
+   "ID 전체의 부재"와 "특정 버전의 부재"를 구분하지 못한 것이 원인이다. **수정**:
+   `Evidence.missing_inputs`를 `List[str]`에서 `List[ArtifactRef]`로 바꿔 artifact_id와 version을
+   모두 보존하고, `ArtifactGraphStore._still_missing(ref)`가 `self.get_version(ref.artifact_id,
+   ref.version)`으로 정확히 그 버전의 존재 여부만 확인하도록 고쳤다 — `table@1`이 이미 존재해도
+   `table@2`가 실제로 생기기 전까지는 FAIL이 계속 유효하다.
+2. **없는 source를 `Constraint.applies_to`에도 선언하면 UNKNOWN evidence가 숨겨짐** — §1.2에
+   기록. 재현: 같은 미생성 source를 `Constraint.applies_to`와 재계산의 `source_ref`에 동시에
+   지정하면, 2차 수정은 `input_versions=list(constraint.applies_to)`(무조건, 존재 여부 확인
+   없음)와 `missing_inputs=[source_ref.artifact_id]`를 **동시에** 기록했다 — 같은 참조가
+   "존재해야 유효"(`input_versions`)와 "없어야 유효"(`missing_inputs`) 양쪽 조건에 걸려, 그
+   evidence는 outcome과 무관하게 영원히 유효 목록에 들어갈 수 없는 자기 모순 상태가 됐다. 원인은
+   `applies_to`를 병합할 때 각 참조가 실제로 존재하는지 확인하지 않고 무조건 `input_versions`에
+   담은 것이다. **수정**: 기존 `_merge_input_refs`(병합만 하고 분류하지 않음)를
+   `_resolve_input_refs`(병합 후 각 참조를 `get_version()`으로 존재 여부 확인, 존재하면
+   `input_versions`, 존재하지 않으면 `missing_inputs`로 분류해 반환)로 교체했다. 이제 같은 참조가
+   두 목록에 동시에 들어가는 경우는 구조적으로 불가능하다 — RECOMPUTE 두 모드의 모든 분기
+   (직접 비교, source 없음/content 없음/숫자 아님/성공)가 이 하나의 분류 로직을 거친다.
+
+두 문제의 공통 교훈: "이 입력이 없다"는 사실을 기록할 때 **정확히 무엇의 부재인지**(어떤
+artifact_id의 어떤 버전)와 **그 부재가 다른 어떤 기록과 충돌하지 않는지**(같은 참조가
+input_versions에도 들어가 있지 않은지)를 둘 다 보장해야 한다 — artifact_id만으로는 버전을
+구분할 수 없고, 병합만으로는 존재 여부를 알 수 없다.
+
+모든 수정은 재현 테스트로 남겼다(예:
+`test_schema_contract_missing_ref_tracks_the_exact_version_not_just_the_artifact_id`,
+`test_live_evidence_treats_a_missing_input_as_version_specific_not_id_specific`,
+`test_check_through_the_real_executor_a_fail_for_a_missing_specific_version_stays_live_even_when_
+an_older_version_already_exists`(실제 checker+executor를 통한 end-to-end 재현),
+`test_direct_comparison_mode_declaring_the_same_missing_source_via_applies_to_and_source_refs_
+does_not_self_contradict`,
+`test_declaring_the_same_missing_source_via_applies_to_and_source_ref_does_not_self_contradict`,
+`test_check_through_the_real_executor_declaring_the_same_missing_source_via_applies_to_and_
+source_ref_is_still_live`). 검증: `test/core/` + `test/evaluation/` 198개 전부 통과(2차 수정 후
+192개에서 +6); 전체 저장소 기준으로도 706 passed / 57 failed로, 57건은 매 차수와 정확히 동일한
+기존 무관 결함 목록이라 회귀 없음을 확인했다. `scripts/run_full_pipeline.py`와 agent 코드는
+이번 차수에서도 전혀 수정하지 않았다.

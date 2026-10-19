@@ -53,23 +53,29 @@ Covers two of ``ConstraintKind``'s four families this stage:
      genuinely recomputed from a versioned artifact here, not merely
      handed in.
 
-  Both modes record every artifact version the verdict actually consulted
-  on ``Evidence.input_versions`` (direct mode: ``constraint.applies_to``
-  merged with whatever ``source_refs`` the caller additionally declares;
-  recompute mode: ``applies_to`` merged with ``source_ref`` itself --
-  ``_merge_input_refs``). A second Stage 3 review found that a caller
-  declaring the source *only* via ``applies_to`` -- a legitimate choice,
-  since that is the one mechanism SCHEMA_CONTRACT already uses -- got an
-  empty ``input_versions`` under the original, ``source_refs``-only
-  version of this, so a later change to that source never invalidated the
-  verdict. A source artifact found to not exist *at all* goes on
-  ``Evidence.missing_inputs`` instead, by id, never as a fabricated
-  "existing" version -- see that field's own docstring for why conflating
-  the two inverts ``ArtifactGraphStore.live_evidence``'s invalidation
-  direction for exactly this case. ``Validator.check(..., context=...)``
-  is the same extension point Stage 1's ``TextAgentValidatorAdapter``
-  already uses to carry whatever a given checker needs beyond the bare
-  ``Constraint`` list.
+  Both modes resolve every artifact ref the verdict actually consulted --
+  ``constraint.applies_to`` merged with whichever mode-specific ref(s) the
+  caller additionally supplies (direct mode: ``source_refs``; recompute
+  mode: ``source_ref`` itself) -- via ``_resolve_input_refs``, which
+  existence-checks each one *right now* and splits the result: resolved
+  refs go on ``Evidence.input_versions``, refs whose exact
+  ``(artifact_id, version)`` does not resolve go on
+  ``Evidence.missing_inputs``, as the full ref, never just an id. Three
+  Stage 3 reviews shaped this: (1) merging ``source_refs`` only, not
+  ``applies_to`` too, left a caller who declared the source solely via
+  ``applies_to`` (a legitimate choice -- the one mechanism SCHEMA_CONTRACT
+  itself uses) with an empty ``input_versions``, so a later version
+  change on that source never invalidated the verdict; (2) routing every
+  merged ref onto ``input_versions`` unconditionally, with no existence
+  check, meant declaring the *same not-yet-created* source via both
+  ``applies_to`` and ``source_ref`` produced a ref required to
+  simultaneously exist and not exist -- self-contradictory, never live;
+  (3) tracking a not-found ref by id alone (not the full ref, version
+  included) let *any other* version of that id count as "no longer
+  missing," even one that does nothing to satisfy what was actually
+  required. ``Validator.check(..., context=...)`` is the same extension
+  point Stage 1's ``TextAgentValidatorAdapter`` already uses to carry
+  whatever a given checker needs beyond the bare ``Constraint`` list.
 
 ``CSP_SMT`` and ``SYMBOLIC`` are deliberately left unimplemented this
 stage: no concrete constraint instance needing Z3/SymPy exists yet, and
@@ -84,7 +90,7 @@ Progress.ver2 under Stage 3, not forgotten.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.artifact_graph import ArtifactGraphStore
 from src.core.schemas import (
@@ -217,23 +223,27 @@ class BasicConstraintChecker:
         kind -- it still exists, just incorrectly) goes on
         ``Evidence.input_versions``: a later review found this check's own
         correctness also depends on that version staying the current one,
-        PASS or FAIL alike. A ref that was not found at all -- the
-        artifact_id has literally never been stored -- goes on
-        ``Evidence.missing_inputs`` instead, by artifact_id alone, never
-        a version number: a second review found that recording a
-        not-found ref as if it were some trustworthy existing version (the
-        original fix) inverted ``ArtifactGraphStore.live_evidence``'s
-        invalidation direction for exactly this case -- see
+        PASS or FAIL alike. A ref whose exact ``(artifact_id, version)``
+        was not found -- regardless of whether *other* versions of that
+        same artifact_id exist -- goes on ``Evidence.missing_inputs``
+        instead, as the full ``ArtifactRef`` (never just the id): a second
+        review found that recording a not-found ref as if it were some
+        trustworthy existing version inverted
+        ``ArtifactGraphStore.live_evidence``'s invalidation direction for
+        exactly this case, and a third review found that dropping the
+        version number (id-only) wrongly let *any* other version of that
+        id (e.g. ``table@1``, already present) count as "no longer
+        missing" for a FAIL that specifically required ``table@2`` -- see
         ``Evidence.missing_inputs``'s own docstring.
         """
         unresolved_detail: List[str] = []
         live_refs: List[ArtifactRef] = []
-        missing_ids: List[str] = []
+        missing_refs: List[ArtifactRef] = []
         for ref in constraint.applies_to:
             stored = self._store.get_version(ref.artifact_id, ref.version)
             if stored is None:
                 unresolved_detail.append(f"{ref.artifact_id}@v{ref.version} (not found)")
-                missing_ids.append(ref.artifact_id)
+                missing_refs.append(ref)
             elif stored.ref.kind != ref.kind:
                 unresolved_detail.append(
                     f"{ref.artifact_id}@v{ref.version} (expected kind={ref.kind.value!r}, "
@@ -250,7 +260,7 @@ class BasicConstraintChecker:
                 checked_artifact=artifact,
                 detail=f"missing/unresolved required artifact(s): {', '.join(unresolved_detail)}",
                 input_versions=live_refs,
-                missing_inputs=missing_ids,
+                missing_inputs=missing_refs,
             )
         return Evidence(
             constraint_id=constraint.constraint_id,
@@ -260,17 +270,38 @@ class BasicConstraintChecker:
             input_versions=live_refs,
         )
 
-    def _merge_input_refs(self, constraint: Constraint, extra: List[ArtifactRef]) -> List[ArtifactRef]:
+    def _resolve_input_refs(
+        self, constraint: Constraint, extra: List[ArtifactRef]
+    ) -> Tuple[List[ArtifactRef], List[ArtifactRef]]:
         """``constraint.applies_to`` plus whatever extra refs a RECOMPUTE
-        mode consulted beyond it (``source_refs``/``source_ref``),
-        deduped by ``(artifact_id, version)``. A second Stage 3 review
-        found that a RECOMPUTE constraint declaring its source only via
-        ``applies_to`` -- the same mechanism SCHEMA_CONTRACT uses, instead
-        of duplicating it into ``context["recompute"][...]["source_refs"]``
-        -- ended up with an empty ``Evidence.input_versions``, so a PASS
-        kept reading as live evidence forever even after that source
-        artifact changed version. Merging means it no longer matters which
-        of the two ways a caller happened to declare the dependency."""
+        mode consulted beyond it (``source_refs``/``source_ref``), deduped
+        by ``(artifact_id, version)`` and then split by whether each one
+        actually resolves in the store **right now**: a resolved ref goes
+        toward ``Evidence.input_versions`` (live iff it stays the current,
+        non-stale version); a ref whose exact version does not resolve
+        goes toward ``Evidence.missing_inputs`` (live iff that exact
+        version still does not exist) -- see that field's docstring for
+        why putting an unresolved ref on ``input_versions`` instead is
+        backwards.
+
+        A second Stage 3 review found that a RECOMPUTE constraint
+        declaring its source only via ``applies_to`` -- the same
+        mechanism SCHEMA_CONTRACT uses, instead of duplicating it into
+        ``context["recompute"][...]["source_refs"]`` -- ended up with an
+        empty ``Evidence.input_versions`` under the original,
+        ``source_refs``-only merge, so a PASS kept reading as live
+        evidence forever even after that source artifact changed version.
+        A third review found the fix after *that* (merging unconditionally
+        into ``input_versions``) broke the opposite case: declaring the
+        *same not-yet-created* source via both ``applies_to`` and
+        ``source_ref``/``source_refs`` produced an ``Evidence`` requiring
+        that ref to simultaneously exist (``input_versions``) and not
+        exist (``missing_inputs``) -- self-contradictory, so it could
+        never be live. Existence-checking every ref here, regardless of
+        which of the two APIs a caller declared it through, is what
+        removes that contradiction: a given ref ends up on exactly one of
+        the two lists, never both.
+        """
         combined = list(constraint.applies_to)
         seen = {(ref.artifact_id, ref.version) for ref in combined}
         for ref in extra:
@@ -278,7 +309,15 @@ class BasicConstraintChecker:
             if key not in seen:
                 combined.append(ref)
                 seen.add(key)
-        return combined
+
+        found: List[ArtifactRef] = []
+        missing: List[ArtifactRef] = []
+        for ref in combined:
+            if self._store.get_version(ref.artifact_id, ref.version) is not None:
+                found.append(ref)
+            else:
+                missing.append(ref)
+        return found, missing
 
     def _check_recompute(
         self, constraint: Constraint, artifact: ArtifactRef, values: Optional[Dict[str, Any]]
@@ -315,9 +354,10 @@ class BasicConstraintChecker:
                 ref if isinstance(ref, ArtifactRef) else ArtifactRef.model_validate(ref)
                 for ref in raw_source_refs
             ]
+            input_versions, missing_inputs = self._resolve_input_refs(constraint, source_refs)
             return self._recompute_verdict(
                 constraint, artifact, expected=expected, observed=observed, tolerance=tolerance,
-                input_versions=self._merge_input_refs(constraint, source_refs), mode="comparison",
+                input_versions=input_versions, missing_inputs=missing_inputs, mode="comparison",
             )
 
         return Evidence(
@@ -360,31 +400,39 @@ class BasicConstraintChecker:
 
         stored_source = self._store.get_version(source_ref.artifact_id, source_ref.version)
         if stored_source is None:
-            # The source artifact_id was never stored at all (at this
-            # version or any other) -- this goes on missing_inputs, not
-            # input_versions, so ArtifactGraphStore.live_evidence treats
-            # "still absent" as live and "now exists" as invalidating, not
-            # the other way around. See Evidence.missing_inputs's docstring.
+            # source_ref's exact version was not found -- let
+            # _resolve_input_refs re-derive that itself (rather than
+            # hardcoding it into missing_inputs here) so any OTHER
+            # applies_to-declared ref that also happens to be missing is
+            # caught too, and so declaring this same source via BOTH
+            # applies_to and source_ref never produces a ref on both
+            # input_versions and missing_inputs at once (a third review's
+            # exact repro: that self-contradiction made the Evidence
+            # un-live no matter what).
+            input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
             return Evidence(
                 constraint_id=constraint.constraint_id,
                 outcome=CheckOutcome.UNKNOWN,
                 checked_artifact=artifact,
                 detail=f"source artifact {source_ref.artifact_id}@v{source_ref.version} not found",
                 unknown_reason=UnknownReason.MISSING_DEPENDENCY,
-                input_versions=list(constraint.applies_to),
-                missing_inputs=[source_ref.artifact_id],
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
             )
         if stored_source.content is None:
             # The artifact exists (at this version) but was stored with no
-            # content -- a real, trackable version, so this belongs on
-            # input_versions like any other resolved-but-unusable source.
+            # content -- a real, trackable version, so source_ref itself
+            # resolves to input_versions here; only some OTHER
+            # applies_to-declared ref could still land on missing_inputs.
+            input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
             return Evidence(
                 constraint_id=constraint.constraint_id,
                 outcome=CheckOutcome.UNKNOWN,
                 checked_artifact=artifact,
                 detail=f"source artifact {source_ref.artifact_id}@v{source_ref.version} has no content",
                 unknown_reason=UnknownReason.MISSING_DEPENDENCY,
-                input_versions=self._merge_input_refs(constraint, [source_ref]),
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
             )
 
         try:
@@ -392,6 +440,7 @@ class BasicConstraintChecker:
             if not isinstance(numbers, list) or not all(isinstance(n, (int, float)) for n in numbers):
                 raise ValueError("not a JSON array of numbers")
         except (ValueError, TypeError, json.JSONDecodeError):
+            input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
             return Evidence(
                 constraint_id=constraint.constraint_id,
                 outcome=CheckOutcome.UNKNOWN,
@@ -401,13 +450,15 @@ class BasicConstraintChecker:
                     "is not a JSON array of numbers -- cannot recompute"
                 ),
                 unknown_reason=UnknownReason.NOT_REPRESENTABLE,
-                input_versions=self._merge_input_refs(constraint, [source_ref]),
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
             )
 
         expected = float(_RECOMPUTE_OPERATIONS[operation](numbers))
+        input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
         return self._recompute_verdict(
             constraint, artifact, expected=expected, observed=observed, tolerance=tolerance,
-            input_versions=self._merge_input_refs(constraint, [source_ref]),
+            input_versions=input_versions, missing_inputs=missing_inputs,
             mode=f"recomputed via {operation!r} from {source_ref.artifact_id}@v{source_ref.version}",
         )
 
@@ -420,8 +471,10 @@ class BasicConstraintChecker:
         observed: float,
         tolerance: float,
         input_versions: List[ArtifactRef],
+        missing_inputs: Optional[List[ArtifactRef]] = None,
         mode: str,
     ) -> Evidence:
+        missing_inputs = missing_inputs or []
         diff = abs(expected - observed)
         if diff <= tolerance:
             return Evidence(
@@ -430,6 +483,7 @@ class BasicConstraintChecker:
                 checked_artifact=artifact,
                 detail=f"observed={observed} matches expected={expected} ({mode}) within tolerance={tolerance}",
                 input_versions=input_versions,
+                missing_inputs=missing_inputs,
             )
         return Evidence(
             constraint_id=constraint.constraint_id,
@@ -440,6 +494,7 @@ class BasicConstraintChecker:
                 f"(|diff|={diff} > tolerance={tolerance})"
             ),
             input_versions=input_versions,
+            missing_inputs=missing_inputs,
         )
 
 

@@ -197,13 +197,14 @@ def test_schema_contract_evidence_carries_applies_to_as_input_versions() -> None
     assert evidence[0].missing_inputs == []
 
 
-def test_schema_contract_fail_records_missing_refs_by_id_not_as_a_fabricated_existing_version() -> None:
+def test_schema_contract_fail_records_missing_refs_as_full_artifactrefs_not_as_a_fabricated_existing_version() -> None:
     """Regression for a second user-caught repro: a not-found ref must go
-    on missing_inputs by artifact_id, never on input_versions as if that
-    version genuinely existed -- otherwise ArtifactGraphStore.live_evidence
-    treats a "this is missing" FAIL as already invalid (nothing named in
-    input_versions actually exists yet to be live), and resurrects it the
-    moment the artifact is finally produced -- backwards either way."""
+    on missing_inputs as the full ArtifactRef, never on input_versions as
+    if that version genuinely existed -- otherwise ArtifactGraphStore.
+    live_evidence treats a "this is missing" FAIL as already invalid
+    (nothing named in input_versions actually exists yet to be live), and
+    resurrects it the moment the artifact is finally produced -- backwards
+    either way."""
     store, checked = _store_with_one_artifact("thm_1")
     checker = BasicConstraintChecker(store)
     missing_1 = ArtifactRef(artifact_id="ghost_1", version=1, kind=ArtifactKind.DEFINITION)
@@ -213,7 +214,28 @@ def test_schema_contract_fail_records_missing_refs_by_id_not_as_a_fabricated_exi
     )
     evidence = checker.check(checked, [constraint])
     assert evidence[0].outcome == CheckOutcome.FAIL
-    assert sorted(evidence[0].missing_inputs) == ["ghost_1", "ghost_2"]
+    assert evidence[0].missing_inputs == [missing_1, missing_2]
+    assert evidence[0].input_versions == []
+
+
+def test_schema_contract_missing_ref_tracks_the_exact_version_not_just_the_artifact_id() -> None:
+    """Regression for a third user-caught repro: the artifact_id already
+    exists (at v1), but the constraint requires v2, which does not exist
+    yet. missing_inputs must name table@2 specifically -- not just
+    "table" -- so ArtifactGraphStore._still_missing checks for table@2's
+    own appearance, not merely any version of "table" (which already
+    existed before this check even ran)."""
+    store = ArtifactGraphStore()
+    store.add_version("thm_1", ArtifactKind.CLAIM, content="thm")
+    store.add_version("table", ArtifactKind.TABLE, content="v1")  # table@1 already exists
+    checker = BasicConstraintChecker(store)
+    required_v2 = ArtifactRef(artifact_id="table", version=2, kind=ArtifactKind.TABLE)
+    constraint = Constraint(
+        constraint_id="c1", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[required_v2]
+    )
+    evidence = checker.check(store.latest("thm_1").ref, [constraint])
+    assert evidence[0].outcome == CheckOutcome.FAIL
+    assert evidence[0].missing_inputs == [required_v2]  # table@2, not just "table"
     assert evidence[0].input_versions == []
 
 
@@ -252,6 +274,29 @@ def test_direct_comparison_mode_tracks_applies_to_even_without_source_refs_in_co
     evidence = checker.check(checked, [constraint], context={"recompute": {"r1": {"expected": 3.0, "observed": 3.0}}})
     assert evidence[0].outcome == CheckOutcome.PASS
     assert evidence[0].input_versions == [src_ref]
+
+
+def test_direct_comparison_mode_declaring_the_same_missing_source_via_applies_to_and_source_refs_does_not_self_contradict() -> None:
+    """Regression for a third user-caught repro: declaring the same
+    not-yet-created source via both Constraint.applies_to and
+    context["recompute"][...]["source_refs"] previously produced an
+    Evidence with that ref on BOTH input_versions (must exist to stay
+    live) and missing_inputs (must NOT exist to stay live) -- a
+    self-contradiction that could never be live regardless of outcome."""
+    store, checked = _store_with_one_artifact("checked")
+    missing_source = ArtifactRef(artifact_id="src", version=1, kind=ArtifactKind.SOURCE_DATA)
+    checker = BasicConstraintChecker(store)
+    constraint = Constraint(
+        constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x", applies_to=[missing_source]
+    )
+    evidence = checker.check(
+        checked,
+        [constraint],
+        context={"recompute": {"r1": {"expected": 3.0, "observed": 3.0, "source_refs": [missing_source]}}},
+    )
+    assert evidence[0].outcome == CheckOutcome.PASS  # the comparison itself still runs
+    assert evidence[0].input_versions == []  # not on both lists
+    assert evidence[0].missing_inputs == [missing_source]
 
 
 def test_direct_comparison_mode_merges_applies_to_and_source_refs_without_duplicating() -> None:
@@ -335,11 +380,36 @@ class TestRecomputeFromSource:
         assert evidence[0].outcome == CheckOutcome.UNKNOWN
         assert evidence[0].unknown_reason == UnknownReason.MISSING_DEPENDENCY
         # Regression for a second user-caught repro: a wholly-absent source
-        # must go on missing_inputs by id, never on input_versions as a
-        # fabricated "existing" version -- see test_constraint_checks.py's
-        # top-level test of the same fix for SCHEMA_CONTRACT.
-        assert evidence[0].missing_inputs == ["ghost"]
+        # must go on missing_inputs as the full ref, never on
+        # input_versions as a fabricated "existing" version -- see
+        # test_constraint_checks.py's top-level test of the same fix for
+        # SCHEMA_CONTRACT.
+        assert evidence[0].missing_inputs == [ghost_ref]
         assert evidence[0].input_versions == []
+
+    def test_declaring_the_same_missing_source_via_applies_to_and_source_ref_does_not_self_contradict(self) -> None:
+        """Regression for a third user-caught repro: declaring the same
+        not-yet-created source via BOTH Constraint.applies_to and
+        context["recompute"][...]["source_ref"] previously produced an
+        Evidence with that ref required to simultaneously exist
+        (input_versions, from the unconditional applies_to merge) and not
+        exist (missing_inputs, from source_ref's own not-found branch) --
+        self-contradictory, so it could never be live no matter what."""
+        store, checked, _ = self._store_with_source()
+        checker = BasicConstraintChecker(store)
+        missing_source = ArtifactRef(artifact_id="ghost", version=1, kind=ArtifactKind.SOURCE_DATA)
+        constraint = Constraint(
+            constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x", applies_to=[missing_source]
+        )
+        evidence = checker.check(
+            checked,
+            [constraint],
+            context={"recompute": {"r1": {"source_ref": missing_source, "operation": "sum", "observed": 1.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.MISSING_DEPENDENCY
+        assert evidence[0].input_versions == []  # not on both lists
+        assert evidence[0].missing_inputs == [missing_source]
 
     def test_recompute_from_source_also_tracks_constraints_applies_to_refs(self) -> None:
         """The same applies_to-merge fix as the direct-comparison mode:
