@@ -561,43 +561,77 @@ class ArtifactGraphStore:
             return False
         return not self.is_stale(ref.artifact_id)
 
+    def _still_missing(self, artifact_id: str) -> bool:
+        """The live counterpart to ``Evidence.missing_inputs``: whether
+        ``artifact_id`` is still, right now, never-stored. Mirrors
+        ``_ref_is_live``'s role for ``Evidence.input_versions``, but for
+        the opposite fact -- a verdict that depends on something's
+        *absence* must invalidate the moment that thing starts existing,
+        not the moment some version number changes."""
+        return self.latest(artifact_id) is None
+
+    def _evidence_is_live(self, item: Evidence) -> bool:
+        """Whether every input a verdict actually depended on still holds
+        -- every ``input_versions`` entry is still live (``_ref_is_live``)
+        *and* every ``missing_inputs`` entry is still missing
+        (``_still_missing``). Split out of ``live_evidence`` so it can be
+        applied strictly *after* the single most-recent-per-``constraint_id``
+        entry has already been picked -- see that method's docstring for
+        why the order between "pick latest" and "check validity" is not
+        interchangeable."""
+        return all(self._ref_is_live(ref) for ref in item.input_versions) and all(
+            self._still_missing(artifact_id) for artifact_id in item.missing_inputs
+        )
+
     def live_evidence(self, artifact_id: str) -> List[Evidence]:
         """The single currently-valid verdict per ``constraint_id`` checked
         against ``artifact_id`` -- distinct from the full history (see
-        ``evidence_history``). Three conditions, all required:
+        ``evidence_history``).
 
-        1. Checked against the artifact's current latest version, AND
-        2. recorded while that artifact was not (and has not since become)
-           stale -- including an artifact that was born stale (see
-           ``add_version``) and so was never trustworthy at any point in
-           its current version's lifetime. The staleness check is not
-           redundant with the version check: a shared-definition change
-           marks its dependents stale *without* bumping their own version
-           number, so Evidence checked against their unchanged version
-           would still version-match even though it no longer reflects a
-           trustworthy state.
-        3. every one of ``Evidence.input_versions`` -- whatever *other*
-           artifacts the check actually consulted beyond ``checked_artifact``
-           itself (e.g. a SCHEMA_CONTRACT's ``applies_to`` refs, a
-           RECOMPUTE's source-data ref) -- is *itself* still the current,
-           non-stale version. Added after a Stage 3 review found that a
-           PASS checked against a source artifact's v1 kept reading as
-           live evidence even after that source moved to v2: condition 1/2
-           alone only protect against *the checked artifact itself*
-           changing, not against one of the other things the verdict
-           actually depended on changing.
+        Two steps, strictly in this order -- a second Stage 3 review found
+        that doing them in the other order (filter for validity, *then*
+        pick the latest survivor per ``constraint_id``) silently resurrects
+        an earlier, already-superseded verdict whenever the truly-latest
+        one for that ``constraint_id`` turns out to be invalid: an
+        invalidated latest verdict must mean "needs rechecking", never
+        "fall back to history".
 
-        A fourth condition handles **re-checking the same constraint**: if
-        ``constraint_id`` was checked more than once against the current
-        version (e.g. FAIL, then -- after an unrelated missing artifact was
-        added -- PASS), only the most recently logged entry for that
-        ``constraint_id`` is returned, never both; ``self.log.evidence`` is
-        append-only in chronological order, so the last matching entry per
-        ``constraint_id`` *is* the most recent one, with no separate
-        timestamp/sequence field required. The earlier version of this
-        method had no such dedup at all and could return a stale FAIL
-        alongside the PASS that superseded it, with nothing on either
-        entry indicating which one was current.
+        1. **Pick the latest entry per ``constraint_id``**, among every
+           ``Evidence`` logged against ``artifact_id``'s current latest
+           version (checked while that version was not, and has not since
+           become, stale -- see below) -- regardless of whether that entry
+           is itself currently valid. ``self.log.evidence`` is append-only
+           in chronological order, so the last matching entry per
+           ``constraint_id`` *is* the most recent one, with no separate
+           timestamp/sequence field required.
+        2. **Then** keep only the entries that are still valid
+           (``_evidence_is_live``): every ``input_versions`` ref is still
+           the current, non-stale version of its artifact, AND every
+           ``missing_inputs`` artifact_id is still genuinely never-stored.
+           Both conditions were added after review-caught repros:
+
+           - a RECOMPUTE PASS checked against a source artifact's v1 kept
+             reading as live evidence even after that source moved to v2
+             (``input_versions``);
+           - a SCHEMA_CONTRACT FAIL that correctly found a required
+             artifact *absent* was being excluded from ``live_evidence``
+             immediately (treated as already invalid, because nothing
+             named in ``input_versions`` existed yet to be "live") and,
+             backwards, started being returned again once that artifact
+             was finally produced but not yet rechecked (``missing_inputs``
+             fixes both directions: absent counts as live for this entry
+             exactly while it stays absent).
+
+        Checking against the artifact's current latest version, recorded
+        while it was not (and has not since become) stale, remains the
+        baseline requirement for ``checked_artifact`` itself -- including
+        an artifact that was born stale (see ``add_version``) and so was
+        never trustworthy at any point in its current version's lifetime.
+        This is not redundant with the version check: a shared-definition
+        change marks its dependents stale *without* bumping their own
+        version number, so Evidence checked against their unchanged version
+        would still version-match even though it no longer reflects a
+        trustworthy state.
 
         Returns deep copies (``self.log.evidence`` already deep-copies) --
         mutating an entry in the returned list has no effect on this
@@ -607,18 +641,15 @@ class ArtifactGraphStore:
         if current is None or self.is_stale(artifact_id):
             return []
 
-        matching = [
-            item
-            for item in self.log.evidence
-            if item.checked_artifact.artifact_id == artifact_id
-            and item.checked_artifact.version == current.ref.version
-            and all(self._ref_is_live(ref) for ref in item.input_versions)
-        ]
-
         latest_by_constraint: Dict[str, Evidence] = {}
-        for item in matching:
-            latest_by_constraint[item.constraint_id] = item
-        return list(latest_by_constraint.values())
+        for item in self.log.evidence:
+            if item.checked_artifact.artifact_id != artifact_id:
+                continue
+            if item.checked_artifact.version != current.ref.version:
+                continue
+            latest_by_constraint[item.constraint_id] = item  # last wins -- chronological order
+
+        return [item for item in latest_by_constraint.values() if self._evidence_is_live(item)]
 
     def evidence_history(self, artifact_id: str) -> List[Evidence]:
         """Every ``Evidence`` ever logged against *any* version of

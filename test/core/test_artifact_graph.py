@@ -307,6 +307,92 @@ def test_live_evidence_keeps_distinct_constraint_ids_independent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Second Stage 3 review: live_evidence must treat "confirmed absent at
+# check time" (Evidence.missing_inputs) as its own liveness condition --
+# distinct from, and the mirror image of, an input_versions ref needing to
+# still exist -- and must pick the latest entry per constraint_id BEFORE
+# filtering for validity, never after.
+# ---------------------------------------------------------------------------
+
+
+def test_live_evidence_returns_a_fail_that_correctly_found_its_declared_input_missing() -> None:
+    """Regression for a user-caught repro: a required table does not exist
+    yet, so a check correctly FAILs. That FAIL must itself count as live
+    evidence -- "this is missing" is still true, and is exactly what the
+    verdict asserts -- not be excluded just because the thing it names
+    does not (yet) exist."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    checked_ref = store.latest("checked").ref
+
+    failing = Evidence(
+        constraint_id="req_table",
+        outcome=CheckOutcome.FAIL,
+        checked_artifact=checked_ref,
+        detail="required table is missing",
+        missing_inputs=["table_foo"],
+    )
+    store.record_evidence(failing)
+    assert store.live_evidence("checked") == [failing]
+
+
+def test_live_evidence_invalidates_a_missing_input_fail_once_that_input_starts_existing() -> None:
+    """Regression for a user-caught repro: after the FAIL above, the
+    missing table is added but the constraint is not yet rechecked.
+    live_evidence must NOT keep returning the now-stale FAIL -- it must
+    return nothing, signalling "needs a fresh check", not fall back to a
+    verdict that no longer reflects reality."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    checked_ref = store.latest("checked").ref
+    failing = Evidence(
+        constraint_id="req_table",
+        outcome=CheckOutcome.FAIL,
+        checked_artifact=checked_ref,
+        detail="required table is missing",
+        missing_inputs=["table_foo"],
+    )
+    store.record_evidence(failing)
+    assert store.live_evidence("checked") == [failing]
+
+    store.add_version("table_foo", ArtifactKind.TABLE, content="now present")
+    assert store.live_evidence("checked") == []  # not the stale FAIL
+    assert store.evidence_history("checked") == [failing]  # history is untouched
+
+
+def test_live_evidence_does_not_fall_back_to_an_earlier_verdict_when_the_latest_one_for_the_same_constraint_is_invalidated() -> None:
+    """Regression for a user-caught repro: constraint_id "r1" first PASSes
+    (depending on source_1@v1), then is re-checked and FAILs (depending on
+    source_1@v2, current at that moment). source_1 then moves to v3,
+    invalidating the FAIL. live_evidence must return nothing for "r1" --
+    never fall back to the earlier PASS, which the old filter-then-pick-
+    latest order would have resurrected."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    store.add_version("source_1", ArtifactKind.SOURCE_DATA, content="v1")
+    checked_ref = store.latest("checked").ref
+    source_v1 = store.latest("source_1").ref
+
+    passing = Evidence(
+        constraint_id="r1", outcome=CheckOutcome.PASS, checked_artifact=checked_ref, input_versions=[source_v1]
+    )
+    store.record_evidence(passing)
+    assert store.live_evidence("checked") == [passing]
+
+    store.add_version("source_1", ArtifactKind.SOURCE_DATA, content="v2")
+    source_v2 = store.latest("source_1").ref
+    failing = Evidence(
+        constraint_id="r1", outcome=CheckOutcome.FAIL, checked_artifact=checked_ref, input_versions=[source_v2]
+    )
+    store.record_evidence(failing)
+    assert store.live_evidence("checked") == [failing]  # the new latest verdict, still valid
+
+    store.add_version("source_1", ArtifactKind.SOURCE_DATA, content="v3")  # invalidates failing's v2 binding
+    assert store.live_evidence("checked") == []  # needs recheck -- not [passing]
+    assert store.evidence_history("checked") == [passing, failing]  # both kept, in order
+
+
+# ---------------------------------------------------------------------------
 # Stage 2 checklist item 4: a shared-definition change must selectively
 # invalidate its real dependents while leaving an unrelated artifact alone
 # -- mirrors revision direction 1's own worked example verbatim: "정의의

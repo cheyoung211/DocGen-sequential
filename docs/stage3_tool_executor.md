@@ -14,9 +14,10 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 
 ## 0. 코드 위치
 
-> **2026.10.19 사용자 재검토 반영**: 1차 구현 공개 후 사용자가 4가지 핵심 결함 + 추가 2건을 재현
-> 중심으로 발견했다. 이 문서는 **현재(수정 후) 구현**을 기준으로 적는다 — 무엇이 어떻게 바뀌었는지는
-> §5 "사용자 재검토 후 수정"에 리뷰 이력으로 남긴다.
+> **2026.10.19 사용자 재검토 반영 (2회)**: 1차 구현 공개 후 사용자가 두 차례에 걸쳐 재현 중심으로
+> 결함을 발견했다 — 1차는 4가지 핵심 결함 + 추가 2건(§5), 2차는 그중 "evidence 유효성"·"budget
+> hard cap"·"checkpoint JSON 직렬화" 세 영역에서 추가 3건(§6). 이 문서는 **현재(두 차례 수정 후)
+> 구현**을 기준으로 적는다 — 무엇이 어떻게 바뀌었는지는 §5/§6에 리뷰 이력으로 남긴다.
 
 | 구분 | 위치 |
 |---|---|
@@ -24,10 +25,11 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 | 도구 실행기 (dispatch, `run_generation`, budget/max-actions/suspend-resume 강제, 모든 호출 로깅) | `src/core/tool_executor.py::ToolExecutor` |
 | 기본 제약 검사 (`schema_contract`: kind까지 확인 / `recompute`: 비교+실제 재계산 두 모드, `Validator` 구현) | `src/core/constraint_checks.py::BasicConstraintChecker` |
 | 비용·지연·GPU 측정, 로컬/API 공통 모델 adapter | `src/core/cost_tracking.py::GpuUtilizationSampler`, `CostTrackingProducer` |
-| `live_evidence`(입력 버전까지 확인+constraint당 최신 1건)/`evidence_history`(전체 이력)/`record_tool_call` | `src/core/artifact_graph.py::ArtifactGraphStore` (Stage 2 소유 파일에 Stage 3가 추가) |
+| `live_evidence`(입력 버전+결측 여부까지 확인, constraint당 최신 1건을 먼저 고른 뒤 유효성 검사)/`evidence_history`(전체 이력)/`record_tool_call` | `src/core/artifact_graph.py::ArtifactGraphStore` (Stage 2 소유 파일에 Stage 3가 추가) |
 | `RunLog.tool_calls`/`log_tool_call`, `Checkpoint.tool_calls` | `src/core/run_log.py`, `src/core/schemas.py::Checkpoint` |
 | 실제 compile timeout (`subprocess.run(timeout=...)`, 전파만 함) | `src/agents/latex_compiler.py::LatexCompiler.compile_pdf` (신규 `timeout` 파라미터, 기본값 `None`=기존 동작 그대로 — Stage 3에서 유일하게 agent 코드를 수정한 지점) |
-| 테스트 | `test/core/test_tool_executor.py` (39개), `test/core/test_constraint_checks.py` (22개), `test/core/test_cost_tracking.py` (13개), `test/core/test_artifact_graph.py`에 신규 5개 추가 |
+| `CompileToolResult.compile_result`는 `Optional[Any]`가 아니라 `Optional[CompileResult]`(`src/evaluation/schemas.py`에서 import) | `src/core/schemas.py::CompileToolResult` |
+| 테스트 | `test/core/test_tool_executor.py` (42개), `test/core/test_constraint_checks.py` (27개), `test/core/test_cost_tracking.py` (13개), `test/core/test_artifact_graph.py` (47개) |
 
 ---
 
@@ -67,8 +69,13 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
   kind가 다르면 "not found"와 구분되는 사유("expected kind=..., actually stored as kind=...")로
   FAIL한다. artifact_id 존재뿐 아니라 정확한 `(artifact_id, version)` 실재 여부까지 확인하는 것은
   Stage 2의 `_validate_artifact_ref`가 이미 구분한 "존재 여부 vs 버전 실재 여부"와 동일한 구분을
-  재사용. PASS/FAIL 둘 다 `applies_to` 전체를 `Evidence.input_versions`에 담는다 — PASS여도 그
-  참조들이 나중에 바뀌면 이 판정이 더 이상 유효하지 않아야 하기 때문(§2). **이 체커는 artifact의
+  재사용. **2차 사용자 재검토에서 발견된 결함**: `applies_to` 전체를 무조건
+  `Evidence.input_versions`에 담던 1차 수정은, 아예 존재하지 않는 참조(필수 table 누락 등)를 마치
+  "지금 존재하는 버전"인 것처럼 기록해 `live_evidence()`의 무효화 방향을 거꾸로 뒤집었다 — 누락을
+  찾아낸 FAIL이 즉시 무효로 취급되고, 누락이 해소되는 순간 오히려 "유효"로 되살아났다(§6/§2).
+  **수정**: 실제로 존재하는(단, kind가 틀린 경우 포함) 참조만 `input_versions`에, 아예 존재하지
+  않는 참조는 버전 없이 artifact_id만 `Evidence.missing_inputs`에 분리해서 담는다 — PASS여도 그
+  참조들이 나중에 바뀌면 이 판정이 더 이상 유효하지 않아야 하기 때문. **이 체커는 artifact의
   content가 실제로 그 참조를 인용하는지는 검사하지 않는다** — 그건 레퍼런스 스캐너가 할 일이고,
   Stage 2가 이미 명시적으로 미룬 범위다(`docs/stage2_artifact_graph.md` §3, "실제 레퍼런스 스캔
   기반 INFERRED edge 자동 탐지").
@@ -83,10 +90,14 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
      `source_ref`의 저장된 content를 직접 읽어 JSON 숫자 배열로 파싱하고 `operation`으로 지정한
      연산(현재는 `"sum"` 하나만 — 일반 수식 평가기가 아니라 좁고 구체적인 사례 하나)을 실행해
      `expected`를 **실제로 재계산**한다 — 이것이 "숫자 재계산"이라는 이름에 부합하는 모드다.
-  두 모드 모두 실제로 사용한 모든 artifact 버전을 `Evidence.input_versions`에 담는다(직접 모드:
-  호출자가 선언한 `source_refs`; 재계산 모드: `source_ref` 자신). 값이 없으면 FAIL이 아니라
-  UNKNOWN/NOT_CHECKED, source artifact가 없거나 content가 숫자 배열이 아니면 각각
-  UNKNOWN/MISSING_DEPENDENCY, UNKNOWN/NOT_REPRESENTABLE.
+  두 모드 모두 **`constraint.applies_to`와 각 모드 고유의 source 참조를 합쳐**(`_merge_input_refs`,
+  `(artifact_id, version)` 기준 중복 제거) `Evidence.input_versions`에 담는다(직접 모드:
+  `applies_to` + 호출자가 선언한 `source_refs`; 재계산 모드: `applies_to` + `source_ref` 자신).
+  **2차 사용자 재검토에서 발견된 결함**: 원래는 `source_refs`로만 기록해, source를 `applies_to`
+  에만 선언한 호출자의 경우 `input_versions`가 비어 source가 바뀌어도 PASS가 영원히 live로
+  남았다. 값이 없으면 FAIL이 아니라 UNKNOWN/NOT_CHECKED, source artifact가 아예 없으면
+  (artifact_id만 `missing_inputs`에) UNKNOWN/MISSING_DEPENDENCY, content가 숫자 배열이 아니면
+  UNKNOWN/NOT_REPRESENTABLE.
 - **CSP_SMT·SYMBOLIC**: 이번 단계는 미구현으로 남겼다 — 체크할 구체적인 narrow 제약 사례가 아직
   없고, z3/sympy 모두 `requirements.txt`에 없다. 항상 UNKNOWN/NOT_REPRESENTABLE을 반환하며
   (`_IMPLEMENTED_KINDS`에 없는 kind는 `check()`의 첫 분기에서 걸러짐), `set_enabled()`로도 켤 수
@@ -128,9 +139,17 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
   12 tokens를 쓰면, 로그에는 기록되지만 `executor.budget.spent`는 0으로 남고 다음 도구 호출이
   그대로 허용됐다. **수정**: `ToolExecutor.run_generation(producer, artifact_id, context, *,
   model_name, stage)`를 추가했다 — ① 호출 **전** `_check_admission(GENERATE)`로 허용량을
-  확인하고(거부되면 producer를 전혀 호출하지 않음 — "엄격한 상한" 보장), ② `CostTrackingProducer`로
+  확인하고(budget이 이미 소진된 상태라면 producer를 전혀 호출하지 않음), ② `CostTrackingProducer`로
   실제 호출하며, ③ 성공·실패·예외 모두 동일하게 `_charge()`(기존 `ToolCall` 디스패치와 같은
-  경로)로 budget을 차감하고 `record_cost()`에 기록한다. `ToolActionKind.GENERATE`를 schema에
+  경로)로 budget을 차감하고 `record_cost()`에 기록한다. **2차 사용자 재검토에서 발견된 결함**:
+  ①을 "엄격한 상한(strict cap)" 보장이라고 표현한 것이 부정확했다 — admission 확인은 호출 *전*
+  남은 예산이 0보다 큰지만 보고, 그 호출 자체의 실제 비용이 남은 예산 안에 들어올지는 보지 않는다.
+  cap=10에서 12 tokens를 쓰는 호출은 (10 > 0이므로) 그대로 허용되고 12 전액이 charge되어
+  `spent`가 `cap`을 넘어선다 — 다음 호출부터만 확실히 막힌다(§6). **문서 수정**: "엄격한 상한"이
+  아니라 "소진 후 신규 호출 차단"으로 정확히 표현한다 — 총 초과분은 "허용된 호출 하나의 비용"으로
+  bound되지만 0으로 bound되지는 않는다. 진짜 pre-emptive hard cap(호출 전 비용 예측·예약, 또는
+  wrapped Producer의 출력 토큰 수 제한)은 LLM 호출 자체(agent/llm_client.py)를 건드려야 하므로
+  Stage 3의 "agent 코드는 건드리지 않는다" 범위를 벗어나 구현하지 않았다. `ToolActionKind.GENERATE`를 schema에
   추가했지만 controller가 선택하는 7개 action에는 포함되지 않는다(direction 2는 "생성"을 action
   후보로 나열하지 않음) — `execute()`/`ToolCall`과는 별도 진입점이며, `Producer` 참조가
   pydantic으로 직렬화 가능한 값이 아니므로 애초에 같은 진입점을 쓸 수 없다. 모의 Producer만으로
@@ -171,18 +190,26 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 - **오래된 검증 결과 재사용 금지**: `_dispatch_check`는 `store.live_evidence()`를 조회해
   건너뛰는 shortcut이 전혀 없다 — 매번 `self._checker.check(...)`를 새로 호출하고 그 결과를
   무조건 `store.record_evidence()`에 기록한다(`test_check_runs_fresh_every_time_never_reuses_a_prior_result`).
-  **사용자 재검토에서 발견된 결함**: `live_evidence()` 자신은 `checked_artifact`의 버전/stale
+  **1차 사용자 재검토에서 발견된 결함**: `live_evidence()` 자신은 `checked_artifact`의 버전/stale
   여부만 봤지, 검사에 실제로 쓰인 *다른* 입력(예: RECOMPUTE의 source artifact)이 바뀌었는지는
   전혀 보지 않았다 — source artifact가 v1→v2로 바뀌어도 기존 PASS가 계속 live로 남았다. 또한
   같은 constraint_id를 재검사했을 때(필수 table 누락→FAIL, table 추가 후 재검사→PASS) 과거
   FAIL과 새 PASS가 **동시에** live로 반환됐다 — "매번 새로 검사한다"는 것만으로는 이전 결과가
-  무효화되지 않았기 때문이다. **수정**: `Evidence`에 `input_versions` 필드를 추가해 체커가
+  무효화되지 않았기 때문이다. **1차 수정**: `Evidence`에 `input_versions` 필드를 추가해 체커가
   실제로 참조한 다른 artifact 버전을 담게 하고(§1.2), `live_evidence()`가 (a)
   `checked_artifact` 버전/stale 조건에 더해 (b) `input_versions`의 모든 항목이 여전히 현재·
   non-stale 버전인지까지 확인하며, (c) 같은 constraint_id에 대해서는 **가장 최근에 기록된 것
   하나만** 반환하도록(append-only 순서를 그대로 "최신"으로 사용) 다시 작성했다. 전체 이력은
   별도의 새 메서드 `evidence_history(artifact_id)`로 분리해, "현재 유효한 판정"과 "전체 이력"이
   서로 다른 접근자로 명확히 구분된다.
+  **2차 사용자 재검토에서 발견된 결함(§6)**: 이 1차 수정은 두 가지를 더 틀렸다. ① "참조가
+  존재해야 유효"라는 규칙을 "참조가 아예 없음을 확인한 FAIL"에도 그대로 적용해, 누락을 찾아낸
+  FAIL이 즉시 무효 처리되고 누락이 해소되면 오히려 되살아나는 **반대 방향**의 오류를 만들었다.
+  ② (b) 필터링을 (c) "constraint_id당 최신 선택"보다 **먼저** 적용해, 최신 판정이 무효화된
+  경우 그보다 오래된(이미 대체된) 판정으로 조용히 되돌아갔다. **2차 수정**: `missing_inputs`
+  필드를 추가해 "참조가 없어야 유효"라는 반대 방향 조건을 별도로 표현하고(`_still_missing`),
+  `live_evidence()`를 "constraint_id당 최신 선택 → 그 다음에만 유효성 검사"로 순서를 바꿨다
+  (`_evidence_is_live`). 세부는 §6.
 - **실패한 도구 호출도 비용에서 누락되지 않음**: `execute()`의 dispatch 단계에서 예외가 나도
   (`EXECUTION_FAILED`) `succeeded=False`인 `CostRecord`를 만들어 charge한다
   (`test_dispatch_exception_is_converted_to_a_structured_error_not_raised`). `CostTrackingProducer`도
@@ -239,10 +266,17 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
   Producer 연결을 설계할 때 필요하면 추가한다.
 - **`SCHEMA_CONTRACT`가 artifact content에서 실제 참조를 스캔**: 여전히 `applies_to`에 명시된
   것만 확인한다 — Stage 2가 이미 미룬 범위와 동일(§1.2).
+- **`run_generation()`의 budget admission은 pre-emptive hard cap이 아니다**: 호출 전 "남은
+  예산 > 0"만 확인하며, 그 호출 자체의 비용이 남은 예산을 넘는지는 사전에 알 수 없다(LLM 호출의
+  실제 토큰 수는 호출 전에 알 수 없음) — 그래서 총 `spent`가 `cap`을 넘을 수 있고, bound는 "허용된
+  호출 하나의 비용"까지다(§1.4, §6). 이를 진짜 hard cap으로 만들려면 wrapped `Producer`의 출력
+  토큰 수 자체를 제한해야 하는데, 이는 agent/`llm_client.py` 레벨의 변경이 필요해 "agent 코드는
+  건드리지 않는다"는 Stage 3 범위를 벗어난다 — 2차 사용자 재검토에서 이 한계를 명시적으로
+  인정하기로 확정(§6).
 
 ---
 
-## 5. 사용자 재검토 후 수정 (2026.10.19)
+## 5. 사용자 재검토 후 수정 (1차, 2026.10.19)
 
 1차 구현을 공개한 뒤 재현 중심 리뷰에서 4가지 핵심 결함과 추가 2건을 발견해 전부 수정했다 —
 `src/core/{schemas,tool_executor,constraint_checks,artifact_graph,run_log}.py`,
@@ -286,3 +320,59 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 `test_tool_observation_rejects_an_action_output_mismatch`,
 `test_execute_logs_a_finish_calls_reason_and_unresolved_ids`). 기존 §0–4의 테스트는 수정 없이
 그대로 통과한다; `test/evaluation/`의 38개 테스트도 회귀 없음.
+
+---
+
+## 6. 사용자 재검토 후 수정 (2차, 2026.10.19)
+
+1차 수정을 공개한 뒤 같은 날 두 번째 재현 중심 리뷰에서 추가 3건을 발견해 전부 수정했다 —
+`src/core/{schemas,artifact_graph,constraint_checks}.py` 수정(이번 차수는 agent 코드 변경 없음),
+`test/core/`에 재현 테스트 추가(`test_tool_executor.py` 39→42개, `test_constraint_checks.py`
+22→27개, `test_artifact_graph.py` 44→47개).
+
+1. **`live_evidence()`가 필요한 FAIL을 숨기거나 과거 판정을 다시 반환함** — §2/§1.2에 기록. 세
+   가지를 재현: (a) 필수 table 누락 FAIL이 `live_evidence()`에서 빈 목록으로 숨겨짐, (b) table을
+   추가하고 재검사하지 않으면 그 누락-FAIL이 다시 반환됨, (c) 과거 PASS 이후 새 FAIL을 기록하고
+   그 FAIL의 입력이 바뀌면 과거 PASS가 다시 반환됨. 원인: 1차 수정은 "참조가 존재해야 유효"라는
+   규칙 하나만 있어서 "존재하지 않음을 확인한 FAIL"을 표현할 수 없었고(→ (a)(b)), 유효성 필터링을
+   constraint_id당 최신 선택보다 먼저 적용해 무효화된 최신 판정이 그보다 오래된 판정으로
+   되돌아갔다(→ (c)). 수정: `Evidence.missing_inputs: List[str]` 추가(버전이 아니라 artifact_id로,
+   "아직 존재하지 않음"을 직접 표현) + `ArtifactGraphStore._still_missing`/`_evidence_is_live` 추가
+   + `live_evidence()`를 "constraint_id당 최신 선택 → 그 다음에만 유효성 검사" 순서로 재작성.
+   `BasicConstraintChecker._check_schema_contract`/`_check_recompute_from_source`도 존재하지 않는
+   참조는 `missing_inputs`에, 존재하지만 틀린/변경 가능한 참조는 `input_versions`에 분리해서
+   담도록 수정. 추가로, 직접 비교 모드가 `source_refs` context 키로만 input을 추적해 `applies_to`
+   에만 선언된 source는 추적되지 않던 것도 `_merge_input_refs`로 수정(§1.2) — recompute-from-source
+   모드도 동일하게 `applies_to`를 병합하도록 통일.
+2. **비용 연결은 됐지만 "엄격한 상한"은 성립하지 않음** — §1.4에 기록. 재현: cap=10에서 12
+   tokens를 쓰는 호출이 그대로 실행되고 12 전액이 charge되어 `spent`(12) > `cap`(10)이 됨;
+   다음 호출부터만 막힌다. 이것은 코드 버그가 아니라 **문서 표현의 오류**였다 — admission 확인은
+   호출 전 "남은 예산 > 0"만 보고, 호출 자체의 실제 비용은 사전에 알 수 없으므로 그 호출이
+   예산을 넘을 수 있다는 것은 애초에 피할 수 없는 설계였다(진짜 pre-emptive hard cap은
+   Producer의 출력 토큰 수 제한이 필요 → agent 코드 변경 → Stage 3 범위 밖, §4). **수정**: 코드
+   동작은 바꾸지 않고, "엄격한 상한" 표현을 "소진 후 신규 호출 차단, 초과분은 허용된 호출 하나의
+   비용까지 bound"로 정확히 고쳤다(`tool_executor.py` 모듈 docstring, `run_generation` docstring,
+   이 문서, 테스트 docstring). 이 정확한 bound 자체를 `test_budget_admission_bounds_overspend_to_
+   at_most_one_calls_cost`로 못박아, "표현을 다시 과장되게 되돌리면" 테스트가 그 사실을 상기시키게
+   했다.
+3. **저장된 관측을 checkpoint JSON에서 복원하면 `compile_result`가 dict로 바뀜** — §0에 기록.
+   재현: 실제 compile 결과를 포함한 checkpoint를 `model_dump_json()` → `model_validate_json()`으로
+   왕복하면, 저장 전 `CompileResult` 객체였던 `observation.output.compile_result`가 복원 후 평범한
+   `dict`가 되어 `.pdf_exists` 같은 속성 접근이 깨짐. 원인: `CompileToolResult.compile_result`가
+   `Optional[Any]`로 선언되어 있어 pydantic이 복원 시 참조할 schema가 없었다 — 값은 보존되지만
+   타입 정보가 사라짐. 수정: `compile_result`를 `Optional[CompileResult]`(`src/evaluation/schemas.py`
+   에서 import)로 변경 — `src/core/adapters.py`가 이미 `src.evaluation.metrics...`를 같은 방향으로
+   import하고 있고, `src/evaluation/schemas.py`는 `src.core`를 전혀 import하지 않으므로 순환
+   import 위험이 없음을 확인했다.
+
+모든 수정은 재현 테스트로 남겼다(예: `test_live_evidence_returns_a_fail_that_correctly_found_its_
+declared_input_missing`, `test_live_evidence_does_not_fall_back_to_an_earlier_verdict_when_the_
+latest_one_for_the_same_constraint_is_invalidated`, `test_check_through_the_real_executor_a_
+missing_required_table_stays_live_until_added_then_rechecked`(실제 checker+executor를 통한
+end-to-end 재현), `test_budget_admission_bounds_overspend_to_at_most_one_calls_cost`,
+`test_compile_result_survives_a_checkpoint_json_round_trip_as_a_typed_object`). 검증: `test/core/`
++ `test/evaluation/` 192개 전부 통과(1차 수정 후 181개에서 +11); 전체 저장소 기준으로도
+`test/test_pipeline_dependency_ordering.py`(수집 자체가 깨진, Stage 3 이전부터의 무관한 기존
+결함) 제외 700 passed / 57 failed로, 57건은 1차 수정 때와 정확히 동일한 기존 무관 결함 목록이라
+회귀 없음을 확인했다. `scripts/run_full_pipeline.py`와 agent 코드는 이번 차수에서 전혀 수정하지
+않았다.

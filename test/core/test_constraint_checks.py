@@ -194,6 +194,83 @@ def test_schema_contract_evidence_carries_applies_to_as_input_versions() -> None
     evidence = checker.check(checked, [constraint])
     assert evidence[0].outcome == CheckOutcome.PASS
     assert evidence[0].input_versions == [ref]
+    assert evidence[0].missing_inputs == []
+
+
+def test_schema_contract_fail_records_missing_refs_by_id_not_as_a_fabricated_existing_version() -> None:
+    """Regression for a second user-caught repro: a not-found ref must go
+    on missing_inputs by artifact_id, never on input_versions as if that
+    version genuinely existed -- otherwise ArtifactGraphStore.live_evidence
+    treats a "this is missing" FAIL as already invalid (nothing named in
+    input_versions actually exists yet to be live), and resurrects it the
+    moment the artifact is finally produced -- backwards either way."""
+    store, checked = _store_with_one_artifact("thm_1")
+    checker = BasicConstraintChecker(store)
+    missing_1 = ArtifactRef(artifact_id="ghost_1", version=1, kind=ArtifactKind.DEFINITION)
+    missing_2 = ArtifactRef(artifact_id="ghost_2", version=1, kind=ArtifactKind.TABLE)
+    constraint = Constraint(
+        constraint_id="c1", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[missing_1, missing_2]
+    )
+    evidence = checker.check(checked, [constraint])
+    assert evidence[0].outcome == CheckOutcome.FAIL
+    assert sorted(evidence[0].missing_inputs) == ["ghost_1", "ghost_2"]
+    assert evidence[0].input_versions == []
+
+
+def test_schema_contract_wrong_kind_ref_is_tracked_as_input_versions_not_missing() -> None:
+    """A ref that resolved to the wrong kind still exists -- it belongs on
+    input_versions (so a later version change on it invalidates this
+    verdict), not on missing_inputs (which means "does not exist at
+    all")."""
+    store = ArtifactGraphStore()
+    store.add_version("def_1", ArtifactKind.DEFINITION, content="def")
+    store.add_version("thm_1", ArtifactKind.CLAIM, content="thm")
+    checker = BasicConstraintChecker(store)
+    wrong_kind_ref = ArtifactRef(artifact_id="def_1", version=1, kind=ArtifactKind.TABLE)
+    constraint = Constraint(
+        constraint_id="c1", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[wrong_kind_ref]
+    )
+    evidence = checker.check(store.latest("thm_1").ref, [constraint])
+    assert evidence[0].outcome == CheckOutcome.FAIL
+    assert evidence[0].input_versions == [wrong_kind_ref]
+    assert evidence[0].missing_inputs == []
+
+
+def test_direct_comparison_mode_tracks_applies_to_even_without_source_refs_in_context() -> None:
+    """Regression for a second user-caught repro: declaring the source
+    solely via Constraint.applies_to (the same mechanism SCHEMA_CONTRACT
+    uses), with no "source_refs" key in context["recompute"][...] at all,
+    previously left input_versions empty -- so a PASS kept reading as live
+    evidence forever even after that source changed version."""
+    store, checked = _store_with_one_artifact("checked")
+    store.add_version("src", ArtifactKind.SOURCE_DATA, content="[1, 2]")
+    src_ref = store.latest("src").ref
+    checker = BasicConstraintChecker(store)
+    constraint = Constraint(
+        constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x", applies_to=[src_ref]
+    )
+    evidence = checker.check(checked, [constraint], context={"recompute": {"r1": {"expected": 3.0, "observed": 3.0}}})
+    assert evidence[0].outcome == CheckOutcome.PASS
+    assert evidence[0].input_versions == [src_ref]
+
+
+def test_direct_comparison_mode_merges_applies_to_and_source_refs_without_duplicating() -> None:
+    store, checked = _store_with_one_artifact("checked")
+    store.add_version("src_a", ArtifactKind.SOURCE_DATA, content="[1]")
+    store.add_version("src_b", ArtifactKind.SOURCE_DATA, content="[2]")
+    ref_a = store.latest("src_a").ref
+    ref_b = store.latest("src_b").ref
+    checker = BasicConstraintChecker(store)
+    constraint = Constraint(
+        constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x", applies_to=[ref_a]
+    )
+    evidence = checker.check(
+        checked,
+        [constraint],
+        context={"recompute": {"r1": {"expected": 3.0, "observed": 3.0, "source_refs": [ref_a, ref_b]}}},
+    )
+    assert evidence[0].outcome == CheckOutcome.PASS
+    assert evidence[0].input_versions == [ref_a, ref_b]  # ref_a from applies_to, not duplicated
 
 
 class TestRecomputeFromSource:
@@ -257,6 +334,32 @@ class TestRecomputeFromSource:
         )
         assert evidence[0].outcome == CheckOutcome.UNKNOWN
         assert evidence[0].unknown_reason == UnknownReason.MISSING_DEPENDENCY
+        # Regression for a second user-caught repro: a wholly-absent source
+        # must go on missing_inputs by id, never on input_versions as a
+        # fabricated "existing" version -- see test_constraint_checks.py's
+        # top-level test of the same fix for SCHEMA_CONTRACT.
+        assert evidence[0].missing_inputs == ["ghost"]
+        assert evidence[0].input_versions == []
+
+    def test_recompute_from_source_also_tracks_constraints_applies_to_refs(self) -> None:
+        """The same applies_to-merge fix as the direct-comparison mode:
+        a constraint can additionally declare dependencies via applies_to
+        (e.g. an unrelated required artifact), and those must still be
+        tracked on input_versions alongside source_ref itself."""
+        store, checked, source_ref = self._store_with_source()
+        store.add_version("extra", ArtifactKind.DEFINITION, content="also depended on")
+        extra_ref = store.latest("extra").ref
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x", applies_to=[extra_ref]
+        )
+        evidence = checker.check(
+            checked,
+            [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "sum", "observed": 35.5, "tolerance": 0.01}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+        assert evidence[0].input_versions == [extra_ref, source_ref]
 
     def test_non_numeric_json_content_is_unknown_not_representable(self) -> None:
         store, checked, source_ref = self._store_with_source(content='{"not": "a list of numbers"}')

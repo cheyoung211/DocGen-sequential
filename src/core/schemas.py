@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
+from src.evaluation.schemas import CompileResult
+
 
 class ArtifactKind(str, Enum):
     """The artifact vocabulary from revision direction 1 ("definition,
@@ -192,6 +194,22 @@ class Evidence(BaseModel):
     method's docstring. Defaults to empty for a check that genuinely
     depends on nothing beyond ``checked_artifact`` itself (e.g. a
     structural check with no cross-references).
+
+    ``missing_inputs`` is the counterpart for an input a check found to
+    *not exist at all* at check time -- e.g. a SCHEMA_CONTRACT FAIL whose
+    required artifact was never produced. A second Stage 3 review found
+    that cramming this case into ``input_versions`` instead (as some
+    already-stored version number that happened to be expected) actively
+    inverted ``live_evidence()``'s invalidation logic: a verdict asserting
+    "X is absent" was treated as invalid *while X stayed absent* (because
+    ``input_versions``' liveness rule requires the referenced version to
+    currently exist), and, backwards, started being treated as *live again*
+    the moment X was finally produced -- exactly backwards from "the thing
+    this verdict depends on changed, so it needs rechecking". An entry here
+    stays live only while ``artifact_id`` is still, right now, never-stored
+    (``ArtifactGraphStore._still_missing``); the moment it starts existing,
+    this verdict must invalidate, the same direction ``input_versions``
+    invalidates when its ref moves to a different version.
     """
 
     constraint_id: str
@@ -200,6 +218,7 @@ class Evidence(BaseModel):
     detail: str = ""
     unknown_reason: Optional[UnknownReason] = None
     input_versions: List[ArtifactRef] = Field(default_factory=list)
+    missing_inputs: List[str] = Field(default_factory=list)
 
     def model_post_init(self, __context: object) -> None:
         if self.outcome == CheckOutcome.UNKNOWN and self.unknown_reason is None:
@@ -692,21 +711,32 @@ class CompileCall(BaseModel):
 
 
 class CompileToolResult(BaseModel):
-    """``compile_result`` is ``Optional`` only for schema generality
-    (``CompileResult`` is defined in ``src/evaluation/schemas.py``, not
-    imported here to avoid a schema-module-to-schema-module dependency --
-    see ``Any``'s use above). In practice it is never actually ``None``:
-    ``ToolExecutor`` always constructs a fresh ``EventLogger`` before
-    calling ``compile_pdf``, and every one of that method's four return
-    paths (missing ``main.tex``, no engine found, a failed compile, and
-    success) calls ``_finalize_compile_result``, which unconditionally
-    sets ``event_logger.compile_result`` whenever ``event_logger`` is not
+    """``compile_result`` is ``Optional`` only because ``ToolExecutor``
+    could in principle be asked to compile without ever constructing an
+    ``EventLogger`` -- in practice it is never actually ``None``:
+    ``ToolExecutor`` always constructs a fresh one before calling
+    ``compile_pdf``, and every one of that method's four return paths
+    (missing ``main.tex``, no engine found, a failed compile, and success)
+    calls ``_finalize_compile_result``, which unconditionally sets
+    ``event_logger.compile_result`` whenever ``event_logger`` is not
     ``None`` (``latex_compiler.py``). ``compile_success`` always mirrors
-    ``compile_pdf``'s own boolean return."""
+    ``compile_pdf``'s own boolean return.
+
+    Typed as the real ``CompileResult`` (``src/evaluation/schemas.py``),
+    not ``Any`` -- a second Stage 3 review found that ``Any`` let a round
+    trip through ``Checkpoint.model_dump_json()`` /
+    ``model_validate_json()`` silently turn this field into a plain
+    ``dict`` (pydantic has no schema to reconstruct against for ``Any``),
+    so ``observation.output.compile_result.pdf_exists`` worked before
+    serializing a checkpoint and broke after restoring one, with the
+    underlying data otherwise unchanged. ``src/core/adapters.py`` already
+    imports from ``src.evaluation.metrics...`` the same direction, and
+    ``src/evaluation/schemas.py`` imports nothing from ``src.core`` at
+    all, so this adds no import cycle."""
 
     action: Literal[ToolActionKind.COMPILE] = ToolActionKind.COMPILE
     compile_success: bool
-    compile_result: Optional[Any] = None
+    compile_result: Optional[CompileResult] = None
 
 
 class FinishCall(BaseModel):

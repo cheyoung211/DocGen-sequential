@@ -115,6 +115,37 @@ def test_check_dispatches_to_the_configured_checker_and_records_evidence() -> No
     assert len(store.log.evidence) == 1
 
 
+def test_check_through_the_real_executor_a_missing_required_table_stays_live_until_added_then_rechecked() -> None:
+    """End-to-end reproduction (through CheckCall/execute(), not a
+    hand-built Evidence) of the exact scenario a second Stage 3 review
+    reported, exercising BasicConstraintChecker + ToolExecutor +
+    ArtifactGraphStore.live_evidence together: a required table is
+    missing (FAIL, itself live evidence), is added without a recheck
+    (live_evidence must go empty, not keep returning the stale FAIL), and
+    is then rechecked (PASS, itself live evidence)."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    checked_ref = store.latest("checked").ref
+    executor = _executor(store)
+    required_table = ArtifactRef(artifact_id="table_foo", version=1, kind=ArtifactKind.TABLE)
+    constraint = Constraint(
+        constraint_id="req_table", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[required_table]
+    )
+
+    first = executor.execute(CheckCall(artifact=checked_ref, constraints=[constraint]))
+    assert first.output.evidence[0].outcome.value == "fail"
+    live = store.live_evidence("checked")
+    assert len(live) == 1 and live[0].outcome.value == "fail"  # the FAIL is itself live evidence
+
+    store.add_version("table_foo", ArtifactKind.TABLE, content="now present")
+    assert store.live_evidence("checked") == []  # stale FAIL must not be resurrected
+
+    second = executor.execute(CheckCall(artifact=checked_ref, constraints=[constraint]))
+    assert second.output.evidence[0].outcome.value == "pass"
+    live2 = store.live_evidence("checked")
+    assert len(live2) == 1 and live2[0].outcome.value == "pass"
+
+
 def test_check_runs_fresh_every_time_never_reuses_a_prior_result() -> None:
     """Completion criterion: "오래된 검증 결과를 재사용하지 않으며" --
     calling check() twice on evidence that is designed to change (by
@@ -183,6 +214,33 @@ def test_compile_reports_failure_for_a_real_latex_syntax_error(tmp_path: Path) -
     assert obs.output.compile_success is False
     assert obs.output.compile_result.first_error_type == "undefined_control_sequence"
     assert obs.output.compile_result.pdf_exists is False
+
+
+def test_compile_result_survives_a_checkpoint_json_round_trip_as_a_typed_object(tmp_path: Path) -> None:
+    """Regression for a second user-caught repro: compile_result used to
+    be typed Optional[Any], so Checkpoint.model_dump_json() ->
+    model_validate_json() silently turned a real CompileResult into a
+    plain dict -- the data survived but .compile_result.pdf_exists stopped
+    working. Now typed as the concrete CompileResult schema, so pydantic
+    reconstructs it properly on restore."""
+    from src.core.schemas import Checkpoint, CompileResult
+
+    request_id = "req_roundtrip"
+    project_dir = tmp_path / request_id
+    project_dir.mkdir()
+    (project_dir / "main.tex").write_text(
+        "\\documentclass{article}\\begin{document}Hello\\end{document}\n", encoding="utf-8"
+    )
+    store = ArtifactGraphStore()
+    executor = _executor(store)
+    executor.execute(CompileCall(request_id=request_id, output_dir=str(tmp_path)))
+
+    checkpoint = store.save_checkpoint()
+    restored = Checkpoint.model_validate_json(checkpoint.model_dump_json())
+
+    logged_output = restored.tool_calls[0].observation.output
+    assert isinstance(logged_output.compile_result, CompileResult)  # not a plain dict
+    assert logged_output.compile_result.pdf_exists is True
 
 
 # -- PATCH / REPLAN (schema-only this stage) --------------------------------
@@ -406,9 +464,39 @@ def test_run_generation_charges_the_executors_own_budget() -> None:
     assert rejected.error.code == ToolErrorCode.SUSPENDED
 
 
+def test_budget_admission_bounds_overspend_to_at_most_one_calls_cost() -> None:
+    """Pins the exact, documented bound a second Stage 3 review asked for
+    after the fix above: admission only checks whether *any* budget
+    remains before a call starts (remaining > 0), never whether that
+    call's own cost will actually fit -- so total spend can overshoot cap
+    by up to one admitted call's cost, never more, and the very next call
+    is guaranteed rejected. This is intentionally weaker than a
+    pre-emptive hard cap -- see tool_executor.py's module docstring for
+    why closing that gap would require controlling the wrapped Producer's
+    own output-token limit, a lever this executor does not have."""
+    store = ArtifactGraphStore()
+    executor = _executor(store, cap=10.0)
+    producer = _FakeProducer(tokens=12)  # remaining=10 > 0 at call time -> admitted anyway
+
+    obs = executor.run_generation(producer, "sec_1", {}, model_name="gpt-4o-mini", stage="text_agent")
+    assert obs.ok is True  # admitted: remaining was positive when the call started
+    assert executor.budget.spent == 12.0  # overshoots cap=10 by exactly this one call's cost
+    assert executor.budget.remaining == -2.0
+    assert executor.is_suspended is True  # but no further call will ever be admitted now
+
+    rejected = executor.execute(InspectArtifactCall(artifact_id="a"))
+    assert rejected.ok is False
+    assert rejected.error.code == ToolErrorCode.SUSPENDED
+    assert executor.budget.spent == 12.0  # unchanged -- the rejected call was never charged
+
+
 def test_run_generation_is_rejected_before_calling_the_producer_when_budget_is_already_exhausted() -> None:
-    """The strict-cap guarantee: a rejected call never reaches the LLM at
-    all, not merely "gets charged after the fact.\""""
+    """Admission checks *before* calling the producer: once the budget is
+    already exhausted, a rejected call never reaches the LLM at all, not
+    merely "gets charged after the fact." This is narrower than a true
+    hard cap -- see test_budget_admission_bounds_overspend_to_at_most_one_
+    calls_cost below for what happens when the budget is *not yet*
+    exhausted going into a call that itself overruns it."""
     store = ArtifactGraphStore()
     executor = _executor(store, cap=0.0)
     producer = _FakeProducer(tokens=5)

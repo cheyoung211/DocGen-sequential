@@ -32,11 +32,32 @@ docstring).
 ever charged against this executor's own ``Budget``: recording a cost via
 ``ArtifactGraphStore.record_cost()`` alone only updates the log, it does
 not touch ``self._budget``, which lives only here. ``run_generation()``
-checks admission *before* calling the wrapped ``Producer`` at all (the
-strict-cap guarantee: a rejected call never reaches the LLM), then charges
-the resulting cost -- success or failure -- through the exact same
-``_charge()`` every dispatched ``ToolCall`` uses, so generation and tool
-calls share one budget ledger, not two independently-tracked ones.
+checks admission *before* calling the wrapped ``Producer`` at all, so a
+call is never even attempted once the budget is already exhausted; it
+then charges the resulting cost -- success or failure -- through the
+exact same ``_charge()`` every dispatched ``ToolCall`` uses, so generation
+and tool calls share one budget ledger, not two independently-tracked
+ones.
+
+**This is exhaustion-gated admission, not a pre-emptive hard cap** -- a
+second Stage 3 review pointed out that "엄격한 상한" (strict cap) is the
+wrong description: admission only ever checks whether *any* budget
+remains (``self._budget.remaining <= 0``) before a call starts, not
+whether *that specific call* will fit inside what remains. A single call
+whose real cost turns out to exceed what was left (e.g. cap=10, remaining
+10, the call itself costs 12) is still admitted and still charged in
+full, and total ``spent`` can therefore overshoot ``cap`` by up to that
+one call's own cost -- what the admission check actually guarantees is
+that *no further call* is admitted after that point (see ``_charge()``'s
+auto-suspend). Pre-empting a single in-flight call from itself exceeding
+the cap would require knowing its cost before it runs -- not possible for
+a probabilistic LLM call in general -- or capping the wrapped
+``Producer``'s own output-token limit, which is a lever this executor
+does not have (it lives in the agent/LLM-client call itself, out of
+Stage 3's "stay additive, do not touch agent code" scope). See
+``test_run_generation_charges_the_executors_own_budget`` and
+``test_budget_admission_bounds_overspend_to_at_most_one_calls_cost`` for
+the exact, tested bound.
 
 Every ``execute()`` call -- admitted, rejected, or raised -- is logged via
 ``ArtifactGraphStore.record_tool_call()`` (also added in that review):
