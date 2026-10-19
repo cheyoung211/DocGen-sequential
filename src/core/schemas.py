@@ -202,9 +202,24 @@ class RepairAction(BaseModel):
     These two fields are independent axes by construction: a policy can
     hold ``action_type`` fixed while varying ``use_diagnostic_feedback``
     (the "blind retry" vs "diagnostic retry" comparison revision direction 2
-    asks for), or vice versa. See ``adapters.BlindRetryRepairPolicy`` vs
-    ``adapters.TodayFixedRepairPolicyAdapter`` for two policies that differ
-    on both axes independently.
+    asks for), or vice versa. ``adapters.BlindRetryRepairPolicy`` demonstrates
+    this by wrapping another ``RepairPolicy`` (e.g.
+    ``adapters.TodayFixedRepairPolicyAdapter``) and stripping only
+    ``use_diagnostic_feedback``/``feedback_text`` from its decisions, while
+    sharing its exact ``action_type`` choice.
+
+    ``use_diagnostic_feedback`` governs only the diagnostic text a
+    ``RepairPolicy`` attaches to *this one action* -- what an executor would
+    pass to a ``Producer`` call site when carrying it out (e.g.
+    ``TextAgent.regenerate_blocks``'s ``error_message`` parameter). It says
+    nothing about, and cannot disable, a ``Producer``'s own *internal*
+    retry-with-feedback loop (``TextAgent.process_node``'s inner attempts
+    feed their own self-discovered validation errors into the next inner
+    attempt's prompt unconditionally -- see ``text_agent.py``'s
+    ``_run_generation_loop``, which has no parameter to turn that off). A
+    "blind" condition built from this flag alone is blind only at the
+    outer, repair-policy-chosen-diagnostic level; see
+    ``adapters.TextAgentProducer``'s docstring for the concrete gap.
     """
 
     action_type: RepairActionType

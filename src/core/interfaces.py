@@ -23,10 +23,16 @@ way today's ``DocGenPipeline._repair_and_recompile``
   ``RepairAction.action_type``.
 
 A ``RepairPolicy`` can vary any one of these while holding the others
-fixed. For example "blind retry" (``adapters.BlindRetryRepairPolicy``) is
-trigger=on, feedback=off, scope=constant; today's actual pipeline
-(``adapters.TodayFixedRepairPolicyAdapter``) is trigger=on, feedback=on,
-scope=block-or-section depending on the error location. Neither axis is
+fixed. Today's actual pipeline (``adapters.TodayFixedRepairPolicyAdapter``)
+is trigger=on, scope=block-or-section depending on the error location, and
+feedback=on *only* for the block branch (the section branch's real call,
+``TextAgent.process_node``, is never actually handed the triggering error
+message at all -- see that adapter's and ``RepairAction``'s own
+docstrings). "blind retry" (``adapters.BlindRetryRepairPolicy``) is defined
+as *another policy, wrapped*, with feedback forced off on every action it
+returns and scope left exactly as the wrapped policy chose -- not an
+independently invented constant scope, which would silently also change
+the scope axis while claiming to isolate feedback alone. Neither axis is
 hard-coded into the Protocols below -- only into a given policy's
 *implementation* of ``decide()``, so a new policy can pick a new
 combination without changing this file.

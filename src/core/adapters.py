@@ -96,6 +96,20 @@ class TextAgentProducer:
     second one's error message is read back off ``graph.nodes[artifact_id]
     .last_error`` rather than invented, since that is the pipeline's own
     record of why it failed.
+
+    **``produce()`` has no way to suppress ``process_node``'s own internal
+    retry-with-feedback loop.** Every inner attempt inside
+    ``_run_generation_loop`` unconditionally feeds its own previous
+    attempt's error back into the next attempt's prompt
+    (``text_agent.py:765`` passes ``previous_error=last_error``) -- there is
+    no parameter on ``process_node`` to turn that off, and this adapter
+    does not add one (that would be an agent-code change, outside Stage
+    1's scope). A caller building a "blind" condition out of
+    ``RepairAction.use_diagnostic_feedback=False`` is only blind at the
+    outer level -- which diagnostic text, if any, this adapter *was handed*
+    to pass along to the Producer call. It cannot, by itself, make
+    ``TextAgent`` stop learning from its own in-flight attempts; see
+    ``RepairAction``'s docstring for the same point from the schema side.
     """
 
     def __init__(self, text_agent: TextAgent) -> None:
@@ -130,11 +144,31 @@ class TextAgentProducer:
         )
 
 
-# Error codes TextAgent._validate_one_block can produce unconditionally,
-# before any enabled_validators-gated check runs -- and whose presence
-# means every gated check below was skipped entirely, not merely not
-# triggered (text_agent.py:1020-1037's early ``return errors``).
-_STRUCTURAL_CODES = frozenset({"type_mismatch", "empty_content"})
+# The two unconditional (never enabled_validators-gated) checks
+# _validate_one_block runs before anything else, IN THIS ORDER
+# (text_agent.py:1020-1037) -- each one's own early ``return errors`` means
+# every check *after* it in this tuple, and every gated check below both,
+# never ran at all. Order matters: type_mismatch is checked first and can
+# short-circuit empty_content, but not vice versa.
+_STRUCTURAL_CHECK_ORDER = ("type_mismatch", "empty_content")
+_STRUCTURAL_CODES = frozenset(_STRUCTURAL_CHECK_ORDER)
+
+
+def _short_circuited_before(code: str, errors_by_code: Dict[str, SemanticBlockError]) -> bool:
+    """True if ``_validate_one_block`` returned before ``code``'s own check
+    could run at all, because an earlier check in ``_STRUCTURAL_CHECK_ORDER``
+    already failed -- meaning a later code's absence from ``errors_by_code``
+    reflects "never evaluated", not "evaluated and passed". Every gated
+    check (anything not in ``_STRUCTURAL_CHECK_ORDER``) is short-circuited
+    by either structural failure, since both sit before the gated checks
+    in the method body.
+    """
+    for earlier_code in _STRUCTURAL_CHECK_ORDER:
+        if earlier_code == code:
+            return False
+        if earlier_code in errors_by_code:
+            return True
+    return False
 
 # Gated error code -> the DEFAULT_ENABLED_VALIDATORS key that gates it
 # (text_agent.py:1046-1143). "figure_content" gates two distinct codes.
@@ -184,19 +218,27 @@ class TextAgentValidatorAdapter:
     ``constraint_id`` matching one of ``_validate_one_block``'s own error
     codes (e.g. ``"forbidden_environment"``, ``"type_mismatch"``) -- not by
     silently reporting whatever the checker happened to find and ignoring
-    ``constraints`` otherwise. Four distinct reasons a constraint does not
-    get a plain PASS/FAIL, each a different ``Evidence``:
+    ``constraints`` otherwise. Checked in this order, each a different
+    reason a constraint does not get a plain PASS/FAIL:
 
-    - unrecognized ``constraint_id`` -> UNKNOWN / NOT_REPRESENTABLE (this
-      adapter has no check by that name at all).
-    - recognized, but ``layout_block.kind`` is one ``_validate_one_block``
-      never runs that check for (e.g. ``equation_shape`` on a non-equation
-      block) -> UNKNOWN / NOT_REPRESENTABLE.
-    - recognized and applicable, but this block already failed
-      ``type_mismatch``/``empty_content``, so every gated check below that
-      short-circuit never ran at all -> UNKNOWN / NOT_CHECKED.
-    - recognized, applicable, and reached, but its gate in
-      ``enabled_validators`` is off for this run -> UNKNOWN / NOT_CHECKED.
+    1. unrecognized ``constraint_id`` -> UNKNOWN / NOT_REPRESENTABLE (this
+       adapter has no check by that name at all).
+    2. recognized, but ``layout_block.kind`` is one ``_validate_one_block``
+       never runs that check for (e.g. ``equation_shape`` on a
+       non-equation block) -> UNKNOWN / NOT_REPRESENTABLE. Checked *before*
+       #3 below: a kind mismatch is true independent of anything else that
+       did or didn't short-circuit, so it is the more fundamental reason
+       and takes priority when both would otherwise apply.
+    3. kind-applicable, but ``_validate_one_block`` returned before this
+       code's own check could run, because an *earlier* unconditional
+       check -- ``type_mismatch``, then ``empty_content``
+       (``_STRUCTURAL_CHECK_ORDER``) -- already failed first. This can
+       happen to ``empty_content`` itself (short-circuited by
+       ``type_mismatch``), not only to a gated check -> UNKNOWN /
+       NOT_CHECKED.
+    4. kind-applicable and reached, but its gate in ``enabled_validators``
+       is off for this run -> UNKNOWN / NOT_CHECKED.
+    5. everything else: actually evaluated -> PASS or FAIL.
     """
 
     def __init__(self, text_agent: TextAgent) -> None:
@@ -238,17 +280,12 @@ class TextAgentValidatorAdapter:
             error.code: error
             for error in self._text_agent._validate_one_block(content_block, layout_block)
         }
-        short_circuited = bool(_STRUCTURAL_CODES & errors_by_code.keys())
 
         evidence: List[Evidence] = []
         for constraint in constraints:
             code = constraint.constraint_id
 
-            if code in _STRUCTURAL_CODES:
-                evidence.append(self._pass_or_fail(code, errors_by_code, artifact))
-                continue
-
-            if code not in _GATE_KEY_BY_CODE:
+            if code not in _STRUCTURAL_CODES and code not in _GATE_KEY_BY_CODE:
                 evidence.append(
                     Evidence(
                         constraint_id=code,
@@ -260,6 +297,14 @@ class TextAgentValidatorAdapter:
                 )
                 continue
 
+            # Kind-applicability is checked before short-circuit below: if
+            # this check could never apply to this block's kind at all
+            # (e.g. table_shape on a DEFINITION block), that is true
+            # regardless of whether something else also short-circuited
+            # _validate_one_block -- it is the more fundamental reason, and
+            # does not depend on errors_by_code at all. _APPLICABLE_KINDS_
+            # BY_CODE/_EXCLUDED_KINDS_BY_CODE have no entry for a
+            # structural code, so this is always "applicable" for those.
             applicable_kinds = _APPLICABLE_KINDS_BY_CODE.get(code)
             excluded_kinds = _EXCLUDED_KINDS_BY_CODE.get(code)
             is_applicable = (
@@ -277,16 +322,30 @@ class TextAgentValidatorAdapter:
                 )
                 continue
 
-            if short_circuited:
+            # Checked next, including for a structural code itself:
+            # type_mismatch is never short-circuited (it's first in
+            # _STRUCTURAL_CHECK_ORDER), but empty_content IS short-
+            # circuited by type_mismatch -- so a structural code can still
+            # be UNKNOWN/NOT_CHECKED, not just a gated one. This is the fix
+            # for a real bug: a block that fails type_mismatch AND would
+            # also fail empty_content (wrong type, and empty) used to
+            # report empty_content as PASS, because _validate_one_block
+            # never actually reached that check to fail it -- "absent from
+            # errors_by_code" was wrongly read as "checked and passed".
+            if _short_circuited_before(code, errors_by_code):
                 evidence.append(
                     Evidence(
                         constraint_id=code,
                         outcome=CheckOutcome.UNKNOWN,
                         checked_artifact=artifact,
-                        detail="block failed an earlier structural check, so this check never ran",
+                        detail="an earlier structural check failed first, so this check never ran",
                         unknown_reason=UnknownReason.NOT_CHECKED,
                     )
                 )
+                continue
+
+            if code in _STRUCTURAL_CODES:
+                evidence.append(self._pass_or_fail(code, errors_by_code, artifact))
                 continue
 
             gate_key = _GATE_KEY_BY_CODE[code]
@@ -329,13 +388,21 @@ class TodayFixedRepairPolicyAdapter:
     directly -- it reproduces just its *decision rule*. Two parts of that
     rule matter, and both are reproduced:
 
-    1. Scope: patch the block if the compiler's error location resolved to
-       one via ``LatexAssembler.locate_block_at_line`` (here:
-       ``checked_artifact.kind == ArtifactKind.BLOCK``), otherwise
-       regenerate the whole section (``run_full_pipeline.py:491-511``).
-       Diagnostic feedback is always on, matching the real method, which
-       always forwards the compiler's error message as the next attempt's
-       instruction.
+    1. Scope *and* feedback, together -- the real method's two call sites
+       differ in both, not just scope (``run_full_pipeline.py:499-511``):
+       when the error location resolved to a block, it calls
+       ``TextAgent.regenerate_blocks(section_id, block_id, location.message,
+       ...)``, passing the compiler's error message as the explicit
+       ``error_message`` argument -- feedback *is* delivered. When it
+       didn't resolve to a block, it calls
+       ``TextAgent.process_node(section_id, graph, request_id, ...)`` --
+       this call has no error-message parameter at all, so the compiler's
+       message is computed (``location.message``) but never actually
+       handed to the producer. So: ``PATCH_BLOCK`` ->
+       ``use_diagnostic_feedback=True``; ``REGENERATE_SECTION`` ->
+       ``use_diagnostic_feedback=False``. An earlier version of this
+       adapter set feedback ``True`` for both branches, which did not match
+       the real method's section-repair call.
     2. Cardinality: the real method acts on exactly **one** location per
        round -- ``regenerable[0]`` (``run_full_pipeline.py:466-475``) --
        then recompiles and re-reads the *new* log before deciding again. It
@@ -360,17 +427,17 @@ class TodayFixedRepairPolicyAdapter:
         for item in evidence:
             if item.outcome != CheckOutcome.FAIL:
                 continue
-            action_type = (
-                RepairActionType.PATCH_BLOCK
-                if item.checked_artifact.kind == ArtifactKind.BLOCK
-                else RepairActionType.REGENERATE_SECTION
-            )
+            is_block = item.checked_artifact.kind == ArtifactKind.BLOCK
+            action_type = RepairActionType.PATCH_BLOCK if is_block else RepairActionType.REGENERATE_SECTION
             return [
                 RepairAction(
                     action_type=action_type,
                     target_artifacts=[item.checked_artifact],
-                    use_diagnostic_feedback=True,
-                    feedback_text=item.detail,
+                    # Matches regenerate_blocks (gets location.message) vs
+                    # process_node (gets nothing) -- see this method's
+                    # docstring, point 1.
+                    use_diagnostic_feedback=is_block,
+                    feedback_text=item.detail if is_block else None,
                     triggering_constraint_id=item.constraint_id,
                 )
             ]
@@ -383,28 +450,34 @@ class BlindRetryRepairPolicy:
     review problem #1 frames the comparison: "동일한 허용 복구 정책과 비용
     상한에서 blind retry와 비교한다" (compare against blind retry under the
     *same admissible repair policy* and cost cap). Wraps ``wrapped`` (e.g.
-    ``TodayFixedRepairPolicyAdapter()``) and shares its scope decisions by
-    construction, instead of inventing an independent scope rule -- an
-    earlier version of this class picked its own hardcoded constant scope,
-    which was not actually comparable to anything else on a single,
-    isolated axis and has been replaced by this wrapper form.
+    ``TodayFixedRepairPolicyAdapter()``) and shares its decisions by
+    construction, instead of inventing independent logic of its own.
 
-    Concretely: ``BlindRetryRepairPolicy(wrapped=TodayFixedRepairPolicyAdapter())``
-    picks the exact same ``action_type`` as ``TodayFixedRepairPolicyAdapter()``
-    alone would for the same ``Evidence``, and differs *only* in
-    ``use_diagnostic_feedback``/``feedback_text`` -- see
-    ``test/core/test_adapters.py::test_blind_retry_shares_the_wrapped_policys_scope_rule``.
+    **Calls ``wrapped.decide()`` exactly once per ``decide()`` call, on one
+    shared evidence list, then only strips feedback from whatever it
+    returns.** An earlier version called ``wrapped.decide([item], ...)``
+    separately *per distinct failing artifact* -- which seemed like a
+    reasonable way to also enforce a per-artifact retry cap, but silently
+    changed more than feedback: ``TodayFixedRepairPolicyAdapter`` alone,
+    given 2 distinct failing artifacts, returns exactly 1 action (its own
+    ``regenerable[0]``-style cardinality -- see its docstring); the
+    per-artifact-call version of this wrapper returned 2, one per artifact,
+    because each singleton call let the wrapped policy "see" only one
+    failure at a time and naturally act on it. That was no longer "the same
+    policy, minus feedback" -- it was a different policy that also happened
+    to drop feedback. Fixed by computing the retry cap's effect as a
+    *restriction on the evidence list itself* (evidence for an
+    already-exhausted artifact is simply left out, as if that failure
+    weren't reported this round) and then calling ``wrapped.decide()``
+    once on what remains -- so cardinality, ordering, and every other
+    aspect of the wrapped policy's behavior come through unchanged; see
+    ``test/core/test_adapters.py::test_blind_retry_matches_the_wrapped_policys_cardinality_exactly``.
 
-    Also enforces its own per-artifact retry cap and budget check, grouping
-    ``Evidence`` by target artifact first so one ``decide()`` call never
-    returns two actions for the same artifact (previously, two FAIL
-    ``Evidence`` entries naming the same artifact produced two separate
-    ``RepairAction``s for it in a single call). The retry counter is
-    advanced **only** by ``record_attempt_started()``, never inside
-    ``decide()`` -- see ``RepairPolicy.decide()``'s docstring for why
-    counting there is wrong (it exhausts the cap before anything was
-    actually executed, and double-counts on a repeated/speculative
-    ``decide()`` call).
+    The retry counter behind that restriction is advanced **only** by
+    ``record_attempt_started()``, never inside ``decide()`` -- see
+    ``RepairPolicy.decide()``'s docstring for why counting there is wrong
+    (it exhausts the cap before anything was actually executed, and
+    double-counts on a repeated/speculative ``decide()`` call).
     """
 
     def __init__(self, wrapped: RepairPolicy, max_retries_per_artifact: int = 3) -> None:
@@ -422,25 +495,19 @@ class BlindRetryRepairPolicy:
     def decide(
         self, evidence: List[Evidence], dependency_edges: List[Any], budget: Budget
     ) -> List[RepairAction]:
-        first_failure_by_artifact: Dict[str, Evidence] = {}
-        for item in evidence:
-            if item.outcome != CheckOutcome.FAIL:
-                continue
-            first_failure_by_artifact.setdefault(item.checked_artifact.artifact_id, item)
-
-        actions: List[RepairAction] = []
-        for artifact_id, item in first_failure_by_artifact.items():
-            if budget.remaining <= 0:
-                break
-            if self._attempts.get(artifact_id, 0) >= self._max_retries:
-                continue
-            for wrapped_action in self._wrapped.decide([item], dependency_edges, budget):
-                actions.append(
-                    wrapped_action.model_copy(
-                        update={"use_diagnostic_feedback": False, "feedback_text": None}
-                    )
-                )
-        return actions
+        if budget.remaining <= 0:
+            return []
+        eligible_evidence = [
+            item
+            for item in evidence
+            if item.outcome != CheckOutcome.FAIL
+            or self._attempts.get(item.checked_artifact.artifact_id, 0) < self._max_retries
+        ]
+        wrapped_actions = self._wrapped.decide(eligible_evidence, dependency_edges, budget)
+        return [
+            action.model_copy(update={"use_diagnostic_feedback": False, "feedback_text": None})
+            for action in wrapped_actions
+        ]
 
 
 class ContractOnlyFinalEvaluator:
