@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -475,3 +475,258 @@ class Checkpoint(BaseModel):
     actions: List[ActionLogEntry] = Field(default_factory=list)
     evidence: List[Evidence] = Field(default_factory=list)
     costs: List[CostRecord] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 ("도구 실행기, 기본 제약 검사, 비용 집계") schemas. The seven
+# action kinds are direction 2's controller action space ("inspect_artifact,
+# query_dependencies, check_constraints/check_calculation, patch_block,
+# replan_subgraph, compile_document, finish"), collapsed to the Stage 3
+# checklist's own seven short names ("inspect/query/check/patch/replan/
+# compile/finish의 입력·출력 schema") -- the checklist itself folds
+# direction 2's "check_constraints / check_calculation" slash-pair into one
+# "check" action, so there is exactly one CHECK kind here, not two; which
+# ``ConstraintKind``s a given check call actually exercises is a property
+# of the ``Constraint`` list passed in, not of the action name.
+#
+# The behavior behind each kind lives in ``src/core/tool_executor.py``
+# (dispatch, budget/action-count/suspend enforcement),
+# ``src/core/constraint_checks.py`` (CHECK), and ``src/core/cost_tracking.py``
+# (cost/latency/GPU measurement for the one real LLM-calling surface that
+# exists today, Stage 1's ``Producer``). These classes are plain data shapes
+# only, following this file's existing split between schema (here) and
+# behavior (elsewhere) -- see ``interfaces.py``'s and ``artifact_graph.py``'s
+# own module docstrings for the same split at Stage 1/2.
+# ---------------------------------------------------------------------------
+
+
+class ToolActionKind(str, Enum):
+    """The controller's action vocabulary (revision direction 2), exactly as
+    the Stage 3 checklist names it. ``PATCH``/``REPLAN`` are intentionally
+    not implemented this stage -- see ``tool_executor.ToolExecutor``'s
+    docstring: actually deciding regeneration scope and carrying it out is
+    Stage 4's "고정 복구 정책" / Stage 5's controller, not Stage 3's."""
+
+    INSPECT = "inspect"
+    QUERY = "query"
+    CHECK = "check"
+    PATCH = "patch"
+    REPLAN = "replan"
+    COMPILE = "compile"
+    FINISH = "finish"
+
+
+class ToolErrorCode(str, Enum):
+    """The "실행 오류 형식" (execution error format) the Stage 3 checklist
+    asks every tool action to share, rather than each action inventing its
+    own ad hoc error shape."""
+
+    BUDGET_EXCEEDED = "budget_exceeded"
+    MAX_ACTIONS_EXCEEDED = "max_actions_exceeded"
+    SUSPENDED = "suspended"
+    NOT_IMPLEMENTED = "not_implemented"
+    UNKNOWN_ARTIFACT = "unknown_artifact"
+    TIMEOUT = "timeout"
+    EXECUTION_FAILED = "execution_failed"
+
+
+class ToolExecutionError(BaseModel):
+    """One structured execution failure for one ``ToolCall``. Never a bare
+    exception/string: ``code`` is always one of ``ToolErrorCode`` so a
+    controller can branch on it programmatically, and ``action`` identifies
+    which call this refers to even once unwrapped from its
+    ``ToolObservation``."""
+
+    code: ToolErrorCode
+    action: ToolActionKind
+    message: str
+
+
+class InspectArtifactCall(BaseModel):
+    """inspect_artifact: read one artifact's current (or one historical)
+    stored state -- no side effects, no cost beyond the call's own
+    measured latency."""
+
+    action: Literal[ToolActionKind.INSPECT] = ToolActionKind.INSPECT
+    artifact_id: str
+    version: Optional[int] = None
+
+
+class InspectArtifactResult(BaseModel):
+    """``stored`` reuses ``StoredArtifact`` directly (ref/content/
+    produced_by/status/branch_id/created_at) rather than re-deriving a
+    narrower view of it -- same principle ``CostRecord`` already applies to
+    ``TokenUsage``: reuse an existing shape in full instead of inventing a
+    thinner one. ``found=False`` with ``stored=None`` means the
+    ``(artifact_id, version)`` was never stored -- not an error, since
+    "does this exist" is a legitimate question to ask."""
+
+    action: Literal[ToolActionKind.INSPECT] = ToolActionKind.INSPECT
+    found: bool
+    stored: Optional[StoredArtifact] = None
+
+
+class QueryDependenciesCall(BaseModel):
+    """query_dependencies: the change-impact and typed-edge view of one
+    artifact, read straight through to ``ArtifactGraphStore.impact_candidates``/
+    ``.edges`` -- see that module for why both are pure queries."""
+
+    action: Literal[ToolActionKind.QUERY] = ToolActionKind.QUERY
+    artifact_id: str
+
+
+class QueryDependenciesResult(BaseModel):
+    """``impact_candidates`` is ``I(R) = R ∪ Desc_G(R)`` (direction 1) for
+    ``artifact_id``, sorted for determinism. ``edges`` is filtered to only
+    those naming ``artifact_id`` as either endpoint -- the store's full
+    ``edges`` property is every edge ever recorded across every artifact,
+    which would make every ``QueryDependenciesResult`` carry the whole
+    run's edge history regardless of which artifact was asked about."""
+
+    action: Literal[ToolActionKind.QUERY] = ToolActionKind.QUERY
+    impact_candidates: List[str] = Field(default_factory=list)
+    edges: List[DependencyEdge] = Field(default_factory=list)
+
+
+class CheckCall(BaseModel):
+    """check: evaluate ``constraints`` against ``artifact`` via whichever
+    ``Validator`` the executor was constructed with (Stage 3's default is
+    ``constraint_checks.BasicConstraintChecker``). ``context`` is forwarded
+    to ``Validator.check()`` unchanged -- e.g. a RECOMPUTE constraint's
+    expected/observed values, keyed by ``constraint_id`` under
+    ``context["recompute"]`` (see that module), mirroring how Stage 1's
+    ``TextAgentValidatorAdapter.check()`` already uses ``context`` to carry
+    whatever a given checker needs beyond the bare ``Constraint`` list.
+
+    Always runs a fresh check -- never a cache lookup against previously
+    recorded ``Evidence`` -- so a stale verification result can never be
+    silently reused in place of re-checking (Stage 3's completion
+    criterion: "오래된 검증 결과를 재사용하지 않으며")."""
+
+    action: Literal[ToolActionKind.CHECK] = ToolActionKind.CHECK
+    artifact: ArtifactRef
+    constraints: List[Constraint]
+    context: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CheckResult(BaseModel):
+    action: Literal[ToolActionKind.CHECK] = ToolActionKind.CHECK
+    evidence: List[Evidence] = Field(default_factory=list)
+
+
+class PatchCall(BaseModel):
+    """patch_block: schema only this stage -- see ``ToolActionKind``'s
+    docstring. Defined now so the input shape a Stage 4 executor will
+    actually dispatch on is already fixed and testable; calling it through
+    ``ToolExecutor`` always returns ``ToolErrorCode.NOT_IMPLEMENTED``."""
+
+    action: Literal[ToolActionKind.PATCH] = ToolActionKind.PATCH
+    target: ArtifactRef
+    feedback_text: Optional[str] = None
+
+
+class ReplanCall(BaseModel):
+    """replan_subgraph: schema only this stage -- see ``PatchCall``'s
+    docstring; the same applies here."""
+
+    action: Literal[ToolActionKind.REPLAN] = ToolActionKind.REPLAN
+    targets: List[ArtifactRef]
+    reason: Optional[str] = None
+
+
+class CompileCall(BaseModel):
+    """compile_document: dispatches to the real, already-deterministic
+    ``LatexCompiler.compile_pdf`` (``src/agents/latex_compiler.py``) --
+    direction 2 frames the compiler as a ready-made deterministic tool, and
+    unlike patch/replan there is no new decision logic to defer to Stage 4
+    here, only plumbing. ``request_id``/``output_dir`` match
+    ``compile_pdf``'s own parameters exactly (``base_dir = output_dir /
+    request_id``, matching ``main.tex``'s expected location)."""
+
+    action: Literal[ToolActionKind.COMPILE] = ToolActionKind.COMPILE
+    request_id: str
+    output_dir: str = "outputs/generations"
+
+
+class CompileToolResult(BaseModel):
+    """``compile_result`` is ``Optional`` only for schema generality
+    (``CompileResult`` is defined in ``src/evaluation/schemas.py``, not
+    imported here to avoid a schema-module-to-schema-module dependency --
+    see ``Any``'s use above). In practice it is never actually ``None``:
+    ``ToolExecutor`` always constructs a fresh ``EventLogger`` before
+    calling ``compile_pdf``, and every one of that method's four return
+    paths (missing ``main.tex``, no engine found, a failed compile, and
+    success) calls ``_finalize_compile_result``, which unconditionally
+    sets ``event_logger.compile_result`` whenever ``event_logger`` is not
+    ``None`` (``latex_compiler.py``). ``compile_success`` always mirrors
+    ``compile_pdf``'s own boolean return."""
+
+    action: Literal[ToolActionKind.COMPILE] = ToolActionKind.COMPILE
+    compile_success: bool
+    compile_result: Optional[Any] = None
+
+
+class FinishCall(BaseModel):
+    """finish: end the episode and record what, if anything, is left
+    unresolved -- direction 2: "종료 조건과 미해결 항목을 기록하고 종료".
+    Always admissible through ``ToolExecutor.execute`` regardless of
+    suspension or exhausted budget/action-count: those conditions are
+    exactly when an episode needs to be able to wrap up cleanly, not when
+    it should be blocked from doing so."""
+
+    action: Literal[ToolActionKind.FINISH] = ToolActionKind.FINISH
+    reason: str
+    unresolved_artifact_ids: List[str] = Field(default_factory=list)
+
+
+class FinishToolResult(BaseModel):
+    action: Literal[ToolActionKind.FINISH] = ToolActionKind.FINISH
+    acknowledged: bool = True
+
+
+ToolCall = Union[
+    InspectArtifactCall,
+    QueryDependenciesCall,
+    CheckCall,
+    PatchCall,
+    ReplanCall,
+    CompileCall,
+    FinishCall,
+]
+
+ToolCallResult = Union[
+    InspectArtifactResult,
+    QueryDependenciesResult,
+    CheckResult,
+    CompileToolResult,
+    FinishToolResult,
+]
+
+
+class ToolObservation(BaseModel):
+    """The one structured shape a controller reads back from every
+    ``ToolExecutor.execute()`` call -- Stage 3's completion criterion:
+    "controller가 읽을 수 있는 구조화된 observation". Exactly one of
+    ``output``/``error`` is set, matching ``ProductionResult``'s existing
+    success-xor-failure discipline (``model_post_init`` below) rather than
+    leaving a caller to infer which one is meaningful from ``ok`` alone.
+
+    ``cost`` is populated whenever the executor actually dispatched the
+    call (whether it then succeeded or raised) -- a rejected call (budget/
+    max-actions/suspended, or an unimplemented action) carries no
+    ``CostRecord`` at all, since nothing was actually run; see
+    ``tool_executor.ToolExecutor`` for why an admission-rejected call must
+    not be charged.
+    """
+
+    action: ToolActionKind
+    ok: bool
+    output: Optional[ToolCallResult] = Field(default=None, discriminator="action")
+    error: Optional[ToolExecutionError] = None
+    cost: Optional[CostRecord] = None
+
+    def model_post_init(self, __context: object) -> None:
+        if self.ok and self.error is not None:
+            raise ValueError("ToolObservation with ok=True must not carry an error.")
+        if not self.ok and self.output is not None:
+            raise ValueError("ToolObservation with ok=False must not carry an output.")
