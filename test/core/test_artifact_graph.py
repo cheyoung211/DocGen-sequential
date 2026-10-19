@@ -12,6 +12,7 @@ from src.core.run_log import RunLog
 from src.core.schemas import (
     ArtifactKind,
     ArtifactRef,
+    ArtifactStatus,
     CheckOutcome,
     Checkpoint,
     CostRecord,
@@ -376,3 +377,206 @@ def test_run_log_total_cost_tokens_includes_failed_attempts() -> None:
     log.log_cost(CostRecord(stage="text_agent", total_tokens=50, succeeded=True))
     log.log_cost(CostRecord(stage="text_agent", total_tokens=30, succeeded=False))
     assert log.total_cost_tokens == 80
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for a user-caught review (4 issues + a minor one). Named
+# after the exact repro each one came from.
+# ---------------------------------------------------------------------------
+
+# -- Issue 1: every store boundary must deep-copy, not just latest()/edges --
+
+
+def test_mutating_add_version_result_ref_does_not_corrupt_the_store() -> None:
+    store = ArtifactGraphStore()
+    result = store.add_version("def_1", ArtifactKind.DEFINITION, content="v1")
+    result.ref.version = 99
+    assert store.latest("def_1").ref.version == 1
+
+
+def test_mutating_a_returned_checkpoint_does_not_affect_a_later_restore() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("def_1", ArtifactKind.DEFINITION, content="v1")
+    checkpoint = store.save_checkpoint()
+    checkpoint.artifacts["def_1"][0].content = "tampered"
+    checkpoint.label = "tampered label"
+
+    restored = store.restore_checkpoint(checkpoint.checkpoint_id, branch_id="branch_A")
+    assert restored.latest("def_1").content == "v1"
+
+
+def test_mutating_a_recorded_cost_record_after_the_call_does_not_affect_the_log() -> None:
+    store = ArtifactGraphStore()
+    cost = CostRecord(stage="text_agent", total_tokens=100)
+    store.record_cost(cost)
+    cost.total_tokens = 0
+    assert store.log.total_cost_tokens == 100
+
+
+def test_mutating_live_evidence_result_does_not_corrupt_the_stored_evidence() -> None:
+    store = ArtifactGraphStore()
+    result = store.add_version("thm_1", ArtifactKind.CLAIM, content="...")
+    evidence = Evidence(constraint_id="c1", outcome=CheckOutcome.FAIL, checked_artifact=result.ref)
+    store.record_evidence(evidence)
+
+    live = store.live_evidence("thm_1")
+    live[0].outcome = CheckOutcome.PASS
+    assert store.live_evidence("thm_1")[0].outcome == CheckOutcome.FAIL
+
+
+def test_mutating_an_invalidation_record_does_not_corrupt_the_audit_trail() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("def_1", ArtifactKind.DEFINITION, content="v1")
+    def_ref = store.latest("def_1").ref
+    store.add_version("thm_1", ArtifactKind.CLAIM, read_input_versions=[def_ref])
+    store.add_version("def_1", ArtifactKind.DEFINITION, content="v2")
+
+    records = store.invalidation_history
+    records[0].affected_artifact_id = "tampered"
+    assert all(r.affected_artifact_id != "tampered" for r in store.invalidation_history)
+
+
+def test_mutating_a_logged_action_entry_does_not_corrupt_the_log() -> None:
+    store = ArtifactGraphStore()
+    action = RepairAction(
+        action_type=RepairActionType.PATCH_BLOCK,
+        target_artifacts=[_ref("blk_1", 1, ArtifactKind.BLOCK)],
+        use_diagnostic_feedback=False,
+    )
+    entry = store.record_action(action)
+    entry.branch_id = "tampered"
+    assert store.log.actions[0].branch_id != "tampered"
+
+
+# -- Issue 2: input *staleness* (not just version-matching) must be
+# checked, and status must have one source of truth. --
+
+
+def test_creating_an_artifact_from_a_stale_input_is_itself_born_stale() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1", read_input_versions=[a_ref])
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")  # b becomes stale
+    assert store.is_stale("b")
+
+    b_ref = store.latest("b").ref  # still v1, still stale, version unchanged
+    result = store.add_version(
+        "c", ArtifactKind.DEFINITION, content="c1", read_input_versions=[b_ref]
+    )
+
+    assert result.born_stale is True
+    assert result.used_stale_inputs == [b_ref]
+    assert store.is_stale("c")
+
+    store.record_evidence(
+        Evidence(constraint_id="x", outcome=CheckOutcome.PASS, checked_artifact=result.ref)
+    )
+    assert store.live_evidence("c") == []  # built on stale ground -- never trustworthy
+
+
+def test_regenerating_with_an_outdated_input_does_not_clear_staleness() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    old_a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1", read_input_versions=[old_a_ref])
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")
+    assert store.is_stale("b")
+
+    # "Regenerate" b, but still reading the old a@1 -- nothing was actually fixed.
+    result = store.add_version(
+        "b", ArtifactKind.DEFINITION, content="b1, again", read_input_versions=[old_a_ref]
+    )
+    assert result.born_stale is True
+    assert result.used_outdated_inputs == [old_a_ref]
+    assert store.is_stale("b")  # staleness must NOT have been cleared
+
+
+def test_is_stale_and_latest_status_never_disagree() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1", read_input_versions=[a_ref])
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")
+
+    assert store.is_stale("b") is True
+    assert store.latest("b").status == ArtifactStatus.STALE
+    assert store.get_version("b", 1).status == ArtifactStatus.STALE  # v1 IS the latest here
+
+    new_a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b2", read_input_versions=[new_a_ref])
+
+    assert store.is_stale("b") is False
+    assert store.latest("b").status == ArtifactStatus.FRESH
+    # The superseded v1 is no longer "the current state" -- not a live staleness concern.
+    assert store.get_version("b", 1).status == ArtifactStatus.FRESH
+
+
+# -- Issue 3: a declared input ref must point at something real. --
+
+
+def test_add_version_rejects_a_nonexistent_input_version() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    phantom_version = _ref("a", 999, ArtifactKind.DEFINITION)
+    with pytest.raises(UnknownArtifactError):
+        store.add_version("b", ArtifactKind.DEFINITION, read_input_versions=[phantom_version])
+
+
+def test_add_version_rejects_a_mismatched_kind_in_a_declared_input() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    wrong_kind_ref = _ref("a", 1, ArtifactKind.TABLE)
+    with pytest.raises(ValueError):
+        store.add_version("b", ArtifactKind.DEFINITION, read_input_versions=[wrong_kind_ref])
+
+
+def test_add_inferred_edge_rejects_a_nonexistent_version_or_mismatched_kind() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1")
+    b_ref = store.latest("b").ref
+
+    with pytest.raises(UnknownArtifactError):
+        store.add_inferred_edge(_ref("a", 999, ArtifactKind.DEFINITION), b_ref, reason="x")
+
+    with pytest.raises(ValueError):
+        store.add_inferred_edge(_ref("a", 1, ArtifactKind.TABLE), b_ref, reason="x")
+
+
+# -- Issue 4: impact computation must use only CURRENT-version relations. --
+
+
+def test_regenerating_without_an_input_drops_it_from_current_impact() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1", read_input_versions=[a_ref])
+    assert "b" in store.impact_candidates("a")
+
+    # b is regenerated with content unrelated to a -- no declared inputs.
+    store.add_version("b", ArtifactKind.DEFINITION, content="b2, unrelated to a")
+    assert store.impact_candidates("a") == {"a"}  # b is no longer a current dependent
+
+    store.add_version("a", ArtifactKind.DEFINITION, content="a3")
+    assert not store.is_stale("b")  # a's change no longer propagates to the current b@2
+
+    # The old a@1 -> b@1 edge is still in the audit trail, just not live.
+    assert any(
+        e.from_artifact.artifact_id == "a" and e.to_artifact.version == 1 for e in store.edges
+    )
+
+
+# -- Minor: add_inferred_edge's reason must actually be stored. --
+
+
+def test_add_inferred_edge_persists_its_reason() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("def_1", ArtifactKind.DEFINITION, content="...")
+    store.add_version("ex_1", ArtifactKind.CLAIM, content="...")
+    def_ref = store.latest("def_1").ref
+    ex_ref = store.latest("ex_1").ref
+
+    store.add_inferred_edge(def_ref, ex_ref, reason="ex_1 cites def:def_1")
+    [edge] = [e for e in store.edges if e.relation == DependencyRelationKind.INFERRED]
+    assert edge.reason == "ex_1 cites def:def_1"

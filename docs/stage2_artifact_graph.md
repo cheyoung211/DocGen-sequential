@@ -102,6 +102,67 @@
 `{def_1, thm_1, ex_1}`만 반환하고, `thm_1`/`ex_1`만 STALE이 되며, `tbl_1`은 stale 집합에도
 invalidation 이력에도 전혀 등장하지 않고 내용도 그대로임을 확인한다.
 
+### 1.5 사용자 재검토 후 수정 (2026.10.19, 2차 리뷰)
+
+첫 구현을 보여준 뒤 재현 중심 리뷰에서 4가지 핵심 결함 + 경미한 결함 1건을 추가로 발견해 전부
+수정했다 (`src/core/artifact_graph.py`/`src/core/run_log.py`/`src/core/schemas.py`
+재작성, `test/core/test_artifact_graph.py`에 14개 회귀 테스트 추가 — 44개→58개).
+
+1. **입출력 경계 복사 미흡**: `latest()`/`edges`만 딥카피를 반환했고, 다른 경로는 store 내부 객체를
+   그대로 노출했다 — `add_version()` 반환값의 `ref`를 수정하면 저장된 버전이 바뀌고, `save_checkpoint()`
+   반환 객체를 수정하면 같은 checkpoint ID로 복원되는 내용이 바뀌고, `record_cost()`에 넘긴
+   `CostRecord`를 호출 후 수정하면 누적 비용이 바뀌고, `live_evidence()` 반환값을 수정하면 저장된
+   evidence 자체가 바뀌었다(FAIL→PASS). **수정**: "저장 시 입력 객체를 복사하고, 반환 시 내부 객체를
+   복사한다"는 원칙을 모든 경계에 일관 적용했다 — `add_version`은 `read_input_versions`를 함수
+   진입 시점에 즉시 딥카피하고, `new_ref`를 `StoredArtifact.ref`/각 `DependencyEdge`/반환
+   `AddVersionResult.ref`에 쓸 때마다 매번 별도로 딥카피한다. `RunLog`는 `_actions`/`_evidence`/
+   `_costs`를 비공개로 바꾸고 `log_*()`는 기록 전에, `actions`/`evidence`/`costs` 프로퍼티는 읽을
+   때마다 딥카피한다. `save_checkpoint()`는 내부 캐시용 사본과 호출자에게 반환하는 사본을 서로
+   **별도로** 딥카피해, 어느 한쪽을 수정해도 다른 쪽이나 이후 `restore_checkpoint()` 결과에 영향이
+   없게 했다. `invalidation_history`도 비공개 필드(`_invalidation_history`) + 딥카피 반환 프로퍼티로
+   바꿨다.
+2. **stale 입력에서 만든 artifact가 fresh로 처리 + status의 두 진실 소스 불일치**: `add_version()`이
+   입력의 "현재 최신 버전과 일치하는가"만 검사하고 "입력 artifact 자체가 `is_stale()`인가"는 검사하지
+   않아, A 변경으로 stale이 된 B(버전 번호는 그대로)를 읽어 C를 만들면 C가 fresh로 저장되고 C의
+   evidence도 유효하게 반환됐다. 또한 오래된 A로 B를 다시 "생성"해도(`add_version`이 항상 FRESH를
+   지정하므로) B의 stale이 풀렸다. 별도로, `StoredArtifact.status`는 생성 시점에 고정되고
+   `_stale_ids`는 그 뒤에도 계속 갱신되어 `is_stale("B")==True`인데 `latest("B").status==FRESH`인
+   불일치도 재현됐다. **수정**: 입력이 (a) 현재 최신 버전이 아니거나(`used_outdated_inputs`) (b)
+   `is_stale()`이면(`used_stale_inputs`) 새로 만드는 버전 자신도 `born_stale=True`로 **STALE로
+   저장**한다(거부하지 않음 — 의도적으로 오래되거나 stale한 입력을 쓰는 것은 여전히 허용되는
+   시나리오지만, 결과를 조용히 건강한 것처럼 취급하지는 않는다). Status의 진실 소스를 `_stale_ids`
+   하나로 통일해, `latest()`/`get_version()`/`save_checkpoint()`가 매번 `_stale_ids`에서 `.status`를
+   실시간으로 다시 계산해 덮어쓴다 — 저장된 `.status` 필드 값을 그대로 믿지 않는다. 다만 현재 최신이
+   아닌(superseded) 과거 버전은 staleness 개념이 적용되지 않으므로 항상 FRESH로 표시한다.
+3. **실재하지 않는 입력 버전·kind 불일치를 허용**: `add_version()`/`add_inferred_edge()` 모두
+   artifact_id의 "존재 여부"만 확인하고, 정확한 `(artifact_id, version)`이 실제로 저장됐는지와
+   선언된 kind가 실제 저장된 kind와 일치하는지는 검사하지 않아, 존재하지 않는 버전 번호(예:
+   `A@999`)나 다른 kind를 주장하는 참조도 그대로 저장됐다. **수정**: `_validate_artifact_ref()`를
+   새로 만들어 두 메서드 모두 상태를 바꾸기 *전에* 먼저 검증한다 — 버전이 실재하지 않으면
+   `UnknownArtifactError`, kind가 다르면 `ValueError`. 실재하는 과거 버전을 입력으로 쓰는 것은
+   여전히 허용한다(이 검사는 "실재 여부"만 본다; "최신인가"는 2번 항목에서 별도로 다룬다).
+4. **과거 의존관계가 현재 버전까지 계속 영향**: `_dependents`가 artifact_id 기준으로 모든 historical
+   edge를 누적만 하고 제거하지 않아, B@1이 A를 읽은 뒤 B@2를 A와 무관한 내용으로 다시 만들어도
+   "A→B" 관계가 영구히 남아 이후 A가 바뀌면 이미 무관해진 현재 B@2까지 STALE로 만들었다. **수정**:
+   누적형 `_dependents` 필드를 완전히 없애고, `impact_candidates()`를 호출할 때마다 `_edges`와
+   `_versions`에서 "edge의 `to_artifact.version`이 그 artifact의 **현재 최신 버전**과 일치하는 edge만"
+   걸러 인접 리스트를 다시 계산하는 `_current_dependents()`로 바꿨다. 과거 edge 자체는 `_edges`에
+   감사 기록으로 그대로 남지만, 더 이상 영향 계산에 기여하지 않는다. 증분 인덱스가 사라지므로
+   `from_checkpoint()`도 별도 인덱스 재구성 코드가 필요 없어졌다(기존에는 이 재구성 코드 자체가 같은
+   버그를 반복할 위험이 있었다).
+5. **(경미) `add_inferred_edge(..., reason)`의 `reason`이 저장되지 않음**: `DependencyEdge`에
+   `reason: Optional[str]` 필드를 추가하고(EXPLICIT edge는 항상 `None` — "producer가 입력으로
+   선언했다"는 사실 자체가 이미 `relation`에 드러나므로 별도 문구를 지어내지 않는다), INFERRED edge
+   생성 시 실제로 저장하도록 고쳤다.
+
+모든 수정은 재현 가능한 회귀 테스트로 남겼다(`test_mutating_*`, `test_creating_an_artifact_from_a_stale_input_is_itself_born_stale`,
+`test_regenerating_with_an_outdated_input_does_not_clear_staleness`,
+`test_is_stale_and_latest_status_never_disagree`, `test_add_version_rejects_a_nonexistent_input_version`,
+`test_add_version_rejects_a_mismatched_kind_in_a_declared_input`,
+`test_add_inferred_edge_rejects_a_nonexistent_version_or_mismatched_kind`,
+`test_regenerating_without_an_input_drops_it_from_current_impact`,
+`test_add_inferred_edge_persists_its_reason`). 기존 1.1–1.4의 테스트는 수정 없이 그대로 통과한다.
+
 ---
 
 ## 2. 완료 기준 대응

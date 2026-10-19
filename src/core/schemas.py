@@ -102,11 +102,19 @@ class DependencyEdge(BaseModel):
     mirrors, but does not replace, ``DocumentNode.dependencies: List[str]``
     (``src/common/state.py:258``), which today is an unused, same-type,
     direction-less id list.
+
+    ``reason`` is only ever populated for INFERRED edges -- the free-form
+    justification passed to ``ArtifactGraphStore.add_inferred_edge``. Left
+    ``None`` for EXPLICIT edges: their "reason" is simply that the producer
+    declared this artifact as a read input, which ``relation`` alone
+    already says, so inventing a canned string there would tell an auditor
+    nothing new.
     """
 
     from_artifact: ArtifactRef
     to_artifact: ArtifactRef
     relation: DependencyRelationKind
+    reason: Optional[str] = None
 
 
 class CheckOutcome(str, Enum):
@@ -417,20 +425,28 @@ class ActionLogEntry(BaseModel):
 class AddVersionResult(BaseModel):
     """What happened as a side effect of one
     ``ArtifactGraphStore.add_version`` call: the new pointer, which
-    existing artifacts this change just invalidated, and which of this
-    version's own declared inputs were already superseded by a newer
-    version at the moment it was recorded.
+    existing artifacts this change just invalidated, and whether this
+    version's own declared inputs were trustworthy at the moment it was
+    recorded.
 
-    ``used_outdated_inputs`` is deliberately informational, not a rejected
-    call: a producer pinning an older input version on purpose is a real,
-    permitted scenario (e.g. a controlled checkpoint-branch comparison) --
-    but it must be visible on the result, never silently indistinguishable
-    from reading the true current state.
+    ``used_outdated_inputs``/``used_stale_inputs`` are deliberately
+    informational, not a rejected call: a producer pinning an older or
+    already-stale input version on purpose is a real, permitted scenario
+    (e.g. a controlled checkpoint-branch comparison) -- but it must be
+    visible on the result, never silently indistinguishable from reading
+    the true, trustworthy current state. ``born_stale`` is simply
+    ``bool(used_outdated_inputs) or bool(used_stale_inputs)``, spelled out
+    explicitly rather than left for a caller to re-derive: this is also
+    exactly whether ``ref``'s own artifact was stored with
+    ``ArtifactStatus.STALE`` instead of ``FRESH`` -- an artifact built from
+    unreliable ground is never itself trustworthy just because it is new.
     """
 
     ref: ArtifactRef
+    born_stale: bool = False
     newly_stale_artifact_ids: List[str] = Field(default_factory=list)
     used_outdated_inputs: List[ArtifactRef] = Field(default_factory=list)
+    used_stale_inputs: List[ArtifactRef] = Field(default_factory=list)
 
 
 class Checkpoint(BaseModel):

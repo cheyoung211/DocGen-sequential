@@ -19,10 +19,17 @@ may be called from inside a ``RepairPolicy.decide()`` (see that Protocol's
 docstring in ``interfaces.py``): ``log_action`` records that an action
 actually *started* executing, which only an executor, never a policy, can
 know.
+
+Every list here is private, and every boundary -- ingestion (``log_*``)
+and read (the ``actions``/``evidence``/``costs`` properties) -- deep-copies.
+A caller handing in a ``CostRecord`` and then mutating their own local
+object afterward, or mutating a list this class handed back, must never be
+able to retroactively rewrite history that has already been logged.
 """
 
 from __future__ import annotations
 
+import copy
 from typing import List, Optional
 
 from src.core.schemas import ActionLogEntry, CostRecord, Evidence, RepairAction
@@ -40,9 +47,25 @@ class RunLog:
     """
 
     def __init__(self) -> None:
-        self.actions: List[ActionLogEntry] = []
-        self.evidence: List[Evidence] = []
-        self.costs: List[CostRecord] = []
+        self._actions: List[ActionLogEntry] = []
+        self._evidence: List[Evidence] = []
+        self._costs: List[CostRecord] = []
+
+    @property
+    def actions(self) -> List[ActionLogEntry]:
+        """A deep copy -- mutating the returned list or any entry in it
+        has no effect on this log."""
+        return copy.deepcopy(self._actions)
+
+    @property
+    def evidence(self) -> List[Evidence]:
+        """A deep copy -- same non-mutating guarantee as ``actions``."""
+        return copy.deepcopy(self._evidence)
+
+    @property
+    def costs(self) -> List[CostRecord]:
+        """A deep copy -- same non-mutating guarantee as ``actions``."""
+        return copy.deepcopy(self._costs)
 
     def log_action(
         self,
@@ -50,19 +73,24 @@ class RunLog:
         branch_id: str,
         triggering_evidence: Optional[List[Evidence]] = None,
     ) -> ActionLogEntry:
+        """Deep-copies ``action``/``triggering_evidence`` before storing --
+        the caller's own objects are never retained by reference -- and
+        returns a further independent deep copy, so mutating the returned
+        ``ActionLogEntry`` afterward cannot corrupt what was just logged
+        either."""
         entry = ActionLogEntry(
-            action=action,
+            action=action.model_copy(deep=True),
             branch_id=branch_id,
-            triggering_evidence=list(triggering_evidence or []),
+            triggering_evidence=[e.model_copy(deep=True) for e in (triggering_evidence or [])],
         )
-        self.actions.append(entry)
-        return entry
+        self._actions.append(entry)
+        return entry.model_copy(deep=True)
 
     def log_evidence(self, evidence: Evidence) -> None:
-        self.evidence.append(evidence)
+        self._evidence.append(evidence.model_copy(deep=True))
 
     def log_cost(self, cost: CostRecord) -> None:
-        self.costs.append(cost)
+        self._costs.append(cost.model_copy(deep=True))
 
     @property
     def total_cost_tokens(self) -> int:
@@ -70,7 +98,23 @@ class RunLog:
         failed attempts -- ``CostRecord.succeeded=False`` records are not
         excluded (revision direction 2: "비용에는 ... 실패한 시도 ...를
         포함한다")."""
-        return sum(cost.total_tokens for cost in self.costs)
+        return sum(cost.total_tokens for cost in self._costs)
+
+    def replace_all(
+        self,
+        actions: List[ActionLogEntry],
+        evidence: List[Evidence],
+        costs: List[CostRecord],
+    ) -> None:
+        """Wholesale-replace this log's contents. Used only by
+        ``ArtifactGraphStore.from_checkpoint`` to load a checkpoint's
+        already-independent history into a freshly constructed
+        ``RunLog`` -- deep-copies anyway, so the caller's own
+        ``checkpoint.actions``/``.evidence``/``.costs`` lists are never
+        retained by reference either."""
+        self._actions = copy.deepcopy(actions)
+        self._evidence = copy.deepcopy(evidence)
+        self._costs = copy.deepcopy(costs)
 
 
 __all__ = ["RunLog"]

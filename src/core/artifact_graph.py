@@ -18,6 +18,26 @@ plan says so directly ("문서 내 상호 참조에는 순환이 있을 수 있�
 e.g. section A's content cites section B's label and vice versa). Every
 reachability computation below is a visited-set BFS for exactly this
 reason, never a toposort.
+
+Two invariants hold everywhere in this file, enforced after a user-caught
+review found them both broken (see ``test/core/test_artifact_graph.py``'s
+regression tests, named after the exact repro each one came from):
+
+1. **Every object that crosses the store's boundary, in either direction,
+   is an independent deep copy.** A parameter handed in (an ``ArtifactRef``
+   declared as a read input, an ``Evidence``/``CostRecord`` being logged,
+   an edge endpoint) is copied before anything internal ever holds a
+   reference to it; anything handed back out (``latest()``, ``edges``,
+   ``live_evidence()``, ``save_checkpoint()``, ...) is copied before the
+   caller ever sees it. Mutating a parameter after the call, or mutating a
+   return value, must never retroactively change stored history.
+2. **Staleness has exactly one source of truth: ``_stale_ids``.**
+   ``StoredArtifact.status`` is never trusted as a static field once
+   written -- every public accessor that returns a ``StoredArtifact``
+   overlays the *current* verdict from ``_stale_ids`` onto a copy of it at
+   read time, so ``is_stale(x)`` and ``latest(x).status`` can never
+   disagree, no matter how long ago ``x`` was actually produced relative
+   to whenever something upstream of it last changed.
 """
 
 from __future__ import annotations
@@ -45,15 +65,21 @@ from src.core.schemas import (
 
 
 class UnknownArtifactError(ValueError):
-    """Raised when a caller references an ``artifact_id`` the store has
-    never recorded a version for -- e.g. claiming to have read it as an
-    input, or declaring an inferred edge to/from it.
+    """Raised when a caller references an ``(artifact_id, version)`` the
+    store never actually recorded -- e.g. claiming to have read it as an
+    input, or declaring an inferred edge to/from it. Covers both "this
+    ``artifact_id`` was never stored at all" and "this ``artifact_id``
+    exists, but never at this specific ``version``" -- a version number
+    that was never real cannot be told apart from a real one by
+    ``add_version``'s *outdated*-input bookkeeping
+    (``AddVersionResult.used_outdated_inputs``), which assumes every input
+    it is handed at least once existed; both are hard errors here instead.
 
     Reading or depending on something that was never produced is a caller
-    bug, not a reachable research scenario, so this is a hard error rather
-    than a silently accepted edge case -- unlike an *outdated but real*
-    input version, which ``add_version`` accepts and only surfaces on its
-    result (see ``AddVersionResult.used_outdated_inputs``).
+    bug, not a reachable research scenario -- unlike an *outdated but
+    real* input version (a real, past version that has since been
+    superseded), which ``add_version`` accepts and only surfaces on its
+    result.
     """
 
 
@@ -74,30 +100,47 @@ class ArtifactGraphStore:
         self.branch_id = branch_id
         self._versions: Dict[str, List[StoredArtifact]] = {}
         self._edges: List[DependencyEdge] = []
-        self._dependents: Dict[str, Set[str]] = {}
         self._stale_ids: Set[str] = set()
-        self.invalidation_history: List[InvalidationRecord] = []
+        self._invalidation_history: List[InvalidationRecord] = []
         self.log = RunLog()
         self._checkpoints: Dict[str, Checkpoint] = {}
 
     # -- read access ----------------------------------------------------
 
+    def _with_live_status(self, stored: StoredArtifact, artifact_id: str) -> StoredArtifact:
+        """A deep copy of ``stored`` with ``.status`` overlaid from the
+        *current* ``_stale_ids`` membership -- see this module's docstring,
+        invariant 2. Only meaningful for an artifact's current latest
+        version; a superseded historical version is handled by its own
+        caller (see ``get_version``), never through this helper."""
+        copy_ = stored.model_copy(deep=True)
+        copy_.status = ArtifactStatus.STALE if artifact_id in self._stale_ids else ArtifactStatus.FRESH
+        return copy_
+
     def latest(self, artifact_id: str) -> Optional[StoredArtifact]:
-        """A **deep copy** of the current latest version, or ``None`` if
-        ``artifact_id`` has never been stored. A versioned artifact's past
-        (and current) state must be immutable history -- the only way to
-        change it is ``add_version`` minting a new version -- so this
-        deliberately never hands out the live internal object; mutating
-        the returned ``StoredArtifact`` has no effect on the store."""
+        """A **deep copy** of the current latest version, with ``.status``
+        always reflecting the *current* ``_stale_ids`` verdict (never a
+        value frozen at creation time), or ``None`` if ``artifact_id`` has
+        never been stored."""
         versions = self._versions.get(artifact_id)
-        return versions[-1].model_copy(deep=True) if versions else None
+        return self._with_live_status(versions[-1], artifact_id) if versions else None
 
     def get_version(self, artifact_id: str, version: int) -> Optional[StoredArtifact]:
-        """A **deep copy** of one historical version -- same non-mutating
-        guarantee as ``latest()``."""
-        for stored in self._versions.get(artifact_id, []):
-            if stored.ref.version == version:
-                return stored.model_copy(deep=True)
+        """A **deep copy** of one historical version. If ``version`` is
+        the artifact's current latest, ``.status`` is live-overlaid exactly
+        like ``latest()``; otherwise ``version`` is superseded history, and
+        staleness -- a property of "the current state" -- does not apply
+        to it, so ``.status`` always reads ``FRESH`` (never ``STALE``) for
+        a non-latest version regardless of ``_stale_ids``."""
+        versions = self._versions.get(artifact_id, [])
+        for stored in versions:
+            if stored.ref.version != version:
+                continue
+            if stored.ref.version == versions[-1].ref.version:
+                return self._with_live_status(stored, artifact_id)
+            copy_ = stored.model_copy(deep=True)
+            copy_.status = ArtifactStatus.FRESH
+            return copy_
         return None
 
     def is_stale(self, artifact_id: str) -> bool:
@@ -109,9 +152,47 @@ class ArtifactGraphStore:
 
     @property
     def edges(self) -> List[DependencyEdge]:
-        """A deep copy of every recorded edge -- mutating an entry in the
-        returned list, or the list itself, has no effect on the store."""
+        """A deep copy of every recorded edge, across all of history --
+        mutating an entry in the returned list, or the list itself, has no
+        effect on the store. Includes edges that no longer describe a
+        *current* relation (see ``_current_dependents``) -- this is the
+        full audit trail, not the live adjacency."""
         return copy.deepcopy(self._edges)
+
+    @property
+    def invalidation_history(self) -> List[InvalidationRecord]:
+        """A deep copy of the full invalidation audit trail."""
+        return copy.deepcopy(self._invalidation_history)
+
+    def _validate_artifact_ref(self, ref: ArtifactRef) -> None:
+        """Every ``ArtifactRef`` a caller hands in as a declared input (to
+        ``add_version``) or edge endpoint (to ``add_inferred_edge``) must
+        point at a version that was genuinely stored, with the kind it
+        actually claims. A version number that was never stored, or a kind
+        that doesn't match what that artifact was actually stored as, is a
+        caller bug -- the resulting edge/version would reference content
+        that ``from_checkpoint`` could never actually locate -- so both
+        are hard errors, raised here before any state is mutated.
+
+        Deliberately permits a real, past (non-latest) version: being
+        outdated relative to the current latest is a *separate*, non-fatal
+        concern surfaced via ``AddVersionResult.used_outdated_inputs``, not
+        rejected here.
+        """
+        versions = self._versions.get(ref.artifact_id)
+        if not versions:
+            raise UnknownArtifactError(f"'{ref.artifact_id}' has never been stored.")
+        exact = next((v for v in versions if v.ref.version == ref.version), None)
+        if exact is None:
+            raise UnknownArtifactError(
+                f"'{ref.artifact_id}'@v{ref.version} was never stored "
+                f"(stored versions: {[v.ref.version for v in versions]})."
+            )
+        if exact.ref.kind != ref.kind:
+            raise ValueError(
+                f"'{ref.artifact_id}' is stored as kind {exact.ref.kind!r}; "
+                f"the given ref claims kind {ref.kind!r}."
+            )
 
     # -- writing new versions --------------------------------------------
 
@@ -128,20 +209,40 @@ class ArtifactGraphStore:
         edges from each declared input, and propagate staleness forward to
         every artifact currently reachable from ``artifact_id`` (revision
         direction 1's conservative candidate set ``I(R) = R ∪ Desc_G(R)``,
-        minus ``R`` itself -- ``R`` is this artifact, which was just
-        freshly produced, so it is never marked stale by its own write).
+        minus ``R`` itself).
 
-        An input in ``read_input_versions`` whose ``version`` is not that
-        artifact's current latest -- something newer exists that this
-        production did not actually read -- is **not** rejected: a
-        producer legitimately pinning an older version (e.g. a controlled
-        checkpoint-branch comparison) is a real scenario this stage does
-        not forbid. It is surfaced on the returned
-        ``AddVersionResult.used_outdated_inputs`` instead, so that case is
-        never silently indistinguishable from reading the true current
-        state.
+        Each entry in ``read_input_versions`` must name a real, previously
+        stored ``(artifact_id, version)`` of the right ``kind`` --
+        validated by ``_validate_artifact_ref`` *before* any state is
+        touched, so a bad input never leaves the store half-mutated.
+        Beyond that hard check, two independent, non-fatal conditions are
+        detected and surfaced rather than rejected:
+
+        - **outdated**: the input's version is not that artifact's current
+          latest (something newer exists that this production did not
+          read) -> ``AddVersionResult.used_outdated_inputs``.
+        - **stale**: the input artifact is *currently* ``is_stale()`` --
+          even if the exact version read happens to still be its latest,
+          because nothing has regenerated it yet since *its own* upstream
+          changed -> ``AddVersionResult.used_stale_inputs``.
+
+        If either condition holds for any input, the artifact being
+        produced right now is **born stale, not fresh**
+        (``AddVersionResult.born_stale``): it was built from ground this
+        store already knows is unreliable, so simply being newly-written
+        does not make it trustworthy. This is what makes
+        ``is_stale()``/``.status`` correct for both of the bugs a caught
+        review found: (a) building C from an already-stale B used to make
+        C look fresh and its Evidence live, even though B's own upstream
+        had already changed; (b) "regenerating" B again from the same old,
+        outdated A used to clear B's staleness simply by virtue of writing
+        a new version, even though nothing was actually fixed. Neither
+        case is rejected -- a producer deliberately pinning a stale/old
+        input remains a permitted scenario -- but neither is silently
+        treated as healthy, either.
         """
-        read_input_versions = read_input_versions or []
+        read_input_versions = [ref.model_copy(deep=True) for ref in (read_input_versions or [])]
+
         existing_versions = self._versions.get(artifact_id, [])
         if existing_versions and existing_versions[-1].ref.kind != kind:
             raise ValueError(
@@ -152,15 +253,16 @@ class ArtifactGraphStore:
         next_version = (existing_versions[-1].ref.version + 1) if existing_versions else 1
 
         used_outdated_inputs: List[ArtifactRef] = []
+        used_stale_inputs: List[ArtifactRef] = []
         for input_ref in read_input_versions:
-            current_input = self.latest(input_ref.artifact_id)
-            if current_input is None:
-                raise UnknownArtifactError(
-                    f"'{artifact_id}' declares reading '{input_ref.artifact_id}' "
-                    f"@v{input_ref.version}, but no version of it has ever been stored."
-                )
+            self._validate_artifact_ref(input_ref)
+            current_input = self._versions[input_ref.artifact_id][-1]
             if input_ref.version != current_input.ref.version:
                 used_outdated_inputs.append(input_ref)
+            if input_ref.artifact_id in self._stale_ids:
+                used_stale_inputs.append(input_ref)
+
+        born_stale = bool(used_outdated_inputs) or bool(used_stale_inputs)
 
         new_ref = ArtifactRef(
             artifact_id=artifact_id,
@@ -169,29 +271,45 @@ class ArtifactGraphStore:
             read_input_versions=list(read_input_versions),
         )
         stored = StoredArtifact(
-            ref=new_ref,
+            ref=new_ref.model_copy(deep=True),
             content=content,
             produced_by=produced_by,
-            status=ArtifactStatus.FRESH,
+            status=ArtifactStatus.STALE if born_stale else ArtifactStatus.FRESH,
             branch_id=self.branch_id,
         )
         self._versions.setdefault(artifact_id, []).append(stored)
-        self._stale_ids.discard(artifact_id)
+
+        if born_stale:
+            self._stale_ids.add(artifact_id)
+            unreliable_ids = sorted({r.artifact_id for r in used_outdated_inputs + used_stale_inputs})
+            self._invalidation_history.append(
+                InvalidationRecord(
+                    changed_artifact=new_ref.model_copy(deep=True),
+                    affected_artifact_id=artifact_id,
+                    reason=(
+                        f"produced from an outdated and/or already-stale input "
+                        f"({', '.join(unreliable_ids)})"
+                    ),
+                )
+            )
+        else:
+            self._stale_ids.discard(artifact_id)
 
         for input_ref in read_input_versions:
             edge = DependencyEdge(
-                from_artifact=input_ref,
-                to_artifact=new_ref,
+                from_artifact=input_ref.model_copy(deep=True),
+                to_artifact=new_ref.model_copy(deep=True),
                 relation=DependencyRelationKind.EXPLICIT,
             )
             self._edges.append(edge)
-            self._dependents.setdefault(input_ref.artifact_id, set()).add(artifact_id)
 
         newly_stale = sorted(self._propagate_staleness(new_ref, artifact_id))
         return AddVersionResult(
-            ref=new_ref,
+            ref=new_ref.model_copy(deep=True),
+            born_stale=born_stale,
             newly_stale_artifact_ids=newly_stale,
-            used_outdated_inputs=used_outdated_inputs,
+            used_outdated_inputs=[r.model_copy(deep=True) for r in used_outdated_inputs],
+            used_stale_inputs=[r.model_copy(deep=True) for r in used_stale_inputs],
         )
 
     def add_inferred_edge(
@@ -202,36 +320,67 @@ class ArtifactGraphStore:
         scanner finding that one artifact's content cites another's label.
         This is revision direction 1's INFERRED relation kind.
 
-        Both artifacts must already exist (same invariant ``add_version``
-        enforces for ``read_input_versions``). Unlike ``add_version``, this
-        does **not** retroactively mark ``to_artifact`` stale: recording a
-        previously-unknown structural fact is a different event from
-        ``from_artifact``'s content actually changing, and conflating the
-        two would mark things stale every time new inference knowledge is
-        added, not only when content changes.
+        Both endpoints are validated exactly like ``add_version``'s
+        declared inputs (``_validate_artifact_ref``: must be a real,
+        previously stored ``(artifact_id, version)`` of the claimed
+        ``kind``). ``reason`` is stored on the edge itself
+        (``DependencyEdge.reason``) so it survives a checkpoint
+        save/restore and remains auditable later -- an earlier version of
+        this method accepted ``reason`` but discarded it.
+
+        Unlike ``add_version``, this does **not** retroactively mark
+        ``to_artifact`` stale: recording a previously-unknown structural
+        fact is a different event from ``from_artifact``'s content actually
+        changing, and conflating the two would mark things stale every time
+        new inference knowledge is added, not only when content changes.
         """
-        if self.latest(from_artifact.artifact_id) is None:
-            raise UnknownArtifactError(f"'{from_artifact.artifact_id}' has never been stored.")
-        if self.latest(to_artifact.artifact_id) is None:
-            raise UnknownArtifactError(f"'{to_artifact.artifact_id}' has never been stored.")
+        self._validate_artifact_ref(from_artifact)
+        self._validate_artifact_ref(to_artifact)
 
         edge = DependencyEdge(
-            from_artifact=from_artifact,
-            to_artifact=to_artifact,
+            from_artifact=from_artifact.model_copy(deep=True),
+            to_artifact=to_artifact.model_copy(deep=True),
             relation=DependencyRelationKind.INFERRED,
+            reason=reason,
         )
         self._edges.append(edge)
-        self._dependents.setdefault(from_artifact.artifact_id, set()).add(
-            to_artifact.artifact_id
-        )
-        return edge
+        return edge.model_copy(deep=True)
 
     # -- change impact / staleness ---------------------------------------
 
+    def _current_dependents(self) -> Dict[str, Set[str]]:
+        """Adjacency used for impact computation: ``from_artifact_id ->
+        {artifact ids that CURRENTLY declare depending on it}``.
+
+        Rebuilt from ``_edges``/``_versions`` on every call rather than
+        incrementally maintained -- a caught review bug: an edge whose
+        ``to_artifact`` is not that artifact's *current* latest version
+        describes a relation that has since been **superseded** (the
+        artifact was regenerated again, possibly with a different input or
+        none at all) and must not keep contributing to the live impact
+        graph, even though the edge itself stays in ``_edges`` forever as
+        an audit trail. Recomputing from scratch -- rather than trying to
+        incrementally retract a superseded edge's earlier contribution --
+        is what this stage's scale actually needs and is far easier to
+        prove correct than the incremental index it replaced, which is
+        exactly what went wrong before.
+        """
+        dependents: Dict[str, Set[str]] = {}
+        for edge in self._edges:
+            to_id = edge.to_artifact.artifact_id
+            versions = self._versions.get(to_id)
+            if not versions:
+                continue
+            if edge.to_artifact.version == versions[-1].ref.version:
+                dependents.setdefault(edge.from_artifact.artifact_id, set()).add(to_id)
+        return dependents
+
     def impact_candidates(self, artifact_id: str) -> Set[str]:
         """``I(R) = R ∪ Desc_G(R)`` (revision direction 1): every artifact
-        transitively reachable from ``artifact_id`` by following recorded
-        EXPLICIT or INFERRED edges forward, plus ``artifact_id`` itself.
+        transitively reachable from ``artifact_id`` by following CURRENTLY
+        applicable EXPLICIT or INFERRED edges forward, plus ``artifact_id``
+        itself -- see ``_current_dependents`` for what "currently
+        applicable" excludes.
 
         Pure query: calling this any number of times changes nothing on
         ``self`` (unlike ``add_version``, which is where staleness is
@@ -241,11 +390,12 @@ class ArtifactGraphStore:
         by construction (visited set): the underlying graph is not assumed
         acyclic.
         """
+        dependents = self._current_dependents()
         visited: Set[str] = {artifact_id}
         frontier = [artifact_id]
         while frontier:
             current = frontier.pop()
-            for dependent in self._dependents.get(current, ()):
+            for dependent in dependents.get(current, ()):
                 if dependent not in visited:
                     visited.add(dependent)
                     frontier.append(dependent)
@@ -257,9 +407,9 @@ class ArtifactGraphStore:
         descendants = self.impact_candidates(changed_artifact_id) - {changed_artifact_id}
         for affected_id in descendants:
             self._stale_ids.add(affected_id)
-            self.invalidation_history.append(
+            self._invalidation_history.append(
                 InvalidationRecord(
-                    changed_artifact=changed_ref,
+                    changed_artifact=changed_ref.model_copy(deep=True),
                     affected_artifact_id=affected_id,
                     reason=(
                         f"upstream artifact '{changed_artifact_id}' changed to "
@@ -278,7 +428,9 @@ class ArtifactGraphStore:
         """Evidence that still speaks to the artifact's *current* state:
         checked against the artifact's current latest version, AND
         recorded while that artifact was not (and has not since become)
-        stale.
+        stale -- including an artifact that was born stale (see
+        ``add_version``) and so was never trustworthy at any point in its
+        current version's lifetime.
 
         The staleness check is not redundant with the version check: a
         shared-definition change marks its dependents stale *without*
@@ -286,7 +438,8 @@ class ArtifactGraphStore:
         -- only the ground it rests on has), so Evidence checked against
         their unchanged version would still version-match even though it no
         longer reflects a trustworthy state. Both conditions are required
-        for Evidence to count as live.
+        for Evidence to count as live. Returns deep copies -- mutating an
+        entry in the returned list has no effect on this store's log.
         """
         current = self.latest(artifact_id)
         if current is None or self.is_stale(artifact_id):
@@ -316,24 +469,44 @@ class ArtifactGraphStore:
     def save_checkpoint(self, label: Optional[str] = None) -> Checkpoint:
         """Snapshot every artifact version, edge, stale id, and the full
         invalidation/action/evidence/cost history into a self-contained
-        ``Checkpoint`` -- no live references back into ``self``. Verified
-        by ``from_checkpoint`` reconstructing a fully independent store
-        from it (see ``test/core/test_artifact_graph.py``'s
-        checkpoint-independence tests)."""
+        ``Checkpoint``.
+
+        Each artifact's latest stored version has its ``.status`` corrected
+        to match ``_stale_ids`` at save time (the same live-overlay
+        ``latest()``/``get_version()`` apply on every read -- see this
+        module's docstring, invariant 2), so the raw ``Checkpoint.artifacts``
+        data is itself already correct, not dependent on going through an
+        accessor later to look right.
+
+        The ``Checkpoint`` cached internally (for ``restore_checkpoint``)
+        and the one returned to the caller are two *separately* deep-copied
+        objects, neither aliased to the other: an earlier version returned
+        the exact object it had just cached, so mutating the caller's copy
+        silently corrupted what a later ``restore_checkpoint`` of the same
+        id would produce.
+        """
+        materialized_artifacts: Dict[str, List[StoredArtifact]] = {}
+        for artifact_id, versions in self._versions.items():
+            copied_versions = copy.deepcopy(versions)
+            copied_versions[-1].status = (
+                ArtifactStatus.STALE if artifact_id in self._stale_ids else ArtifactStatus.FRESH
+            )
+            materialized_artifacts[artifact_id] = copied_versions
+
         checkpoint = Checkpoint(
             checkpoint_id=str(uuid.uuid4()),
             label=label,
             source_branch_id=self.branch_id,
-            artifacts=copy.deepcopy(self._versions),
+            artifacts=materialized_artifacts,
             edges=copy.deepcopy(self._edges),
             stale_artifact_ids=sorted(self._stale_ids),
-            invalidation_history=copy.deepcopy(self.invalidation_history),
-            actions=copy.deepcopy(self.log.actions),
-            evidence=copy.deepcopy(self.log.evidence),
-            costs=copy.deepcopy(self.log.costs),
+            invalidation_history=copy.deepcopy(self._invalidation_history),
+            actions=self.log.actions,
+            evidence=self.log.evidence,
+            costs=self.log.costs,
         )
-        self._checkpoints[checkpoint.checkpoint_id] = checkpoint
-        return checkpoint
+        self._checkpoints[checkpoint.checkpoint_id] = checkpoint.model_copy(deep=True)
+        return checkpoint.model_copy(deep=True)
 
     def restore_checkpoint(self, checkpoint_id: str, branch_id: str) -> "ArtifactGraphStore":
         """Reconstruct a new, independent store from a checkpoint this
@@ -359,23 +532,18 @@ class ArtifactGraphStore:
         and handed to a different process entirely; see
         ``test/core/test_artifact_graph.py::test_from_checkpoint_rebuilds_from_serialized_json_alone``).
 
-        The dependents index is rebuilt from ``checkpoint.edges`` rather
-        than trusted as pre-computed state, so a hand-built or
-        round-tripped ``Checkpoint`` reconstructs correctly even without
-        the live index that originally produced it.
+        No separate adjacency index needs rebuilding: ``impact_candidates``
+        recomputes ``_current_dependents`` fresh from ``_edges``/
+        ``_versions`` on every call, so restoring just those two fields is
+        sufficient and cannot go stale the way an incrementally-maintained
+        index could.
         """
         store = cls(branch_id=branch_id)
         store._versions = copy.deepcopy(checkpoint.artifacts)
         store._edges = copy.deepcopy(checkpoint.edges)
         store._stale_ids = set(checkpoint.stale_artifact_ids)
-        store.invalidation_history = copy.deepcopy(checkpoint.invalidation_history)
-        store.log.actions = copy.deepcopy(checkpoint.actions)
-        store.log.evidence = copy.deepcopy(checkpoint.evidence)
-        store.log.costs = copy.deepcopy(checkpoint.costs)
-        for edge in store._edges:
-            store._dependents.setdefault(edge.from_artifact.artifact_id, set()).add(
-                edge.to_artifact.artifact_id
-            )
+        store._invalidation_history = copy.deepcopy(checkpoint.invalidation_history)
+        store.log.replace_all(checkpoint.actions, checkpoint.evidence, checkpoint.costs)
         return store
 
 
