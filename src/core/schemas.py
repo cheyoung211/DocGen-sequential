@@ -11,6 +11,7 @@ links to it by name instead of redefining it.
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -328,3 +329,133 @@ class FinalEvaluationResult(BaseModel):
     quality: QualityScore
     content_preservation: Optional[ContentPreservationScore] = None
     verifier_precision_recall: Optional[VerifierPrecisionRecall] = None
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 ("Versioned artifact graph와 로그·checkpoint") schemas. The store
+# and graph logic that actually uses these lives in
+# ``src/core/artifact_graph.py``/``src/core/run_log.py`` -- these classes
+# are plain data shapes only, following this file's existing split between
+# schema (here) and behavior (``interfaces.py``/elsewhere).
+# ---------------------------------------------------------------------------
+
+
+class ArtifactStatus(str, Enum):
+    """Whether a stored artifact's *current* version can still be trusted
+    as-is.
+
+    FRESH: nothing this version (transitively) reads from has moved to a
+    newer version since it was produced. STALE: at least one upstream input
+    has -- the content itself has not changed, only the ground it was
+    produced against has. Stage 2 only flags this; deciding what to do
+    about it (modify / re-verify / regenerate, revision direction 1's
+    three-way split) is Stage 4's job.
+    """
+
+    FRESH = "fresh"
+    STALE = "stale"
+
+
+class StoredArtifact(BaseModel):
+    """One versioned artifact as actually persisted by
+    ``artifact_graph.ArtifactGraphStore``. ``ArtifactRef`` above is the bare
+    pointer Stage 1 defined ("Stage 1 only defines the shape; Stage 2 owns
+    actually assigning/incrementing ``version`` and persisting these
+    pointers" -- see that class's own docstring); this is Stage 2's
+    concrete record around it.
+
+    ``produced_by`` is this version's "출처" (provenance, revision
+    direction 1) beyond ``ref.read_input_versions``: a free-form label for
+    what produced it (a ``Producer`` class name, an executed action's id,
+    ...) -- today's ``DocumentNode`` (``src/common/state.py``) has no
+    equivalent field at all.
+    """
+
+    ref: ArtifactRef
+    content: Optional[str] = None
+    produced_by: Optional[str] = None
+    status: ArtifactStatus = ArtifactStatus.FRESH
+    branch_id: str = "main"
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class InvalidationRecord(BaseModel):
+    """Audit trail entry for one "artifact X changed -> artifact Y marked
+    stale" propagation step (revision direction 1's change-impact
+    computation; direction 4's requirement that repairs be auditable).
+
+    Never mutates or deletes anything it describes --
+    ``ArtifactGraphStore`` appends one of these per affected descendant on
+    every ``add_version`` call, and this list is the only record of *why*
+    a given artifact is currently stale.
+    """
+
+    changed_artifact: ArtifactRef
+    affected_artifact_id: str
+    reason: str
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class ActionLogEntry(BaseModel):
+    """One ``RepairAction`` actually carried out -- not merely decided.
+    ``RepairPolicy.decide()`` must stay side-effect-free (``interfaces.py``),
+    so this is logged by an executor, when and only when an action actually
+    begins executing, mirroring ``BlindRetryRepairPolicy.
+    record_attempt_started``'s same principle at the logging layer.
+
+    ``triggering_evidence`` is kept alongside the action so a later audit
+    can see exactly which ``Evidence`` led to it, without re-joining against
+    a separate evidence log by timestamp guesswork.
+    """
+
+    action: RepairAction
+    branch_id: str
+    triggering_evidence: List[Evidence] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class AddVersionResult(BaseModel):
+    """What happened as a side effect of one
+    ``ArtifactGraphStore.add_version`` call: the new pointer, which
+    existing artifacts this change just invalidated, and which of this
+    version's own declared inputs were already superseded by a newer
+    version at the moment it was recorded.
+
+    ``used_outdated_inputs`` is deliberately informational, not a rejected
+    call: a producer pinning an older input version on purpose is a real,
+    permitted scenario (e.g. a controlled checkpoint-branch comparison) --
+    but it must be visible on the result, never silently indistinguishable
+    from reading the true current state.
+    """
+
+    ref: ArtifactRef
+    newly_stale_artifact_ids: List[str] = Field(default_factory=list)
+    used_outdated_inputs: List[ArtifactRef] = Field(default_factory=list)
+
+
+class Checkpoint(BaseModel):
+    """A fully self-contained snapshot of one ``ArtifactGraphStore`` at one
+    moment -- revision direction 4: "복구 전 상태를 versioned checkpoint로
+    저장한다".
+
+    Carries every artifact version, every typed edge, the current stale
+    set, and the full invalidation/action/evidence/cost history -- no live
+    Python object references back into the store that produced it. That is
+    what lets ``ArtifactGraphStore.from_checkpoint`` reconstruct a fully
+    independent store sharing no mutable state with the original, which is
+    the whole point of "branch into different repair actions from the same
+    state" (direction 4): a ``Checkpoint`` could in principle be serialized
+    via ``model_dump_json()`` and handed to a different process entirely.
+    """
+
+    checkpoint_id: str
+    label: Optional[str] = None
+    source_branch_id: str
+    created_at: datetime = Field(default_factory=datetime.now)
+    artifacts: Dict[str, List[StoredArtifact]] = Field(default_factory=dict)
+    edges: List[DependencyEdge] = Field(default_factory=list)
+    stale_artifact_ids: List[str] = Field(default_factory=list)
+    invalidation_history: List[InvalidationRecord] = Field(default_factory=list)
+    actions: List[ActionLogEntry] = Field(default_factory=list)
+    evidence: List[Evidence] = Field(default_factory=list)
+    costs: List[CostRecord] = Field(default_factory=list)
