@@ -508,8 +508,11 @@ def test_is_stale_and_latest_status_never_disagree() -> None:
 
     assert store.is_stale("b") is False
     assert store.latest("b").status == ArtifactStatus.FRESH
-    # The superseded v1 is no longer "the current state" -- not a live staleness concern.
-    assert store.get_version("b", 1).status == ArtifactStatus.FRESH
+    # v1 was genuinely stale right up until it was superseded by v2 -- that
+    # historical fact is frozen permanently, not reset to FRESH just
+    # because v1 is no longer current (see test_historical_version_status_*
+    # below for why this must also match what a checkpoint records).
+    assert store.get_version("b", 1).status == ArtifactStatus.STALE
 
 
 # -- Issue 3: a declared input ref must point at something real. --
@@ -580,3 +583,114 @@ def test_add_inferred_edge_persists_its_reason() -> None:
     store.add_inferred_edge(def_ref, ex_ref, reason="ex_1 cites def:def_1")
     [edge] = [e for e in store.edges if e.relation == DependencyRelationKind.INFERRED]
     assert edge.reason == "ex_1 cites def:def_1"
+
+
+# ---------------------------------------------------------------------------
+# Round 3: a second user review, after round 2's fixes, caught that
+# add_inferred_edge never retroactively re-evaluates status, and that a
+# superseded version's status disagreed between get_version() and a
+# checkpoint. Named after the exact repro each one came from.
+# ---------------------------------------------------------------------------
+
+# -- A missed relation, filled in later via add_inferred_edge, must
+# retroactively invalidate a *current* target if its revealed source is
+# outdated or stale -- not leave the target looking fresh forever. --
+
+
+def test_add_inferred_edge_retroactively_invalidates_target_when_source_is_outdated() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    a_ref_v1 = store.latest("a").ref
+
+    # b actually used a@1, but that relation was never declared at the time.
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1")
+    b_ref = store.latest("b").ref
+    store.add_version("c", ArtifactKind.DEFINITION, content="c1", read_input_versions=[b_ref])
+
+    passing_evidence = Evidence(constraint_id="x", outcome=CheckOutcome.PASS, checked_artifact=b_ref)
+    store.record_evidence(passing_evidence)
+    assert store.live_evidence("b") == [passing_evidence]
+
+    # a moves on; b looks completely unaffected, since the relation is unknown.
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")
+    assert not store.is_stale("b")
+
+    # The missing relation is discovered after the fact.
+    store.add_inferred_edge(a_ref_v1, b_ref, reason="b1 actually used a@1, undeclared at the time")
+
+    assert store.is_stale("b")
+    assert store.is_stale("c")  # descendant of b, also affected
+    assert store.live_evidence("b") == []  # the old PASS no longer counts as live
+
+
+def test_add_inferred_edge_retroactively_invalidates_target_when_source_is_already_stale() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    a_ref = store.latest("a").ref
+    store.add_version("x", ArtifactKind.DEFINITION, content="x1", read_input_versions=[a_ref])
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")  # x becomes stale
+    assert store.is_stale("x")
+
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1")  # relation to x undeclared
+    b_ref = store.latest("b").ref
+    x_ref = store.latest("x").ref  # x's version didn't change -- still stale
+
+    store.add_inferred_edge(x_ref, b_ref, reason="b1 actually used x, which was already stale")
+    assert store.is_stale("b")
+
+
+def test_add_inferred_edge_does_not_invalidate_when_source_is_fresh_and_current() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1")
+    a_ref = store.latest("a").ref
+    b_ref = store.latest("b").ref
+
+    store.add_inferred_edge(a_ref, b_ref, reason="a healthy relation between two current artifacts")
+    assert not store.is_stale("b")
+
+
+def test_add_inferred_edge_does_not_invalidate_a_historical_target_version() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    a_ref_v1 = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1")
+    b_ref_v1 = store.latest("b").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b2")  # b moves on, unrelated to a
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")  # a@1 is now outdated too
+
+    # This edge is purely a historical annotation about b's *old* v1 --
+    # b's current v2 must be entirely unaffected.
+    store.add_inferred_edge(a_ref_v1, b_ref_v1, reason="historical annotation about b@1 only")
+    assert not store.is_stale("b")
+
+
+# -- A superseded version's status must mean the same thing, and read the
+# same way, everywhere it's exposed. --
+
+
+def test_historical_version_status_is_frozen_at_supersession_and_matches_checkpoint() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b1", read_input_versions=[a_ref])
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")  # b becomes stale
+    assert store.is_stale("b")
+
+    new_a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b2", read_input_versions=[new_a_ref])
+    assert not store.is_stale("b")  # b is healed as of v2
+
+    # get_version() and a checkpoint taken afterward must agree that b@1
+    # really was stale right up until it was superseded.
+    assert store.get_version("b", 1).status == ArtifactStatus.STALE
+    checkpoint = store.save_checkpoint()
+    assert checkpoint.artifacts["b"][0].status == ArtifactStatus.STALE
+    assert checkpoint.artifacts["b"][1].status == ArtifactStatus.FRESH
+
+
+def test_historical_version_status_freezes_fresh_when_never_stale() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")
+    assert store.get_version("a", 1).status == ArtifactStatus.FRESH

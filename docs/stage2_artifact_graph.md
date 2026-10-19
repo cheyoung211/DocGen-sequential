@@ -20,7 +20,7 @@
 | Stage 2 스키마 (`ArtifactStatus`/`StoredArtifact`/`InvalidationRecord`/`ActionLogEntry`/`AddVersionResult`/`Checkpoint`) | `src/core/schemas.py` (신규, 파일 끝에 추가) |
 | Versioned artifact graph store (버전·typed edge·change-impact·staleness·evidence 바인딩·checkpoint) | `src/core/artifact_graph.py::ArtifactGraphStore` |
 | action/evidence/cost 로그 | `src/core/run_log.py::RunLog` (store가 소유, `src/evaluation/event_logger.py::EventLogger`와는 독립된 별개 개념) |
-| 테스트 | `test/core/test_artifact_graph.py` (44개 중 19개가 Stage 2 신규) |
+| 테스트 | `test/core/test_artifact_graph.py` (64개 — §1.5/§1.6은 각 리뷰 라운드에서 늘어난 수를 기록) |
 
 ---
 
@@ -35,29 +35,51 @@
 - `read_input_versions`에 넘긴 각 입력마다 `DependencyEdge(relation=EXPLICIT)`을 자동 생성한다 —
   producer가 "이것을 읽었다"고 **선언**한 관계만 EXPLICIT이다.
 - `ArtifactGraphStore.add_inferred_edge(from_artifact, to_artifact, reason)`는 선언되지 않은 관계를
-  별도로 기록한다 (`relation=INFERRED`) — 예: 예제가 생성 입력으로는 정의를 선언하지 않았지만 본문에서
-  그 label을 인용하는 경우. **Stage 2는 이 구분을 저장·질의하는 메커니즘만 제공한다 — 레퍼런스를
-  자동으로 스캔해 추론 엣지를 찾아내는 NLP/정규식 탐지기는 구현하지 않았다**; 그런 추론 엣지는 지금은
-  호출자가 명시적으로 `add_inferred_edge`를 불러줘야 생긴다.
+  별도로 기록한다 (`relation=INFERRED`, `reason`도 함께 저장) — 예: 예제가 생성 입력으로는 정의를
+  선언하지 않았지만 본문에서 그 label을 인용하는 경우. **Stage 2는 이 구분을 저장·질의하는 메커니즘만
+  제공한다 — 레퍼런스를 자동으로 스캔해 추론 엣지를 찾아내는 NLP/정규식 탐지기는 구현하지 않았다**;
+  그런 추론 엣지는 지금은 호출자가 명시적으로 `add_inferred_edge`를 불러줘야 생긴다. 관계를 **뒤늦게**
+  채워 넣었을 때(대상은 현재 버전인데 그 입력이 이미 outdated/stale로 드러나는 경우) 상태를 소급
+  재평가하는 동작은 §1.2/§1.6에서 다룬다 — 이 메서드가 저장하는 것은 구조적 사실(관계)이고, 그로부터
+  상태를 어떻게 갱신하는지는 별도 관심사다.
 - "출처"(provenance)는 두 곳에 나뉘어 저장된다: `ArtifactRef.read_input_versions`(어느 버전을
   읽었는지, Stage 1부터 존재)와 새 필드 `StoredArtifact.produced_by`(무엇이 만들었는지, 자유
   문자열 — Producer 클래스명이나 실행된 action id 등).
 
 ### 1.2 "변경 영향 후보 계산, stale 상태, 검증 evidence의 버전 바인딩·무효화를 구현한다."
 
+> 이 절은 **현재 구현**을 기준으로 적는다(2026.10.19, 3차 리뷰 반영 후). 더 이른 라운드의 구현이
+> 어땠고 왜 바뀌었는지는 §1.5/§1.6에 리뷰 이력으로 남긴다 — 본문을 이전 라운드 설명으로 혼동하지
+> 않도록, 여기서는 과거형 서술을 쓰지 않는다.
+
 - `ArtifactGraphStore.impact_candidates(artifact_id)`가 방향 1의 수식 `I(R) = R ∪ Desc_G(R)`을
-  그대로 구현한다 — `_dependents` 인접 목록 위의 BFS. **순환을 명시적으로 허용한다**: Notion 문서가
-  "문서 내 상호 참조에는 순환이 있을 수 있으므로 모든 관계를 DAG로 강제하지 않는다"고 적었으므로
-  toposort가 아니라 visited-set BFS로 구현했다 (`test_impact_candidates_terminates_on_a_cycle`로
-  순환 입력에서도 종료함을 직접 확인).
+  구현한다. 인접 리스트는 **매 호출마다** `_current_dependents()`가 `_edges`와 `_versions`에서
+  다시 계산한다 — "edge의 `to_artifact.version`이 그 artifact의 **현재 최신 버전**과 일치하는 edge만"
+  걸러서 쓴다. 과거 edge(artifact가 재생성되며 더 이상 유효하지 않게 된 관계)는 `_edges`에 감사
+  기록으로 남지만 영향 계산에는 기여하지 않는다 — 누적형 인덱스를 두지 않는 이유는 §1.5 문제 4를
+  참고. **순환을 명시적으로 허용한다**: Notion 문서가 "문서 내 상호 참조에는 순환이 있을 수 있으므로
+  모든 관계를 DAG로 강제하지 않는다"고 적었으므로 toposort가 아니라 visited-set BFS로 구현했다
+  (`test_impact_candidates_terminates_on_a_cycle`로 순환 입력에서도 종료함을 직접 확인).
 - 이 메서드는 **순수 질의**다 — 몇 번을 불러도 `self`를 바꾸지 않는다 (stale 집합·edge 수가 불변임을
-  `test_impact_candidates_is_a_pure_query`로 확인). 실제로 stale 상태를 세우는 것은
-  `add_version`뿐이다 — Stage 1의 `RepairPolicy.decide()`가 side effect 없이 유지되어야 한다는
+  `test_impact_candidates_is_a_pure_query`로 확인). 실제로 stale 상태를 세우는 것은 `add_version`과
+  `add_inferred_edge`뿐이다 — Stage 1의 `RepairPolicy.decide()`가 side effect 없이 유지되어야 한다는
   설계 원칙([[docgen_stage_review_rigor]]의 bug #1)을 이 "계산" 계층에도 그대로 적용했다.
-- `add_version`은 새 버전을 쓸 때마다 `impact_candidates(artifact_id) - {artifact_id}`를
-  STALE로 표시하고 `InvalidationRecord`를 남긴다 (누가·왜 stale이 됐는지 감사 가능). **artifact
-  자신은 절대 stale로 표시하지 않는다** — 방금 새로 생성된 그 버전이 바로 "fresh"의 근거이기
-  때문이다.
+- **stale 상태의 단일 진실 소스는 `_stale_ids`뿐이다**(`ArtifactGraphStore._live_status()`).
+  `StoredArtifact.status` 필드 자체를 읽고 믿는 코드는 없다 — `latest()`/`get_version()`(최신
+  버전을 가리킬 때)/`save_checkpoint()`가 매번 `_stale_ids`에서 실시간으로 다시 계산해 덮어쓴다.
+  `add_version`은 새 버전을 쓸 때마다 `impact_candidates(artifact_id) - {artifact_id}`(자기 자신
+  제외, 하위 artifact만)를 STALE로 표시하고 `InvalidationRecord`를 남긴다. 하지만 **artifact 자신이
+  절대 stale로 표시되지 않는 것은 아니다** — 새로 쓰는 버전이 outdated/stale한 입력을 읽었다면
+  (`born_stale`) 그 버전 자신도 STALE로 저장된다(§1.5 문제 2). 또한 `add_inferred_edge`로 뒤늦게
+  발견한 관계가 현재 버전의 artifact가 이미 outdated/stale한 입력에 의존했음을 드러내면, 그 artifact
+  자신과 하위 artifact 모두가 **소급** STALE로 표시된다(§1.6 문제 1·2) — 이 경우는 "새 버전을 쓰는"
+  이벤트가 아니므로 자기 자신도 포함해 무효화해야 하기 때문이다. 두 전파 방식(자기 자신 제외 vs 포함)
+  모두 공용 헬퍼 `ArtifactGraphStore._invalidate(..., include_self=...)`로 구현된다.
+- **superseded(과거) 버전의 status는 교체되는 순간 영구히 고정된다**: `add_version`이 새 버전을
+  append하기 *직전에*, 교체되는 기존 최신 버전의 `.status`를 그 순간의 `_live_status()` 값으로
+  덮어쓴다. 그래서 `get_version(artifact_id, 옛_버전)`과 `Checkpoint.artifacts[artifact_id][i]`
+  (최신이 아닌 항목)는 항상 서로 일치하고, "그 버전이 교체되기 직전까지 실제로 stale였는지"를 영구히
+  보여준다 — 교체 후 임의로 FRESH로 되돌리지 않는다(§1.6 문제 3).
 - Evidence의 버전 바인딩·무효화: `ArtifactGraphStore.live_evidence(artifact_id)`는 "현재 최신
   버전에 대해 기록되었고(**버전 일치**) 그 이후 stale이 되지 않은(**non-stale**) Evidence"만
   돌려준다. **두 조건 모두 필요한 이유**: 공통 정의가 바뀌어도 그 하위 artifact 자신의 버전 번호는
@@ -162,6 +184,49 @@ invalidation 이력에도 전혀 등장하지 않고 내용도 그대로임을 �
 `test_add_inferred_edge_rejects_a_nonexistent_version_or_mismatched_kind`,
 `test_regenerating_without_an_input_drops_it_from_current_impact`,
 `test_add_inferred_edge_persists_its_reason`). 기존 1.1–1.4의 테스트는 수정 없이 그대로 통과한다.
+
+### 1.6 사용자 재검토 후 수정 (2026.10.19, 3차 리뷰)
+
+2차 리뷰의 수정을 보여준 뒤 다시 재현 중심 리뷰를 받아 2가지 결함을 추가로 발견해 수정했다
+(`test/core/test_artifact_graph.py`에 6개 회귀 테스트 추가 — 58개→64개).
+
+1. **뒤늦게 발견한 관계가 상태를 재평가하지 않음**: `add_inferred_edge()`는 edge만 기록하고 끝이라,
+   다음 시나리오를 놓쳤다 — (a) B가 A@1을 실제로 사용했지만 그 관계가 생성 시점에는 기록되지 않았고,
+   (b) A가 A@2로 바뀌었는데 B는 이 관계를 모르니 전혀 영향받지 않았고, (c) 나중에
+   `add_inferred_edge(A@1, B@1, ...)`로 누락된 관계를 추가해도, B와 B의 하위 artifact는 계속
+   fresh로 남고 기존 PASS evidence도 그대로 유효하게 반환됐다. 입력(A)이 이미 stale인 경우도
+   마찬가지였다(출력 버전 번호만 보고 "최신"이라 판단했기 때문). **원인**: 관계 추가 API가 구조적
+   사실만 저장하고 상태를 재평가하지 않는, API 자체의 상태 관리 문제였다 — 자동 관계 탐지기 유무와
+   무관하다. **수정**: `add_inferred_edge`가 edge를 기록한 뒤, `to_artifact`가 대상의 **현재 최신
+   버전**이고 `from_artifact`가 **현재 상태 기준으로 outdated이거나 stale**이면, `add_version`의
+   전파에 쓰는 것과 같은 `_invalidate()` 헬퍼를 `include_self=True`로 호출해 대상 자신과 그 하위
+   artifact를 모두 소급 무효화한다. 다음 두 경우는 명시적으로 제외한다 — ① `to_artifact`가 대상의
+   현재 버전이 아닌 경우(과거 버전에 대한 역사적 기록일 뿐 현재 상태와 무관), ② `from_artifact`가
+   현재 기준으로 fresh하고 최신인 경우(정상 입력 사이의 관계 추가는 아무것도 무효화할 필요가 없다).
+   `add_version`의 자기-제외 전파(`_propagate_staleness`)와 이 소급 전파(포함)는 이제 같은
+   `_invalidate(artifact_id, changed_artifact, reason, include_self=...)` 헬퍼의 두 호출로
+   통일되어 있다.
+2. **과거 버전 status 표현이 접근 경로마다 달랐음**: stale로 생성된 B@1 뒤에 정상 B@2를 만들면,
+   (2차 리뷰 수정 직후 기준) `get_version("B", 1)`은 "현재 최신이 아니면 항상 FRESH"라는 규칙 때문에
+   FRESH를 반환했지만, `save_checkpoint()`는 마지막 항목만 보정해 B@1의 원본 저장값(STALE, 생성
+   시점에 그렇게 기록됨)을 그대로 두었다 — 같은 과거 버전에 대해 두 접근 경로가 서로 다른 답을
+   줬다. **수정**: "과거 상태"의 의미를 "그 버전이 교체되기 직전까지 실제로 stale였는가"로
+   통일했다. `add_version`이 새 버전을 append하기 *직전에* 교체되는 기존 최신 버전의 `.status`를
+   그 순간의 `_live_status()` 값으로 영구히 고정(freeze)한다 — 그 뒤로는 그 항목을 다시 건드리지
+   않는다. `get_version()`은 이제 최신 버전만 실시간으로 `_live_status()`를 덮어쓰고, 과거 버전은
+   저장된(이미 올바르게 고정된) 값을 그대로 돌려준다 — "항상 FRESH로 강제"하던 특수 처리를
+   없앴다. `save_checkpoint()`의 보정 로직도 같은 `_live_status()` 헬퍼를 쓰도록 통일해, 두 접근
+   경로가 더 이상 다른 계산을 하지 않는다.
+
+모든 수정은 재현 가능한 회귀 테스트로 남겼다
+(`test_add_inferred_edge_retroactively_invalidates_target_when_source_is_outdated`,
+`test_add_inferred_edge_retroactively_invalidates_target_when_source_is_already_stale`,
+`test_add_inferred_edge_does_not_invalidate_when_source_is_fresh_and_current`,
+`test_add_inferred_edge_does_not_invalidate_a_historical_target_version`,
+`test_historical_version_status_is_frozen_at_supersession_and_matches_checkpoint`,
+`test_historical_version_status_freezes_fresh_when_never_stale`). 기존 §1.1–1.5의 테스트 중
+`test_is_stale_and_latest_status_never_disagree`의 마지막 단언 하나만 새 의미(과거 버전이
+FRESH가 아니라 STALE로 고정됨)에 맞게 고쳤고, 나머지는 수정 없이 그대로 통과한다.
 
 ---
 

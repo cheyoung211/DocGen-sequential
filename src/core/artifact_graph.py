@@ -32,12 +32,21 @@ regression tests, named after the exact repro each one came from):
    caller ever sees it. Mutating a parameter after the call, or mutating a
    return value, must never retroactively change stored history.
 2. **Staleness has exactly one source of truth: ``_stale_ids``.**
-   ``StoredArtifact.status`` is never trusted as a static field once
-   written -- every public accessor that returns a ``StoredArtifact``
-   overlays the *current* verdict from ``_stale_ids`` onto a copy of it at
-   read time, so ``is_stale(x)`` and ``latest(x).status`` can never
-   disagree, no matter how long ago ``x`` was actually produced relative
-   to whenever something upstream of it last changed.
+   ``StoredArtifact.status`` is never trusted as a static field for the
+   *current* latest version of an artifact -- every public accessor
+   overlays ``_live_status(artifact_id)`` onto a copy of it at read time,
+   so ``is_stale(x)`` and ``latest(x).status`` can never disagree, no
+   matter how long ago ``x`` was actually produced relative to whenever
+   something upstream of it last changed, and regardless of *which*
+   mechanism last touched ``_stale_ids`` for it (``add_version``'s own
+   propagation to descendants, or ``add_inferred_edge``'s retroactive
+   invalidation when a missed relation is filled in later). Once a
+   version is superseded by a newer one, its ``.status`` is frozen for
+   good -- to ``_live_status`` at that exact moment -- rather than kept
+   live forever or reset; see ``get_version``'s docstring for why a
+   superseded version's own historical status must stay a fixed fact, not
+   a value recomputed (or forced) at read time the way the current
+   version's is.
 """
 
 from __future__ import annotations
@@ -107,14 +116,24 @@ class ArtifactGraphStore:
 
     # -- read access ----------------------------------------------------
 
+    def _live_status(self, artifact_id: str) -> ArtifactStatus:
+        """The current live staleness verdict for ``artifact_id``, derived
+        solely from ``_stale_ids`` -- the one source of truth (see this
+        module's docstring, invariant 2). Every place that needs "is this
+        artifact currently stale, as a status value" computes it through
+        this single method, so there is exactly one place that can get the
+        derivation wrong."""
+        return ArtifactStatus.STALE if artifact_id in self._stale_ids else ArtifactStatus.FRESH
+
     def _with_live_status(self, stored: StoredArtifact, artifact_id: str) -> StoredArtifact:
-        """A deep copy of ``stored`` with ``.status`` overlaid from the
-        *current* ``_stale_ids`` membership -- see this module's docstring,
-        invariant 2. Only meaningful for an artifact's current latest
-        version; a superseded historical version is handled by its own
-        caller (see ``get_version``), never through this helper."""
+        """A deep copy of ``stored`` with ``.status`` overlaid from
+        ``_live_status``. Only meaningful for an artifact's current latest
+        version, which can still change status going forward; a superseded
+        historical version's status is frozen for good the moment it stops
+        being latest (see ``add_version``'s pre-append freeze step) and is
+        never touched here."""
         copy_ = stored.model_copy(deep=True)
-        copy_.status = ArtifactStatus.STALE if artifact_id in self._stale_ids else ArtifactStatus.FRESH
+        copy_.status = self._live_status(artifact_id)
         return copy_
 
     def latest(self, artifact_id: str) -> Optional[StoredArtifact]:
@@ -126,21 +145,29 @@ class ArtifactGraphStore:
         return self._with_live_status(versions[-1], artifact_id) if versions else None
 
     def get_version(self, artifact_id: str, version: int) -> Optional[StoredArtifact]:
-        """A **deep copy** of one historical version. If ``version`` is
-        the artifact's current latest, ``.status`` is live-overlaid exactly
-        like ``latest()``; otherwise ``version`` is superseded history, and
-        staleness -- a property of "the current state" -- does not apply
-        to it, so ``.status`` always reads ``FRESH`` (never ``STALE``) for
-        a non-latest version regardless of ``_stale_ids``."""
+        """A **deep copy** of one historical version.
+
+        If ``version`` is the artifact's current latest, ``.status`` is
+        live-overlaid exactly like ``latest()`` (it can still change). If
+        ``version`` has since been superseded, its ``.status`` was already
+        permanently frozen -- at the moment it stopped being latest, by
+        ``add_version``'s pre-append freeze step -- to whatever
+        ``_live_status`` said right then, so it is returned as-is: a
+        version that really was stale right up until it got superseded
+        reads ``STALE`` forever after, not reset to ``FRESH`` just because
+        it is no longer current. This is also exactly what
+        ``save_checkpoint`` writes into a non-latest ``Checkpoint.artifacts``
+        entry, so the two can never disagree about a historical version's
+        status the way an earlier version of this method (which forced
+        ``FRESH`` on every non-latest read) did.
+        """
         versions = self._versions.get(artifact_id, [])
         for stored in versions:
             if stored.ref.version != version:
                 continue
             if stored.ref.version == versions[-1].ref.version:
                 return self._with_live_status(stored, artifact_id)
-            copy_ = stored.model_copy(deep=True)
-            copy_.status = ArtifactStatus.FRESH
-            return copy_
+            return stored.model_copy(deep=True)
         return None
 
     def is_stale(self, artifact_id: str) -> bool:
@@ -264,6 +291,16 @@ class ArtifactGraphStore:
 
         born_stale = bool(used_outdated_inputs) or bool(used_stale_inputs)
 
+        # Freeze the outgoing latest version's status as permanent history,
+        # right before it stops being latest: whatever `_live_status` says
+        # about `artifact_id` at this exact moment (before any of this
+        # call's own bookkeeping for the NEW version below) is the true
+        # "last known state" of the version about to be superseded -- see
+        # `get_version`'s docstring for why this must happen here, not be
+        # read back later from a value forced at read time.
+        if existing_versions:
+            existing_versions[-1].status = self._live_status(artifact_id)
+
         new_ref = ArtifactRef(
             artifact_id=artifact_id,
             version=next_version,
@@ -317,8 +354,11 @@ class ArtifactGraphStore:
     ) -> DependencyEdge:
         """Record a relationship discovered by some mechanism other than a
         Producer's own declared ``read_input_versions`` -- e.g. a reference
-        scanner finding that one artifact's content cites another's label.
-        This is revision direction 1's INFERRED relation kind.
+        scanner finding that one artifact's content cites another's label,
+        or a human noticing *after the fact* that ``to_artifact`` actually
+        used ``from_artifact`` all along even though that was never
+        declared when ``to_artifact`` was produced. This is revision
+        direction 1's INFERRED relation kind.
 
         Both endpoints are validated exactly like ``add_version``'s
         declared inputs (``_validate_artifact_ref``: must be a real,
@@ -328,11 +368,31 @@ class ArtifactGraphStore:
         save/restore and remains auditable later -- an earlier version of
         this method accepted ``reason`` but discarded it.
 
-        Unlike ``add_version``, this does **not** retroactively mark
-        ``to_artifact`` stale: recording a previously-unknown structural
-        fact is a different event from ``from_artifact``'s content actually
-        changing, and conflating the two would mark things stale every time
-        new inference knowledge is added, not only when content changes.
+        **Retroactive invalidation.** Recording a structural fact is not
+        itself the same event as ``from_artifact``'s content changing --
+        simply adding knowledge of a relationship between two artifacts
+        that are both currently fine must not mark anything stale just for
+        being newly connected. But if ``to_artifact`` names the target's
+        *current* latest version, and ``from_artifact`` turns out to be
+        outdated or already-stale relative to the CURRENT state, this edge
+        reveals that ``to_artifact`` (and everything reachable from it) has
+        secretly been resting on unreliable ground the entire time it
+        looked fine -- exactly the case this call exists for: the relation
+        was missed when it mattered, and is only being filled in now. That
+        case **does** retroactively invalidate ``to_artifact`` and its
+        descendants, via the same ``_invalidate`` machinery
+        ``add_version``'s own propagation uses -- the only difference is
+        ``include_self=True`` here, since ``to_artifact`` itself was never
+        rewritten and must be marked stale directly, not merely have its
+        descendants affected.
+
+        Two cases are deliberately exempt from this side effect, per the
+        distinction above: (1) ``to_artifact`` is **not** the current
+        latest version of its artifact_id -- this is a purely historical
+        annotation about a superseded version, with nothing live to
+        invalidate; (2) ``from_artifact`` is itself current and non-stale
+        -- the relationship is healthy, so there is nothing to retroactively
+        reveal.
         """
         self._validate_artifact_ref(from_artifact)
         self._validate_artifact_ref(to_artifact)
@@ -344,6 +404,33 @@ class ArtifactGraphStore:
             reason=reason,
         )
         self._edges.append(edge)
+
+        to_is_current = (
+            to_artifact.version == self._versions[to_artifact.artifact_id][-1].ref.version
+        )
+        from_is_outdated = (
+            from_artifact.version != self._versions[from_artifact.artifact_id][-1].ref.version
+        )
+        from_is_stale = self.is_stale(from_artifact.artifact_id)
+
+        if to_is_current and (from_is_outdated or from_is_stale):
+            unreliable_bits = []
+            if from_is_outdated:
+                unreliable_bits.append("outdated")
+            if from_is_stale:
+                unreliable_bits.append("stale")
+            self._invalidate(
+                to_artifact.artifact_id,
+                changed_artifact=from_artifact.model_copy(deep=True),
+                reason=(
+                    f"inferred edge retroactively revealed that "
+                    f"'{to_artifact.artifact_id}' depends on "
+                    f"'{from_artifact.artifact_id}'@v{from_artifact.version}, which is "
+                    f"{' and '.join(unreliable_bits)} relative to its current state"
+                ),
+                include_self=True,
+            )
+
         return edge.model_copy(deep=True)
 
     # -- change impact / staleness ---------------------------------------
@@ -401,23 +488,57 @@ class ArtifactGraphStore:
                     frontier.append(dependent)
         return visited
 
-    def _propagate_staleness(
-        self, changed_ref: ArtifactRef, changed_artifact_id: str
+    def _invalidate(
+        self,
+        artifact_id: str,
+        changed_artifact: ArtifactRef,
+        reason: str,
+        *,
+        include_self: bool,
     ) -> Set[str]:
-        descendants = self.impact_candidates(changed_artifact_id) - {changed_artifact_id}
-        for affected_id in descendants:
+        """Mark every artifact in ``impact_candidates(artifact_id)`` stale,
+        recording one ``InvalidationRecord`` per affected id, attributing
+        the cause to ``changed_artifact``.
+
+        ``include_self`` is the one thing that differs between this
+        helper's two call sites, and is required (no default) so neither
+        can silently fall back to the other's semantics:
+
+        - ``add_version``'s own propagation (``_propagate_staleness``)
+          passes ``False`` -- the artifact that was just freshly written
+          is, by construction, not stale from its own write; only its
+          *descendants* are affected.
+        - ``add_inferred_edge``'s retroactive path passes ``True`` --
+          ``artifact_id`` here was never rewritten; a newly discovered
+          relation reveals it was *already* resting on unreliable ground,
+          so it must be marked stale directly, not just its descendants.
+        """
+        affected = self.impact_candidates(artifact_id)
+        if not include_self:
+            affected = affected - {artifact_id}
+        for affected_id in affected:
             self._stale_ids.add(affected_id)
             self._invalidation_history.append(
                 InvalidationRecord(
-                    changed_artifact=changed_ref.model_copy(deep=True),
+                    changed_artifact=changed_artifact,
                     affected_artifact_id=affected_id,
-                    reason=(
-                        f"upstream artifact '{changed_artifact_id}' changed to "
-                        f"version {changed_ref.version}"
-                    ),
+                    reason=reason,
                 )
             )
-        return descendants
+        return affected
+
+    def _propagate_staleness(
+        self, changed_ref: ArtifactRef, changed_artifact_id: str
+    ) -> Set[str]:
+        return self._invalidate(
+            changed_artifact_id,
+            changed_artifact=changed_ref.model_copy(deep=True),
+            reason=(
+                f"upstream artifact '{changed_artifact_id}' changed to "
+                f"version {changed_ref.version}"
+            ),
+            include_self=False,
+        )
 
     # -- evidence ---------------------------------------------------------
 
@@ -472,11 +593,20 @@ class ArtifactGraphStore:
         ``Checkpoint``.
 
         Each artifact's latest stored version has its ``.status`` corrected
-        to match ``_stale_ids`` at save time (the same live-overlay
-        ``latest()``/``get_version()`` apply on every read -- see this
-        module's docstring, invariant 2), so the raw ``Checkpoint.artifacts``
-        data is itself already correct, not dependent on going through an
-        accessor later to look right.
+        via ``_live_status`` at save time -- the same overlay
+        ``latest()``/``get_version()`` apply on every read -- so the raw
+        ``Checkpoint.artifacts`` data is itself already correct, not
+        dependent on going through an accessor later to look right. Every
+        *non*-latest (superseded) version's ``.status`` was already frozen
+        permanently when it stopped being latest (``add_version``'s
+        pre-append freeze step, see ``get_version``'s docstring), so it is
+        copied as-is here too -- this is exactly what makes
+        ``get_version(artifact_id, old_version).status`` and
+        ``checkpoint.artifacts[artifact_id][i].status`` agree for the same
+        historical version; an earlier version of this method only
+        corrected the last entry while ``get_version`` separately forced
+        every non-latest read to ``FRESH``, so the two disagreed whenever a
+        version had genuinely been stale right up until it was superseded.
 
         The ``Checkpoint`` cached internally (for ``restore_checkpoint``)
         and the one returned to the caller are two *separately* deep-copied
@@ -488,9 +618,7 @@ class ArtifactGraphStore:
         materialized_artifacts: Dict[str, List[StoredArtifact]] = {}
         for artifact_id, versions in self._versions.items():
             copied_versions = copy.deepcopy(versions)
-            copied_versions[-1].status = (
-                ArtifactStatus.STALE if artifact_id in self._stale_ids else ArtifactStatus.FRESH
-            )
+            copied_versions[-1].status = self._live_status(artifact_id)
             materialized_artifacts[artifact_id] = copied_versions
 
         checkpoint = Checkpoint(
