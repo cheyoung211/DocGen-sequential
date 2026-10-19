@@ -3,12 +3,10 @@ venv/
 __pycache__/
 *.pdf
 .pytest_cache/
-dataset/
+/dataset/
 dataset2/
 data/
 outputs/
 .git.bak/
 evaluation/foundation_metrics/
-test/
-docs/
 outputs_b4_workshop/
