@@ -229,6 +229,84 @@ def test_live_evidence_excludes_evidence_whose_artifact_became_stale() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stage 3 review: live_evidence must also invalidate on a change to one of
+# an Evidence's *other* declared inputs (Evidence.input_versions), not only
+# on checked_artifact itself changing/going stale -- and must return only
+# the single current verdict per constraint_id, not every historical entry
+# ever logged against the same (artifact_id, version).
+# ---------------------------------------------------------------------------
+
+
+def test_live_evidence_excludes_evidence_whose_declared_input_moved_to_a_newer_version() -> None:
+    """Regression for a user-caught repro: a RECOMPUTE check's source
+    artifact moves v1->v2, but the checked artifact's own version never
+    changes (and is never marked stale, since recompute inputs aren't
+    wired into the dependency-edge/staleness machinery at all) -- without
+    binding the source's version onto the Evidence itself, the old PASS
+    kept reading as live forever."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    store.add_version("source_1", ArtifactKind.SOURCE_DATA, content="[1, 2, 3]")
+    checked_ref = store.latest("checked").ref
+    source_v1 = store.latest("source_1").ref
+
+    evidence = Evidence(
+        constraint_id="sum_check",
+        outcome=CheckOutcome.PASS,
+        checked_artifact=checked_ref,
+        input_versions=[source_v1],
+    )
+    store.record_evidence(evidence)
+    assert store.live_evidence("checked") == [evidence]
+
+    # checked_ref's own version is untouched; only the declared input moved.
+    store.add_version("source_1", ArtifactKind.SOURCE_DATA, content="[1, 2, 3, 4]")
+    assert not store.is_stale("checked")  # the checked artifact itself is unaffected
+    assert store.live_evidence("checked") == []  # but its evidence depended on source_1@v1
+    assert store.evidence_history("checked") == [evidence]  # full history is untouched
+
+
+def test_live_evidence_returns_only_the_latest_entry_per_constraint_id() -> None:
+    """Regression for a user-caught repro: a required table is missing
+    (FAIL), the table is then added, and the same constraint is re-checked
+    (PASS) against the *same* checked-artifact version -- live_evidence
+    must return only the PASS, not both. evidence_history keeps both."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    checked_ref = store.latest("checked").ref
+
+    failing = Evidence(
+        constraint_id="req_table", outcome=CheckOutcome.FAIL, checked_artifact=checked_ref, detail="missing"
+    )
+    store.record_evidence(failing)
+    assert store.live_evidence("checked") == [failing]
+
+    passing = Evidence(
+        constraint_id="req_table", outcome=CheckOutcome.PASS, checked_artifact=checked_ref, detail="now present"
+    )
+    store.record_evidence(passing)
+
+    live = store.live_evidence("checked")
+    assert live == [passing]  # only the most recent verdict for this constraint_id
+    assert store.evidence_history("checked") == [failing, passing]  # both kept, in order
+
+
+def test_live_evidence_keeps_distinct_constraint_ids_independent() -> None:
+    """Deduping by constraint_id must not collapse unrelated constraints
+    checked against the same artifact into one."""
+    store = ArtifactGraphStore()
+    store.add_version("checked", ArtifactKind.BLOCK, content="x")
+    checked_ref = store.latest("checked").ref
+    ev_a = Evidence(constraint_id="a", outcome=CheckOutcome.PASS, checked_artifact=checked_ref)
+    ev_b = Evidence(constraint_id="b", outcome=CheckOutcome.FAIL, checked_artifact=checked_ref)
+    store.record_evidence(ev_a)
+    store.record_evidence(ev_b)
+    live = store.live_evidence("checked")
+    assert {e.constraint_id for e in live} == {"a", "b"}
+    assert len(live) == 2
+
+
+# ---------------------------------------------------------------------------
 # Stage 2 checklist item 4: a shared-definition change must selectively
 # invalidate its real dependents while leaving an unrelated artifact alone
 # -- mirrors revision direction 1's own worked example verbatim: "정의의
@@ -377,6 +455,58 @@ def test_run_log_total_cost_tokens_includes_failed_attempts() -> None:
     log.log_cost(CostRecord(stage="text_agent", total_tokens=50, succeeded=True))
     log.log_cost(CostRecord(stage="text_agent", total_tokens=30, succeeded=False))
     assert log.total_cost_tokens == 80
+
+
+# ---------------------------------------------------------------------------
+# Tool-call logging (Stage 3 review): execute()'s call+observation pair was
+# previously not persisted anywhere -- ArtifactGraphStore.record_tool_call /
+# RunLog.log_tool_call / Checkpoint.tool_calls close that gap.
+# ---------------------------------------------------------------------------
+
+
+def test_record_tool_call_logs_and_round_trips_through_checkpoint() -> None:
+    from src.core.schemas import (
+        FinishCall,
+        FinishToolResult,
+        ToolActionKind,
+        ToolObservation,
+    )
+
+    store = ArtifactGraphStore()
+    call = FinishCall(reason="budget exhausted", unresolved_artifact_ids=["a", "b"])
+    observation = ToolObservation(
+        action=ToolActionKind.FINISH, ok=True, output=FinishToolResult(acknowledged=True)
+    )
+    store.record_tool_call(call, observation)
+
+    assert len(store.log.tool_calls) == 1
+    logged = store.log.tool_calls[0]
+    assert logged.call.reason == "budget exhausted"
+    assert logged.call.unresolved_artifact_ids == ["a", "b"]
+
+    checkpoint = store.save_checkpoint()
+    assert len(checkpoint.tool_calls) == 1
+    assert checkpoint.tool_calls[0].call.reason == "budget exhausted"
+
+    # Round-trips through serialized JSON alone, like every other
+    # Checkpoint field (test_from_checkpoint_rebuilds_from_serialized_json_alone).
+    rebuilt = Checkpoint.model_validate_json(checkpoint.model_dump_json())
+    restored_store = ArtifactGraphStore.from_checkpoint(rebuilt, branch_id="branch_B")
+    assert len(restored_store.log.tool_calls) == 1
+    assert restored_store.log.tool_calls[0].call.reason == "budget exhausted"
+
+
+def test_mutating_a_logged_tool_call_entry_does_not_corrupt_the_log() -> None:
+    from src.core.schemas import FinishCall, FinishToolResult, ToolActionKind, ToolObservation
+
+    store = ArtifactGraphStore()
+    call = FinishCall(reason="original")
+    observation = ToolObservation(action=ToolActionKind.FINISH, ok=True, output=FinishToolResult())
+    store.record_tool_call(call, observation)
+
+    entry = store.log.tool_calls[0]
+    entry.call.reason = "corrupted"
+    assert store.log.tool_calls[0].call.reason == "original"
 
 
 # ---------------------------------------------------------------------------

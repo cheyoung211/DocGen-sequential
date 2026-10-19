@@ -179,6 +179,19 @@ class Evidence(BaseModel):
     direction 3). Produced only by a ``Validator`` (see ``interfaces.py``);
     a ``FinalEvaluator`` must never produce or consume this as its quality
     signal -- see that Protocol's docstring for why.
+
+    ``input_versions`` records every artifact version (besides
+    ``checked_artifact`` itself) this verdict actually depended on -- e.g.
+    a SCHEMA_CONTRACT check's ``Constraint.applies_to`` refs, or a
+    RECOMPUTE check's source-data artifact. Added after a Stage 3 review
+    found that without this, a verdict could silently keep looking "live"
+    after one of its real inputs changed version: ``checked_artifact``
+    alone is not the complete set of things a check's correctness depends
+    on. ``ArtifactGraphStore.live_evidence()`` requires every entry here to
+    still be the current, non-stale version of its artifact -- see that
+    method's docstring. Defaults to empty for a check that genuinely
+    depends on nothing beyond ``checked_artifact`` itself (e.g. a
+    structural check with no cross-references).
     """
 
     constraint_id: str
@@ -186,6 +199,7 @@ class Evidence(BaseModel):
     checked_artifact: ArtifactRef
     detail: str = ""
     unknown_reason: Optional[UnknownReason] = None
+    input_versions: List[ArtifactRef] = Field(default_factory=list)
 
     def model_post_init(self, __context: object) -> None:
         if self.outcome == CheckOutcome.UNKNOWN and self.unknown_reason is None:
@@ -455,13 +469,20 @@ class Checkpoint(BaseModel):
     저장한다".
 
     Carries every artifact version, every typed edge, the current stale
-    set, and the full invalidation/action/evidence/cost history -- no live
-    Python object references back into the store that produced it. That is
-    what lets ``ArtifactGraphStore.from_checkpoint`` reconstruct a fully
-    independent store sharing no mutable state with the original, which is
-    the whole point of "branch into different repair actions from the same
-    state" (direction 4): a ``Checkpoint`` could in principle be serialized
-    via ``model_dump_json()`` and handed to a different process entirely.
+    set, and the full invalidation/action/evidence/cost/tool-call history
+    -- no live Python object references back into the store that produced
+    it. That is what lets ``ArtifactGraphStore.from_checkpoint`` reconstruct
+    a fully independent store sharing no mutable state with the original,
+    which is the whole point of "branch into different repair actions from
+    the same state" (direction 4): a ``Checkpoint`` could in principle be
+    serialized via ``model_dump_json()`` and handed to a different process
+    entirely.
+
+    ``tool_calls`` (``ToolCallLogEntry``, defined later in this file) was
+    added in the Stage 3 review -- without it, a branch restored from a
+    checkpoint had no record of which tool calls/observations led up to
+    that state, even though Stage 4's branching re-execution needs exactly
+    that to connect an action to its downstream result.
     """
 
     checkpoint_id: str
@@ -475,6 +496,7 @@ class Checkpoint(BaseModel):
     actions: List[ActionLogEntry] = Field(default_factory=list)
     evidence: List[Evidence] = Field(default_factory=list)
     costs: List[CostRecord] = Field(default_factory=list)
+    tool_calls: List["ToolCallLogEntry"] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +527,17 @@ class ToolActionKind(str, Enum):
     the Stage 3 checklist names it. ``PATCH``/``REPLAN`` are intentionally
     not implemented this stage -- see ``tool_executor.ToolExecutor``'s
     docstring: actually deciding regeneration scope and carrying it out is
-    Stage 4's "고정 복구 정책" / Stage 5's controller, not Stage 3's."""
+    Stage 4's "고정 복구 정책" / Stage 5's controller, not Stage 3's.
+
+    ``GENERATE`` is not one of the controller's seven selectable actions
+    (direction 2 never lists "generate" as something the controller
+    chooses -- initial generation happens upstream of the controller's
+    decision loop, via Planner/TextAgent). It exists here only so
+    ``ToolExecutor.run_generation()`` -- added after a Stage 3 review found
+    "초기 생성" had no connected cost/budget path at all -- can log and
+    charge a production call through the exact same ``ToolExecutionError``/
+    ``CostRecord`` machinery every other action uses, rather than inventing
+    a second, parallel error/cost vocabulary just for this one case."""
 
     INSPECT = "inspect"
     QUERY = "query"
@@ -514,6 +546,7 @@ class ToolActionKind(str, Enum):
     REPLAN = "replan"
     COMPILE = "compile"
     FINISH = "finish"
+    GENERATE = "generate"
 
 
 class ToolErrorCode(str, Enum):
@@ -641,11 +674,21 @@ class CompileCall(BaseModel):
     unlike patch/replan there is no new decision logic to defer to Stage 4
     here, only plumbing. ``request_id``/``output_dir`` match
     ``compile_pdf``'s own parameters exactly (``base_dir = output_dir /
-    request_id``, matching ``main.tex``'s expected location)."""
+    request_id``, matching ``main.tex``'s expected location).
+
+    ``timeout_s`` is forwarded to ``compile_pdf``'s own ``timeout``
+    parameter (added after a Stage 3 review: a local engine that hangs --
+    an infinite loop in a malformed document, say -- would otherwise never
+    return at all). Defaults to a finite 120s rather than ``None``
+    (unbounded) specifically for calls routed through
+    ``ToolExecutor`` -- a direct, non-executor caller of ``compile_pdf``
+    elsewhere in the codebase is unaffected, since that function's own
+    default stays ``None``."""
 
     action: Literal[ToolActionKind.COMPILE] = ToolActionKind.COMPILE
     request_id: str
     output_dir: str = "outputs/generations"
+    timeout_s: Optional[float] = 120.0
 
 
 class CompileToolResult(BaseModel):
@@ -684,6 +727,20 @@ class FinishToolResult(BaseModel):
     acknowledged: bool = True
 
 
+class GenerateResult(BaseModel):
+    """Output of ``ToolExecutor.run_generation()`` -- not reachable through
+    ``execute()``'s normal ``ToolCall`` dispatch (see ``ToolActionKind.GENERATE``'s
+    docstring). ``production`` is the wrapped ``Producer``'s own
+    ``ProductionResult`` unchanged -- ``ok=True`` here means only "the
+    executor allowed this call to run and it didn't raise", exactly
+    mirroring ``CompileToolResult``'s existing ``ok=True``-with-
+    ``compile_success=False`` pattern: a routine ``ProductionStatus.FAILED``
+    is data on ``production.status``, not an executor-level error."""
+
+    action: Literal[ToolActionKind.GENERATE] = ToolActionKind.GENERATE
+    production: ProductionResult
+
+
 ToolCall = Union[
     InspectArtifactCall,
     QueryDependenciesCall,
@@ -700,6 +757,7 @@ ToolCallResult = Union[
     CheckResult,
     CompileToolResult,
     FinishToolResult,
+    GenerateResult,
 ]
 
 
@@ -707,9 +765,17 @@ class ToolObservation(BaseModel):
     """The one structured shape a controller reads back from every
     ``ToolExecutor.execute()`` call -- Stage 3's completion criterion:
     "controller가 읽을 수 있는 구조화된 observation". Exactly one of
-    ``output``/``error`` is set, matching ``ProductionResult``'s existing
-    success-xor-failure discipline (``model_post_init`` below) rather than
-    leaving a caller to infer which one is meaningful from ``ok`` alone.
+    ``output``/``error`` is set -- never both, and never neither --
+    matching ``ProductionResult``'s existing success-xor-failure
+    discipline (``model_post_init`` below) rather than leaving a caller to
+    infer which one is meaningful, or to handle an observation that
+    carries neither, from ``ok`` alone. A Stage 3 review found the
+    original version of this check only forbade the *wrong* field from
+    being set, not that the *right* one must be -- ``ok=True`` with
+    ``output=None`` validated successfully, as did an ``action`` that
+    disagreed with what ``output``/``error`` themselves were tagged with
+    (e.g. ``action=CHECK`` wrapping a ``FinishToolResult``); both are now
+    checked explicitly.
 
     ``cost`` is populated whenever the executor actually dispatched the
     call (whether it then succeeded or raised) -- a rejected call (budget/
@@ -726,7 +792,51 @@ class ToolObservation(BaseModel):
     cost: Optional[CostRecord] = None
 
     def model_post_init(self, __context: object) -> None:
-        if self.ok and self.error is not None:
-            raise ValueError("ToolObservation with ok=True must not carry an error.")
-        if not self.ok and self.output is not None:
-            raise ValueError("ToolObservation with ok=False must not carry an output.")
+        if self.ok:
+            if self.error is not None:
+                raise ValueError("ToolObservation with ok=True must not carry an error.")
+            if self.output is None:
+                raise ValueError("ToolObservation with ok=True must carry an output.")
+            if self.output.action != self.action:
+                raise ValueError(
+                    f"ToolObservation.action={self.action!r} does not match "
+                    f"output.action={self.output.action!r}."
+                )
+        else:
+            if self.output is not None:
+                raise ValueError("ToolObservation with ok=False must not carry an output.")
+            if self.error is None:
+                raise ValueError("ToolObservation with ok=False must carry an error.")
+            if self.error.action != self.action:
+                raise ValueError(
+                    f"ToolObservation.action={self.action!r} does not match "
+                    f"error.action={self.error.action!r}."
+                )
+
+
+class ToolCallLogEntry(BaseModel):
+    """One ``ToolExecutor.execute()`` call paired with the observation it
+    produced -- added after a Stage 3 review found that neither the call
+    nor the observation was persisted anywhere once ``execute()`` returned
+    (e.g. a ``FinishCall``'s ``reason``/``unresolved_artifact_ids`` had no
+    storage path at all), which Stage 4's branching re-execution (revision
+    direction 4: comparing different actions from the *same* checkpointed
+    state) needs connected, not just the ``Evidence``/``CostRecord``
+    fragments a call happened to also produce along the way.
+
+    Logged for **every** ``execute()`` call, including a rejected one
+    (SUSPENDED/BUDGET_EXCEEDED/MAX_ACTIONS_EXCEEDED/NOT_IMPLEMENTED) --
+    "a tool call was attempted and here is exactly what came back" is
+    worth keeping regardless of whether it was admitted, same as
+    ``InvalidationRecord``/``ActionLogEntry`` never skip logging an
+    outcome just because it wasn't the successful one.
+
+    Does not cover ``ToolExecutor.run_generation()`` -- that call's
+    ``Producer`` reference is not itself loggable/serializable the way a
+    plain ``ToolCall`` is; see that method's docstring for the resulting,
+    explicitly scoped gap.
+    """
+
+    call: ToolCall = Field(discriminator="action")
+    observation: ToolObservation
+    created_at: datetime = Field(default_factory=datetime.now)

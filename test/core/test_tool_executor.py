@@ -357,3 +357,229 @@ def test_dispatch_exception_is_converted_to_a_structured_error_not_raised() -> N
     assert "checker exploded" in obs2.error.message
     assert obs2.cost is not None
     assert obs2.cost.succeeded is False
+
+
+# -- run_generation (Stage 3 review: generation had no connected budget path) --
+
+
+class _FakeProducer:
+    def __init__(self, *, tokens: int = 0, status=None, raises: Exception | None = None):
+        from src.core.schemas import ProductionStatus
+
+        self._tokens = tokens
+        self._status = status or ProductionStatus.SUCCESS
+        self._raises = raises
+        self.call_count = 0
+
+    def produce(self, artifact_id, context):
+        from src.core.schemas import ArtifactKind as _AK
+        from src.core.schemas import ArtifactRef as _AR
+        from src.core.schemas import ProductionResult, ProductionStatus
+
+        self.call_count += 1
+        if self._raises is not None:
+            raise self._raises
+        sink = context.get("usage_sink")
+        if sink is not None and self._tokens:
+            sink.append({"input_tokens": self._tokens, "output_tokens": 0, "total_tokens": self._tokens})
+        if self._status == ProductionStatus.FAILED:
+            return ProductionResult(status=ProductionStatus.FAILED, error="synthetic failure")
+        return ProductionResult(status=ProductionStatus.SUCCESS, artifact=_AR(artifact_id=artifact_id, kind=_AK.SECTION))
+
+
+def test_run_generation_charges_the_executors_own_budget() -> None:
+    """Regression for a user-caught repro: cap=10 tokens, a mock
+    generation call that uses 12 tokens, and the executor's budget.spent
+    staying at 0 afterward, with the next tool call still allowed."""
+    store = ArtifactGraphStore()
+    executor = _executor(store, cap=10.0)
+    producer = _FakeProducer(tokens=12)
+
+    obs = executor.run_generation(producer, "sec_1", {}, model_name="gpt-4o-mini", stage="text_agent")
+    assert obs.ok is True
+    assert obs.cost.total_tokens == 12
+    assert executor.budget.spent == 12.0  # was 0 before this fix
+    assert executor.is_suspended is True  # 12 > cap of 10
+
+    rejected = executor.execute(InspectArtifactCall(artifact_id="a"))
+    assert rejected.ok is False  # was previously still "허용됨" (allowed)
+    assert rejected.error.code == ToolErrorCode.SUSPENDED
+
+
+def test_run_generation_is_rejected_before_calling_the_producer_when_budget_is_already_exhausted() -> None:
+    """The strict-cap guarantee: a rejected call never reaches the LLM at
+    all, not merely "gets charged after the fact.\""""
+    store = ArtifactGraphStore()
+    executor = _executor(store, cap=0.0)
+    producer = _FakeProducer(tokens=5)
+
+    obs = executor.run_generation(producer, "sec_1", {}, model_name="gpt-4o-mini", stage="text_agent")
+    assert obs.ok is False
+    assert obs.error.code == ToolErrorCode.BUDGET_EXCEEDED
+    assert producer.call_count == 0  # never actually invoked
+    assert executor.budget.spent == 0.0
+
+
+def test_run_generation_charges_a_failed_production_result_too() -> None:
+    from src.core.schemas import ProductionStatus
+
+    store = ArtifactGraphStore()
+    executor = _executor(store, cap=1000.0)
+    producer = _FakeProducer(tokens=7, status=ProductionStatus.FAILED)
+
+    obs = executor.run_generation(producer, "sec_1", {}, model_name="gpt-4o-mini", stage="text_agent")
+    assert obs.ok is True  # the call itself ran without raising
+    assert obs.output.production.status == ProductionStatus.FAILED
+    assert obs.cost.succeeded is False
+    assert executor.budget.spent == 7.0  # still charged despite the failure
+
+
+def test_run_generation_charges_cost_even_when_the_producer_raises_out_of_contract() -> None:
+    store = ArtifactGraphStore()
+    executor = _executor(store, cap=1000.0)
+    producer = _FakeProducer(raises=RuntimeError("out-of-contract raise"))
+
+    obs = executor.run_generation(producer, "sec_1", {}, model_name="gpt-4o-mini", stage="text_agent")
+    assert obs.ok is False
+    assert obs.error.code == ToolErrorCode.EXECUTION_FAILED
+    assert executor.actions_taken == 1  # still counted as an executed attempt
+
+
+def test_run_generation_only_runs_a_gpu_sampler_for_a_local_model_name() -> None:
+    store = ArtifactGraphStore()
+    executor = _executor(store, cap=1000.0)
+    producer = _FakeProducer(tokens=3)
+
+    obs = executor.run_generation(producer, "sec_1", {}, model_name="qwen3.6-35b-a3b", stage="text_agent")
+    assert obs.ok is True
+    # gpu_seconds is either a real measurement or None if nvidia-smi is
+    # unavailable in this environment -- either way, the field must exist
+    # and the call must not have raised attempting to measure it.
+    assert hasattr(obs.cost, "gpu_seconds")
+
+
+# -- COMPILE timeout (Stage 3 review: TIMEOUT was defined but never raised) --
+
+
+def test_compile_timeout_reports_timeout_not_execution_failed(tmp_path: Path) -> None:
+    import subprocess
+    from unittest.mock import patch
+
+    request_id = "req_timeout"
+    project_dir = tmp_path / request_id
+    project_dir.mkdir()
+    (project_dir / "main.tex").write_text(
+        "\\documentclass{article}\\begin{document}Hello\\end{document}\n", encoding="utf-8"
+    )
+    store = ArtifactGraphStore()
+    executor = _executor(store)
+
+    with patch(
+        "src.agents.latex_compiler.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="tectonic", timeout=5),
+    ):
+        obs = executor.execute(CompileCall(request_id=request_id, output_dir=str(tmp_path), timeout_s=5))
+
+    assert obs.ok is False
+    assert obs.error.code == ToolErrorCode.TIMEOUT
+    assert obs.cost is not None
+    assert obs.cost.succeeded is False  # cost is not lost on a timeout
+
+
+def test_compile_timeout_actually_kills_a_slow_real_compile(tmp_path: Path) -> None:
+    """End-to-end, no mocking: a real compile given an unreasonably short
+    timeout must actually time out rather than running unbounded."""
+    request_id = "req_real_timeout"
+    project_dir = tmp_path / request_id
+    project_dir.mkdir()
+    (project_dir / "main.tex").write_text(
+        "\\documentclass{article}\\begin{document}Hello\\end{document}\n", encoding="utf-8"
+    )
+    store = ArtifactGraphStore()
+    executor = _executor(store)
+    obs = executor.execute(CompileCall(request_id=request_id, output_dir=str(tmp_path), timeout_s=0.001))
+    assert obs.ok is False
+    assert obs.error.code == ToolErrorCode.TIMEOUT
+
+
+# -- record_tool_call logging (Stage 3 review: observations were not persisted) --
+
+
+def test_execute_logs_every_call_including_admitted_ones() -> None:
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.BLOCK, content="x")
+    executor = _executor(store)
+    executor.execute(InspectArtifactCall(artifact_id="a"))
+    assert len(store.log.tool_calls) == 1
+    assert store.log.tool_calls[0].observation.ok is True
+
+
+def test_execute_logs_a_rejected_call_too() -> None:
+    store = ArtifactGraphStore()
+    executor = _executor(store, cap=0.0)
+    executor.execute(InspectArtifactCall(artifact_id="a"))
+    assert len(store.log.tool_calls) == 1
+    assert store.log.tool_calls[0].observation.ok is False
+    assert store.log.tool_calls[0].observation.error.code == ToolErrorCode.BUDGET_EXCEEDED
+
+
+def test_execute_logs_a_finish_calls_reason_and_unresolved_ids() -> None:
+    """Regression for the exact gap the review named: a FinishCall's
+    reason/unresolved_artifact_ids previously had nowhere to persist."""
+    store = ArtifactGraphStore()
+    executor = _executor(store)
+    executor.execute(FinishCall(reason="out of budget", unresolved_artifact_ids=["x", "y"]))
+    assert len(store.log.tool_calls) == 1
+    logged_call = store.log.tool_calls[0].call
+    assert logged_call.reason == "out of budget"
+    assert logged_call.unresolved_artifact_ids == ["x", "y"]
+
+
+def test_execute_logs_a_not_implemented_patch_call_too() -> None:
+    store = ArtifactGraphStore()
+    executor = _executor(store)
+    executor.execute(PatchCall(target=ArtifactRef(artifact_id="a", version=1, kind=ArtifactKind.BLOCK)))
+    assert len(store.log.tool_calls) == 1
+    assert store.log.tool_calls[0].observation.error.code == ToolErrorCode.NOT_IMPLEMENTED
+
+
+def test_run_generation_does_not_log_a_tool_call_entry() -> None:
+    """Explicitly scoped gap (see run_generation's docstring): a Producer
+    reference is not itself a loggable ToolCall, so this path is not
+    recorded via record_tool_call the way execute() is."""
+    store = ArtifactGraphStore()
+    executor = _executor(store)
+    executor.run_generation(_FakeProducer(), "sec_1", {}, model_name="gpt-4o-mini", stage="text_agent")
+    assert len(store.log.tool_calls) == 0
+
+
+# -- ToolObservation validation (Stage 3 review: gaps in model_post_init) --
+
+
+def test_tool_observation_requires_output_when_ok_true() -> None:
+    from pydantic import ValidationError
+
+    from src.core.schemas import ToolActionKind, ToolObservation
+
+    with pytest.raises(ValidationError):
+        ToolObservation(action=ToolActionKind.INSPECT, ok=True, output=None)
+
+
+def test_tool_observation_requires_error_when_ok_false() -> None:
+    from pydantic import ValidationError
+
+    from src.core.schemas import ToolActionKind, ToolObservation
+
+    with pytest.raises(ValidationError):
+        ToolObservation(action=ToolActionKind.INSPECT, ok=False, error=None)
+
+
+def test_tool_observation_rejects_an_action_output_mismatch() -> None:
+    """Regression for a user-caught repro: action=CHECK wrapping a
+    FinishToolResult previously validated successfully."""
+    from pydantic import ValidationError
+
+    from src.core.schemas import FinishToolResult, ToolActionKind, ToolObservation
+
+    with pytest.raises(ValidationError):
+        ToolObservation(action=ToolActionKind.CHECK, ok=True, output=FinishToolResult())

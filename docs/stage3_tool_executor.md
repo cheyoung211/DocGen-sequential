@@ -14,13 +14,20 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 
 ## 0. 코드 위치
 
+> **2026.10.19 사용자 재검토 반영**: 1차 구현 공개 후 사용자가 4가지 핵심 결함 + 추가 2건을 재현
+> 중심으로 발견했다. 이 문서는 **현재(수정 후) 구현**을 기준으로 적는다 — 무엇이 어떻게 바뀌었는지는
+> §5 "사용자 재검토 후 수정"에 리뷰 이력으로 남긴다.
+
 | 구분 | 위치 |
 |---|---|
-| Stage 3 schema (`ToolActionKind`/`ToolErrorCode`/`ToolExecutionError`/7개 Call·Result/`ToolObservation`) | `src/core/schemas.py` (신규, 파일 끝에 추가) |
-| 도구 실행기 (dispatch, budget/max-actions/suspend-resume 강제) | `src/core/tool_executor.py::ToolExecutor` |
-| 기본 제약 검사 (`schema_contract`/`recompute`, `Validator` 구현) | `src/core/constraint_checks.py::BasicConstraintChecker` |
+| Stage 3 schema (`ToolActionKind`/`ToolErrorCode`/`ToolExecutionError`/7개 Call·Result·`GenerateResult`/`ToolObservation`/`ToolCallLogEntry`) | `src/core/schemas.py` (신규, 파일 끝에 추가) |
+| 도구 실행기 (dispatch, `run_generation`, budget/max-actions/suspend-resume 강제, 모든 호출 로깅) | `src/core/tool_executor.py::ToolExecutor` |
+| 기본 제약 검사 (`schema_contract`: kind까지 확인 / `recompute`: 비교+실제 재계산 두 모드, `Validator` 구현) | `src/core/constraint_checks.py::BasicConstraintChecker` |
 | 비용·지연·GPU 측정, 로컬/API 공통 모델 adapter | `src/core/cost_tracking.py::GpuUtilizationSampler`, `CostTrackingProducer` |
-| 테스트 | `test/core/test_tool_executor.py` (24개), `test/core/test_constraint_checks.py` (14개), `test/core/test_cost_tracking.py` (13개) |
+| `live_evidence`(입력 버전까지 확인+constraint당 최신 1건)/`evidence_history`(전체 이력)/`record_tool_call` | `src/core/artifact_graph.py::ArtifactGraphStore` (Stage 2 소유 파일에 Stage 3가 추가) |
+| `RunLog.tool_calls`/`log_tool_call`, `Checkpoint.tool_calls` | `src/core/run_log.py`, `src/core/schemas.py::Checkpoint` |
+| 실제 compile timeout (`subprocess.run(timeout=...)`, 전파만 함) | `src/agents/latex_compiler.py::LatexCompiler.compile_pdf` (신규 `timeout` 파라미터, 기본값 `None`=기존 동작 그대로 — Stage 3에서 유일하게 agent 코드를 수정한 지점) |
+| 테스트 | `test/core/test_tool_executor.py` (39개), `test/core/test_constraint_checks.py` (22개), `test/core/test_cost_tracking.py` (13개), `test/core/test_artifact_graph.py`에 신규 5개 추가 |
 
 ---
 
@@ -53,19 +60,33 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
   `LayoutBlock` 도메인)와는 완전히 분리된, `ArtifactGraphStore`/`ArtifactRef`/`Constraint` 위에서만
   동작하는 별도의 `Validator` 구현이다.
 - **SCHEMA_CONTRACT**: "참조 무결성"과 "필수 구성요소"는 이 체커 수준에서 같은 메커니즘으로
-  수렴한다 — `Constraint.applies_to`에 나열된 모든 `ArtifactRef`가 실제로 저장되어 있는지만
-  확인한다(`_check_schema_contract`). artifact_id 존재뿐 아니라 정확한 `(artifact_id, version)`
-  실재 여부까지 확인한다(`store.get_version`) — Stage 2의 `_validate_artifact_ref`가 이미 구분한
-  "존재 여부 vs 버전 실재 여부"와 동일한 구분을 재사용. **이 체커는 artifact의 content가 실제로
-  그 참조를 인용하는지는 검사하지 않는다** — 그건 레퍼런스 스캐너가 할 일이고, Stage 2가 이미
-  명시적으로 미룬 범위다(`docs/stage2_artifact_graph.md` §3, "실제 레퍼런스 스캔 기반 INFERRED
-  edge 자동 탐지").
-- **RECOMPUTE**: 기대값/관측값 비교만 한다(`_check_recompute`). 숫자를 문서 content나 source
-  data artifact에서 직접 추출하는 로직은 이 체커의 책임이 아니다 — `Validator.check(...,
-  context=...)`의 기존 확장점(Stage 1의 `TextAgentValidatorAdapter.check()`가 이미 같은 방식으로
-  `context`에 도메인별 정보를 담는 패턴)을 그대로 써서, 호출자가
-  `context["recompute"][constraint_id] = {"expected": ..., "observed": ..., "tolerance": ...}`로
-  값을 넘긴다. 값이 없으면 FAIL이 아니라 UNKNOWN/NOT_CHECKED.
+  수렴한다 — `Constraint.applies_to`에 나열된 모든 `ArtifactRef`가 실제로 저장되어 있는지, **그리고
+  저장된 kind가 claim한 kind와 정확히 일치하는지**(`stored.ref.kind == ref.kind`)까지 확인한다
+  (`_check_schema_contract`). **사용자 재검토에서 발견된 결함**: 1차 구현은 kind 비교를 빠뜨려,
+  TABLE을 요구하는 참조가 실제로는 같은 id/version의 DEFINITION을 가리켜도 PASS했다 — 지금은
+  kind가 다르면 "not found"와 구분되는 사유("expected kind=..., actually stored as kind=...")로
+  FAIL한다. artifact_id 존재뿐 아니라 정확한 `(artifact_id, version)` 실재 여부까지 확인하는 것은
+  Stage 2의 `_validate_artifact_ref`가 이미 구분한 "존재 여부 vs 버전 실재 여부"와 동일한 구분을
+  재사용. PASS/FAIL 둘 다 `applies_to` 전체를 `Evidence.input_versions`에 담는다 — PASS여도 그
+  참조들이 나중에 바뀌면 이 판정이 더 이상 유효하지 않아야 하기 때문(§2). **이 체커는 artifact의
+  content가 실제로 그 참조를 인용하는지는 검사하지 않는다** — 그건 레퍼런스 스캐너가 할 일이고,
+  Stage 2가 이미 명시적으로 미룬 범위다(`docs/stage2_artifact_graph.md` §3, "실제 레퍼런스 스캔
+  기반 INFERRED edge 자동 탐지").
+- **RECOMPUTE — 두 모드, 사용자 재검토 후 이름을 정확히 분리**: 1차 구현은 "기대값/관측값 비교"
+  단 하나만 있었는데, 이것은 "숫자 재계산"이 아니라 "숫자 비교"라는 지적을 받았다(체크리스트
+  문구는 "숫자 재계산"). 지금은 두 모드로 나뉜다:
+  1. **직접 비교**(기존 모드): 호출자가 `expected`/`observed`를 이미 계산해 넘긴다 —
+     `context["recompute"][constraint_id] = {"expected": ..., "observed": ..., "tolerance": ...,
+     "source_refs": [...]}`. 이 체커는 비교만 한다 — "비교"로 정확히 부른다.
+  2. **구조화된 source artifact에서 실제 재계산**(신규): `{"source_ref": ArtifactRef, "operation":
+     "sum", "observed": ..., "tolerance": ...}`를 넘기면, 체커가 `ArtifactGraphStore`에서
+     `source_ref`의 저장된 content를 직접 읽어 JSON 숫자 배열로 파싱하고 `operation`으로 지정한
+     연산(현재는 `"sum"` 하나만 — 일반 수식 평가기가 아니라 좁고 구체적인 사례 하나)을 실행해
+     `expected`를 **실제로 재계산**한다 — 이것이 "숫자 재계산"이라는 이름에 부합하는 모드다.
+  두 모드 모두 실제로 사용한 모든 artifact 버전을 `Evidence.input_versions`에 담는다(직접 모드:
+  호출자가 선언한 `source_refs`; 재계산 모드: `source_ref` 자신). 값이 없으면 FAIL이 아니라
+  UNKNOWN/NOT_CHECKED, source artifact가 없거나 content가 숫자 배열이 아니면 각각
+  UNKNOWN/MISSING_DEPENDENCY, UNKNOWN/NOT_REPRESENTABLE.
 - **CSP_SMT·SYMBOLIC**: 이번 단계는 미구현으로 남겼다 — 체크할 구체적인 narrow 제약 사례가 아직
   없고, z3/sympy 모두 `requirements.txt`에 없다. 항상 UNKNOWN/NOT_REPRESENTABLE을 반환하며
   (`_IMPLEMENTED_KINDS`에 없는 kind는 `check()`의 첫 분기에서 걸러짐), `set_enabled()`로도 켤 수
@@ -77,12 +98,20 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 - CHECK의 `CheckResult.evidence`는 `Evidence`(Stage 1) 그대로 — `unknown_reason`까지 포함.
 - INSPECT/QUERY는 `ArtifactRef`/`StoredArtifact`를 통해 버전 정보를 그대로 노출한다
   (`InspectArtifactResult.stored.ref.version`, `QueryDependenciesResult.edges[*].{from,to}_artifact.version`).
-- `ToolErrorCode.TIMEOUT`은 schema에 정의되어 있으나 **이번 단계에서 실제로 발생시키는 호출
-  경로는 없다** — 모든 Stage 3 action(inspect/query/check/compile)이 로컬 연산이거나 로컬
-  subprocess(`tectonic`)라 실제 타임아웃 시나리오가 아직 없다. `GpuUtilizationSampler`의
-  `nvidia-smi` 호출에는 2초 타임아웃이 있지만, 이는 GPU 측정 실패일 뿐 도구 호출 자체의 실패가
-  아니므로 `None` 측정값으로만 드러나고 `ToolErrorCode.TIMEOUT`을 발생시키지 않는다. 실제 LLM
-  호출(Stage 4/5에서 patch/replan이 실제로 구현되면)이 연결되면 이 코드가 쓰일 자리다.
+- `ToolErrorCode.TIMEOUT`은 이제 실제로 발생한다. **사용자 재검토에서 발견된 결함**: 1차 구현은
+  `LatexCompiler.compile_pdf`의 `subprocess.run()`에 timeout이 전혀 없어 무한 루프를 유발하는
+  문서가 영원히 멈추지 않을 수 있었고, 그 상태를 모의로 재현(`TimeoutExpired` 주입)했을 때도
+  `ToolErrorCode.TIMEOUT`이 아니라 일반 `EXECUTION_FAILED`가 반환됐다(당시 어떤 코드 경로도
+  `subprocess.TimeoutExpired`를 실제로 던지지 않았기 때문). **수정**: `compile_pdf`에 `timeout`
+  파라미터를 추가해(기본값 `None` = 기존과 동일하게 무제한) `subprocess.run(timeout=...)`에
+  그대로 전달한다 — 타임아웃 시 `subprocess.run`이 자식 프로세스를 실제로 kill하고
+  `TimeoutExpired`를 던진다. `CompileCall.timeout_s`(기본 120초)가 이 값을 채우고,
+  `ToolExecutor._execute_inner`가 `subprocess.TimeoutExpired`를 (일반 `Exception`보다 먼저)
+  별도로 잡아 `ToolErrorCode.TIMEOUT`으로 변환하며, 소요 비용(`latency_s`,
+  `succeeded=False`)도 다른 실패 경로와 똑같이 charge된다 — 실제 tectonic 호출로(mock 없이)
+  0.001초 timeout을 줘도 동일하게 동작함을 테스트로 확인했다. `GpuUtilizationSampler`의
+  `nvidia-smi` 호출 자체의 2초 타임아웃은 여전히 별개(GPU 측정 실패일 뿐 도구 호출의 실패가
+  아니므로 `None` 측정값으로만 드러남).
 
 ### 1.4 "초기 생성과 모든 후속 호출의 비용·지연을 기록하고 controller 외부의 executor에서 budget cap, 최대 행동 수, 중단·재개 조건을 강제한다. 필요 시 로컬/API 공통 모델 adapter를 둔다."
 
@@ -93,6 +122,19 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
   LLM을 호출했어도(`TextAgent._run_generation_loop`), `usage_sink`에 쌓인 모든 항목을 합산하므로
   **실패한 내부 attempt의 토큰도 자동으로 포함**된다(완료 기준의 "실패한 시도 ... 도 비용에서
   누락되지 않는다"), 각 attempt를 따로 가로챌 필요 없이.
+- **사용자 재검토에서 발견된 결함**: `CostTrackingProducer`가 `last_cost`를 만들어도, 이를
+  **`ToolExecutor`의 `Budget`에 반영하는 경로가 전혀 없었다** — `ArtifactGraphStore.record_cost()`
+  를 불러도 로그만 쌓이고 `self._budget`은 바뀌지 않는다. 재현: cap=10 tokens에서 모의 생성이
+  12 tokens를 쓰면, 로그에는 기록되지만 `executor.budget.spent`는 0으로 남고 다음 도구 호출이
+  그대로 허용됐다. **수정**: `ToolExecutor.run_generation(producer, artifact_id, context, *,
+  model_name, stage)`를 추가했다 — ① 호출 **전** `_check_admission(GENERATE)`로 허용량을
+  확인하고(거부되면 producer를 전혀 호출하지 않음 — "엄격한 상한" 보장), ② `CostTrackingProducer`로
+  실제 호출하며, ③ 성공·실패·예외 모두 동일하게 `_charge()`(기존 `ToolCall` 디스패치와 같은
+  경로)로 budget을 차감하고 `record_cost()`에 기록한다. `ToolActionKind.GENERATE`를 schema에
+  추가했지만 controller가 선택하는 7개 action에는 포함되지 않는다(direction 2는 "생성"을 action
+  후보로 나열하지 않음) — `execute()`/`ToolCall`과는 별도 진입점이며, `Producer` 참조가
+  pydantic으로 직렬화 가능한 값이 아니므로 애초에 같은 진입점을 쓸 수 없다. 모의 Producer만으로
+  (`FakeProducer`) 검증했다 — 실제 파이프라인 연결은 여전히 Stage 4/5의 일이다.
 - **GPU 사용량 실측**: `GpuUtilizationSampler`가 로컬 모델(`qwen`으로 시작하는 model_name) 호출
   구간에만 백그라운드 스레드로 `nvidia-smi --query-gpu=utilization.gpu`를 주기적으로 샘플링해
   `평균 utilization × 경과 시간`을 `gpu_seconds`로 추정한다. **이것은 근사치다, 정확한
@@ -129,6 +171,18 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
 - **오래된 검증 결과 재사용 금지**: `_dispatch_check`는 `store.live_evidence()`를 조회해
   건너뛰는 shortcut이 전혀 없다 — 매번 `self._checker.check(...)`를 새로 호출하고 그 결과를
   무조건 `store.record_evidence()`에 기록한다(`test_check_runs_fresh_every_time_never_reuses_a_prior_result`).
+  **사용자 재검토에서 발견된 결함**: `live_evidence()` 자신은 `checked_artifact`의 버전/stale
+  여부만 봤지, 검사에 실제로 쓰인 *다른* 입력(예: RECOMPUTE의 source artifact)이 바뀌었는지는
+  전혀 보지 않았다 — source artifact가 v1→v2로 바뀌어도 기존 PASS가 계속 live로 남았다. 또한
+  같은 constraint_id를 재검사했을 때(필수 table 누락→FAIL, table 추가 후 재검사→PASS) 과거
+  FAIL과 새 PASS가 **동시에** live로 반환됐다 — "매번 새로 검사한다"는 것만으로는 이전 결과가
+  무효화되지 않았기 때문이다. **수정**: `Evidence`에 `input_versions` 필드를 추가해 체커가
+  실제로 참조한 다른 artifact 버전을 담게 하고(§1.2), `live_evidence()`가 (a)
+  `checked_artifact` 버전/stale 조건에 더해 (b) `input_versions`의 모든 항목이 여전히 현재·
+  non-stale 버전인지까지 확인하며, (c) 같은 constraint_id에 대해서는 **가장 최근에 기록된 것
+  하나만** 반환하도록(append-only 순서를 그대로 "최신"으로 사용) 다시 작성했다. 전체 이력은
+  별도의 새 메서드 `evidence_history(artifact_id)`로 분리해, "현재 유효한 판정"과 "전체 이력"이
+  서로 다른 접근자로 명확히 구분된다.
 - **실패한 도구 호출도 비용에서 누락되지 않음**: `execute()`의 dispatch 단계에서 예외가 나도
   (`EXECUTION_FAILED`) `succeeded=False`인 `CostRecord`를 만들어 charge한다
   (`test_dispatch_exception_is_converted_to_a_structured_error_not_raised`). `CostTrackingProducer`도
@@ -172,19 +226,63 @@ Stage 2(versioned artifact graph, `docs/stage2_artifact_graph.md`)는 이미 완
   결정하고 수행하는" 로직은 Stage 4의 "고정 복구 정책"이다(`docs/stage2_artifact_graph.md`가 이미
   명시한 경계와 동일).
 - **오늘 파이프라인과의 실제 연결**: `scripts/run_full_pipeline.py`가 `ToolExecutor`/
-  `CostTrackingProducer`를 실제로 호출하도록 바꾸는 작업은 없다 — Stage 1·2와 동일하게, 표현
-  가능함과 독립 동작을 테스트로 증명하는 단계다.
+  `CostTrackingProducer`/`run_generation`을 실제로 호출하도록 바꾸는 작업은 없다 — Stage 1·2와
+  동일하게, 표현 가능함과 독립 동작을 테스트로 증명하는 단계다.
 - **정확한 per-process GPU 계정**: `GpuUtilizationSampler`는 디바이스 전체 utilization 기반
   근사치만 제공한다. `pynvml`/`nvidia-ml-py` 같은 정밀 계정 메커니즘은 추가하지 않았다(§3).
-- **CheckCall의 RECOMPUTE가 실제 문서 content/source data에서 숫자를 추출**: 이 체커는 비교만
-  한다 — 어디서 숫자를 읽어와 `context["recompute"]`에 채울지는 호출자(Stage 4/5가 실제 artifact
-  content를 연결할 때)의 몫이다.
-- **ToolErrorCode.TIMEOUT을 실제로 발생시키는 경로**: schema에는 있으나, 이번 단계의 모든
-  dispatch 경로(로컬 연산·로컬 subprocess)에는 의미 있는 타임아웃 시나리오가 없다 — 실제 LLM
-  호출이 patch/replan을 통해 연결되는 Stage 4/5에서 쓰일 자리다.
-- **budget 소진이 토큰 비용으로 "실행 중간에" 크로스되는 경로의 실제 가동**: 이번 단계가
-  디스패치하는 모든 action(inspect/query/check/compile)은 토큰 비용이 항상 0이므로,
-  `Budget.remaining`이 실행 도중 LLM 토큰 소비로 음수를 넘어가는 경로는 지금 "이미 cap=0으로
-  시작한 경우"로만 테스트된다(§1.4). `_charge()`의 로직 자체는 0이 아닌 토큰을 가진
-  `CostRecord`에도 동일하게 적용되므로 코드를 바꿀 필요는 없다 — patch가 실제 Producer를 호출하게
-  되는 Stage 4/5에서 이 경로가 처음으로 실제 가동된다.
+- **RECOMPUTE의 recompute-from-source 모드가 지원하는 연산은 `"sum"` 하나뿐**: 일반 수식
+  평가기가 아니다 — 다른 연산(비율·평균 등)이 필요해지면 `_RECOMPUTE_OPERATIONS`에 추가하면 되는
+  구조이지만, 지금은 "좁은 제약군 하나"만 구현했다(§1.2).
+- **`run_generation()`의 호출 자체는 `record_tool_call()`로 로깅되지 않는다**: `Producer` 참조가
+  로그에 직렬화 가능한 값이 아니기 때문 — 비용/budget은 §1.4대로 정확히 연결되지만, "이 생성
+  호출이 정확히 언제·무엇으로 일어났는지"의 call/observation 로그 자체는 Stage 4/5가 실제
+  Producer 연결을 설계할 때 필요하면 추가한다.
+- **`SCHEMA_CONTRACT`가 artifact content에서 실제 참조를 스캔**: 여전히 `applies_to`에 명시된
+  것만 확인한다 — Stage 2가 이미 미룬 범위와 동일(§1.2).
+
+---
+
+## 5. 사용자 재검토 후 수정 (2026.10.19)
+
+1차 구현을 공개한 뒤 재현 중심 리뷰에서 4가지 핵심 결함과 추가 2건을 발견해 전부 수정했다 —
+`src/core/{schemas,tool_executor,constraint_checks,artifact_graph,run_log}.py`,
+`src/agents/latex_compiler.py` 수정, `test/core/`에 재현 테스트 추가 (`test_tool_executor.py`
+24→39개, `test_constraint_checks.py` 14→22개, `test_artifact_graph.py`에 신규 5개).
+
+1. **생성 비용이 executor의 budget을 줄이지 않음** — §1.4에 기록. 재현: cap=10 tokens, 모의
+   생성 12 tokens 사용 → `budget.spent`는 0으로 남고 다음 도구 호출이 허용됨. 수정:
+   `ToolExecutor.run_generation()` 추가, 호출 전 admission 확인 + `_charge()`로 budget 연결.
+2. **검사 입력이 바뀌어도 과거 evidence가 유효하게 남음** — §2에 기록. 재현: (a) RECOMPUTE의
+   source artifact를 v1→v2로 바꿔도 기존 PASS가 live로 유지됨, (b) FAIL 기록 후 원인이
+   해소되어 PASS를 다시 기록해도 둘 다 live로 반환됨. 수정: `Evidence.input_versions` 추가 +
+   `live_evidence()`가 이를 확인하고 constraint_id당 최신 1건만 반환; `evidence_history()`를
+   별도로 추가해 전체 이력과 분리.
+3. **기본 제약 검사의 범위가 좁음** — §1.2에 기록. 재현: TABLE을 요구하는 참조가 실제로는
+   DEFINITION이어도 PASS. 수정: kind 비교 추가. 또한 RECOMPUTE가 "비교"만 하고 "재계산"이라는
+   이름에 부합하지 않는다는 지적을 받아, 구조화된 source artifact에서 실제로 합계를 계산하는
+   두 번째 모드를 추가하고 문서/이름을 정확히 분리했다.
+4. **TIMEOUT이 정의돼 있지만 실행 경로에서 처리되지 않음** — §1.3에 기록. 재현: 실제
+   `subprocess.run()`에 timeout이 없었고, `TimeoutExpired`를 주입해도 `EXECUTION_FAILED`가
+   반환됨. 수정: `compile_pdf`에 `timeout` 파라미터 추가(기본 `None`=기존 동작 유지) +
+   `ToolExecutor`가 `subprocess.TimeoutExpired`를 `ToolErrorCode.TIMEOUT`으로 매핑, 비용도 다른
+   실패와 동일하게 charge.
+5. **`ToolObservation` 검증 불충분** — 1차 구현은 "틀린 필드가 없는지"만 확인하고 "맞는 필드가
+   있는지"는 확인하지 않아, `ok=True`+`output=None`이나 `action=CHECK`를 달고
+   `FinishToolResult`를 담은 observation도 전부 유효한 객체로 통과했다. 수정:
+   `model_post_init`이 이제 ok=True→output 필수+output.action==action, ok=False→error
+   필수+error.action==action을 모두 강제한다(`schemas.py::ToolObservation`).
+6. **실행 관측이 저장되지 않음** — `FinishCall`의 종료 이유·미해결 항목이 checkpoint에 전혀
+   남지 않았고, 일반 도구 호출의 입출력도 저장 경로가 없었다. 수정: 새 `ToolCallLogEntry`
+   schema + `RunLog.log_tool_call`/`tool_calls` + `ArtifactGraphStore.record_tool_call` +
+   `Checkpoint.tool_calls`를 추가해, `ToolExecutor.execute()`의 **모든** 호출(허용·거부 불문)을
+   call+observation 쌍으로 로깅하고 checkpoint에 포함시킨다 — Stage 4의 분기 재실행이 필요로
+   할 연결을 미리 마련했다.
+
+모든 수정은 재현 테스트로 남겼다 — 각 테스트 이름이 구체적 재현 시나리오를 그대로 설명한다
+(예: `test_schema_contract_fails_on_kind_mismatch_even_when_id_and_version_resolve`,
+`test_live_evidence_excludes_evidence_whose_declared_input_moved_to_a_newer_version`,
+`test_run_generation_charges_the_executors_own_budget`,
+`test_compile_timeout_reports_timeout_not_execution_failed`,
+`test_tool_observation_rejects_an_action_output_mismatch`,
+`test_execute_logs_a_finish_calls_reason_and_unresolved_ids`). 기존 §0–4의 테스트는 수정 없이
+그대로 통과한다; `test/evaluation/`의 38개 테스트도 회귀 없음.

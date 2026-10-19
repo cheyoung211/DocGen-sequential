@@ -21,19 +21,39 @@ without touching budget/action-count at all, since nothing was actually
 run. INSPECT/QUERY/CHECK/COMPILE are fully dispatched to, respectively,
 ``ArtifactGraphStore``, the same, a supplied ``Validator``
 (``constraint_checks.BasicConstraintChecker`` by default), and the real
-``LatexCompiler.compile_pdf``. FINISH is always admissible regardless of
+``LatexCompiler.compile_pdf`` (with a real, enforced timeout -- see
+``_dispatch_compile``). FINISH is always admissible regardless of
 suspension or exhausted budget/action-count (see ``schemas.FinishCall``'s
 docstring).
+
+**``run_generation()``** is the connected cost/budget path for "초기 생성"
+(initial generation) -- added after a Stage 3 review found that
+``cost_tracking.CostTrackingProducer`` produced a ``CostRecord`` nobody
+ever charged against this executor's own ``Budget``: recording a cost via
+``ArtifactGraphStore.record_cost()`` alone only updates the log, it does
+not touch ``self._budget``, which lives only here. ``run_generation()``
+checks admission *before* calling the wrapped ``Producer`` at all (the
+strict-cap guarantee: a rejected call never reaches the LLM), then charges
+the resulting cost -- success or failure -- through the exact same
+``_charge()`` every dispatched ``ToolCall`` uses, so generation and tool
+calls share one budget ledger, not two independently-tracked ones.
+
+Every ``execute()`` call -- admitted, rejected, or raised -- is logged via
+``ArtifactGraphStore.record_tool_call()`` (also added in that review):
+without it, a ``FinishCall``'s ``reason``/``unresolved_artifact_ids`` had
+no storage path at all once ``execute()`` returned.
 """
 
 from __future__ import annotations
 
+import subprocess
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from src.agents.latex_compiler import LatexCompiler
 from src.core.artifact_graph import ArtifactGraphStore
-from src.core.interfaces import Validator
+from src.core.cost_tracking import CostTrackingProducer
+from src.core.interfaces import Producer, Validator
 from src.core.schemas import (
     Budget,
     CheckCall,
@@ -43,6 +63,7 @@ from src.core.schemas import (
     CostRecord,
     FinishCall,
     FinishToolResult,
+    GenerateResult,
     InspectArtifactCall,
     InspectArtifactResult,
     QueryDependenciesCall,
@@ -118,6 +139,20 @@ class ToolExecutor:
         self._suspend_reason = None
 
     def execute(self, call: ToolCall) -> ToolObservation:
+        """Dispatches ``call`` and returns a ``ToolObservation`` -- logged
+        via ``ArtifactGraphStore.record_tool_call()`` on *every* path
+        (admitted, rejected, or raised), which is why all of this method's
+        actual logic lives in ``_execute_inner`` with exactly one exit
+        point here: a Stage 3 review found the original version had five
+        separate ``return`` sites, any one of which could be extended
+        later without remembering to also add the logging call -- routing
+        every path through one wrapper makes that structurally
+        impossible to forget."""
+        observation = self._execute_inner(call)
+        self._store.record_tool_call(call, observation)
+        return observation
+
+    def _execute_inner(self, call: ToolCall) -> ToolObservation:
         if call.action != ToolActionKind.FINISH:
             admission_error = self._check_admission(call.action)
             if admission_error is not None:
@@ -145,9 +180,31 @@ class ToolExecutor:
         start = time.monotonic()
         try:
             output = self._dispatch(call)
+        except subprocess.TimeoutExpired as exc:
+            # Checked before the generic ``Exception`` branch below -- a
+            # Stage 3 review found a compile timeout was being reported as
+            # generic EXECUTION_FAILED instead of the dedicated TIMEOUT
+            # code that already existed in ``ToolErrorCode`` but nothing
+            # ever actually raised this specific exception type through
+            # to here. The elapsed time (including however long the
+            # subprocess ran before being killed) is still charged --
+            # "timeout에도 소요 비용이 남는지" -- exactly like any other
+            # failed dispatch.
+            cost = CostRecord(
+                stage=f"tool_executor:{call.action.value}",
+                latency_s=time.monotonic() - start,
+                succeeded=False,
+            )
+            self._charge(cost)
+            return ToolObservation(
+                action=call.action,
+                ok=False,
+                error=ToolExecutionError(code=ToolErrorCode.TIMEOUT, action=call.action, message=str(exc)),
+                cost=cost,
+            )
         except Exception as exc:  # noqa: BLE001 -- deliberately broad: any
-            # dispatch failure must still be charged and reported, not
-            # propagated past this boundary uncaught (mirrors
+            # other dispatch failure must still be charged and reported,
+            # not propagated past this boundary uncaught (mirrors
             # ``Producer.produce()``'s own "never raise past this boundary
             # for an expected, routine failure" contract in
             # ``interfaces.py``).
@@ -173,6 +230,68 @@ class ToolExecutor:
         )
         self._charge(cost)
         return ToolObservation(action=call.action, ok=True, output=output, error=None, cost=cost)
+
+    def run_generation(
+        self,
+        producer: Producer,
+        artifact_id: str,
+        context: Dict[str, Any],
+        *,
+        model_name: str,
+        stage: str,
+    ) -> ToolObservation:
+        """Runs one ``Producer`` call (initial generation, or any other
+        LLM-backed production) through this executor's own admission and
+        charging path -- the single connected path for "초기 생성과 모든
+        후속 호출의 비용·지연" (checklist item 4). Checks admission
+        *before* calling the producer at all -- a rejected call never
+        reaches the LLM -- and charges the resulting ``CostRecord``,
+        success or failure, through the exact same ``_charge()`` a
+        dispatched ``ToolCall`` uses, so this and ``execute()`` share one
+        budget ledger.
+
+        Not reachable through ``execute()``/``ToolCall`` -- a ``Producer``
+        reference is not a serializable pydantic field, so this is a
+        separate method with its own plain-argument signature, returning
+        the same ``ToolObservation`` shape via ``ToolActionKind.GENERATE``/
+        ``GenerateResult`` for consistency. Not logged via
+        ``record_tool_call()`` (unlike ``execute()``) -- see this module's
+        and ``ToolActionKind.GENERATE``'s docstrings for that explicitly
+        scoped gap.
+        """
+        admission_error = self._check_admission(ToolActionKind.GENERATE)
+        if admission_error is not None:
+            return ToolObservation(action=ToolActionKind.GENERATE, ok=False, error=admission_error, cost=None)
+
+        tracked = CostTrackingProducer(producer, stage=stage, model_name=model_name)
+        try:
+            result: ProductionResult = tracked.produce(artifact_id, context)
+        except Exception as exc:
+            # CostTrackingProducer.produce() always sets last_cost (with
+            # succeeded=False) before re-raising an out-of-contract raise
+            # from the wrapped Producer -- see that class's docstring.
+            cost = tracked.last_cost
+            if cost is not None:
+                self._charge(cost)
+            return ToolObservation(
+                action=ToolActionKind.GENERATE,
+                ok=False,
+                error=ToolExecutionError(
+                    code=ToolErrorCode.EXECUTION_FAILED, action=ToolActionKind.GENERATE, message=str(exc)
+                ),
+                cost=cost,
+            )
+
+        cost = tracked.last_cost
+        if cost is not None:
+            self._charge(cost)
+        return ToolObservation(
+            action=ToolActionKind.GENERATE,
+            ok=True,
+            output=GenerateResult(production=result),
+            error=None,
+            cost=cost,
+        )
 
     def _check_admission(self, action: ToolActionKind) -> Optional[ToolExecutionError]:
         if self._suspended:
@@ -254,8 +373,13 @@ class ToolExecutor:
     def _dispatch_compile(self, call: CompileCall) -> CompileToolResult:
         event_logger = EventLogger(run_id=call.request_id)
         compiler = LatexCompiler()
+        # ``compile_pdf``'s ``timeout`` lets ``subprocess.run`` kill a
+        # hung local engine process and raise ``subprocess.TimeoutExpired``
+        # -- caught specifically in ``_execute_inner`` above, mapped to
+        # ``ToolErrorCode.TIMEOUT``. Not caught here: this method's job is
+        # only to call through, not to translate the exception.
         compile_success = compiler.compile_pdf(
-            call.request_id, output_dir=call.output_dir, event_logger=event_logger
+            call.request_id, output_dir=call.output_dir, event_logger=event_logger, timeout=call.timeout_s
         )
         return CompileToolResult(compile_success=compile_success, compile_result=event_logger.compile_result)
 

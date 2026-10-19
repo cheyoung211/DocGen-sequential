@@ -32,12 +32,20 @@ from __future__ import annotations
 import copy
 from typing import List, Optional
 
-from src.core.schemas import ActionLogEntry, CostRecord, Evidence, RepairAction
+from src.core.schemas import (
+    ActionLogEntry,
+    CostRecord,
+    Evidence,
+    RepairAction,
+    ToolCall,
+    ToolCallLogEntry,
+    ToolObservation,
+)
 
 
 class RunLog:
-    """Accumulates ``ActionLogEntry``/``Evidence``/``CostRecord`` for one
-    ``ArtifactGraphStore`` branch.
+    """Accumulates ``ActionLogEntry``/``Evidence``/``CostRecord``/
+    ``ToolCallLogEntry`` for one ``ArtifactGraphStore`` branch.
 
     Holds no reference to the store itself and tracks no branch of its own
     -- ``branch_id`` is passed in explicitly on every ``log_action`` call,
@@ -50,6 +58,7 @@ class RunLog:
         self._actions: List[ActionLogEntry] = []
         self._evidence: List[Evidence] = []
         self._costs: List[CostRecord] = []
+        self._tool_calls: List[ToolCallLogEntry] = []
 
     @property
     def actions(self) -> List[ActionLogEntry]:
@@ -66,6 +75,11 @@ class RunLog:
     def costs(self) -> List[CostRecord]:
         """A deep copy -- same non-mutating guarantee as ``actions``."""
         return copy.deepcopy(self._costs)
+
+    @property
+    def tool_calls(self) -> List[ToolCallLogEntry]:
+        """A deep copy -- same non-mutating guarantee as ``actions``."""
+        return copy.deepcopy(self._tool_calls)
 
     def log_action(
         self,
@@ -92,6 +106,19 @@ class RunLog:
     def log_cost(self, cost: CostRecord) -> None:
         self._costs.append(cost.model_copy(deep=True))
 
+    def log_tool_call(self, call: ToolCall, observation: ToolObservation) -> ToolCallLogEntry:
+        """Deep-copies both ``call`` and ``observation`` before storing,
+        and returns a further independent deep copy -- same ingestion/
+        return discipline as ``log_action``. Logged for every
+        ``ToolExecutor.execute()`` call regardless of outcome (see
+        ``ToolCallLogEntry``'s own docstring for why a rejected call is
+        logged too, not only a dispatched one)."""
+        entry = ToolCallLogEntry(
+            call=call.model_copy(deep=True), observation=observation.model_copy(deep=True)
+        )
+        self._tool_calls.append(entry)
+        return entry.model_copy(deep=True)
+
     @property
     def total_cost_tokens(self) -> int:
         """Sum of every charged ``CostRecord.total_tokens``, including
@@ -105,16 +132,21 @@ class RunLog:
         actions: List[ActionLogEntry],
         evidence: List[Evidence],
         costs: List[CostRecord],
+        tool_calls: Optional[List[ToolCallLogEntry]] = None,
     ) -> None:
         """Wholesale-replace this log's contents. Used only by
         ``ArtifactGraphStore.from_checkpoint`` to load a checkpoint's
         already-independent history into a freshly constructed
         ``RunLog`` -- deep-copies anyway, so the caller's own
-        ``checkpoint.actions``/``.evidence``/``.costs`` lists are never
-        retained by reference either."""
+        ``checkpoint.actions``/``.evidence``/``.costs``/``.tool_calls``
+        lists are never retained by reference either. ``tool_calls``
+        defaults to ``None``/empty for a checkpoint saved before this
+        field existed (``Checkpoint.tool_calls`` itself already defaults
+        to ``[]`` the same way, so this is purely defensive)."""
         self._actions = copy.deepcopy(actions)
         self._evidence = copy.deepcopy(evidence)
         self._costs = copy.deepcopy(costs)
+        self._tool_calls = copy.deepcopy(tool_calls or [])
 
 
 __all__ = ["RunLog"]

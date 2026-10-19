@@ -164,6 +164,129 @@ def test_set_enabled_false_then_check_reports_not_checked() -> None:
     assert evidence[0].unknown_reason == UnknownReason.NOT_CHECKED
 
 
+def test_schema_contract_fails_on_kind_mismatch_even_when_id_and_version_resolve() -> None:
+    """Regression for a user-caught bug: a constraint requiring kind=TABLE
+    at (artifact_id, version) that actually resolves to a stored
+    DEFINITION must FAIL, not silently PASS just because something real
+    exists at that exact (id, version)."""
+    store = ArtifactGraphStore()
+    store.add_version("def_1", ArtifactKind.DEFINITION, content="def")
+    store.add_version("thm_1", ArtifactKind.CLAIM, content="thm")
+    checker = BasicConstraintChecker(store)
+    wrong_kind_ref = ArtifactRef(artifact_id="def_1", version=1, kind=ArtifactKind.TABLE)
+    constraint = Constraint(
+        constraint_id="c1", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[wrong_kind_ref]
+    )
+    evidence = checker.check(store.latest("thm_1").ref, [constraint])
+    assert evidence[0].outcome == CheckOutcome.FAIL
+    assert "table" in evidence[0].detail and "definition" in evidence[0].detail
+
+
+def test_schema_contract_evidence_carries_applies_to_as_input_versions() -> None:
+    """So ArtifactGraphStore.live_evidence can invalidate this verdict if
+    one of the referenced artifacts later changes version -- even on a
+    PASS, since a PASS depends on those refs staying resolved too."""
+    store, checked = _store_with_one_artifact("thm_1")
+    store.add_version("def_1", ArtifactKind.DEFINITION, content="def")
+    checker = BasicConstraintChecker(store)
+    ref = store.latest("def_1").ref
+    constraint = Constraint(constraint_id="c1", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[ref])
+    evidence = checker.check(checked, [constraint])
+    assert evidence[0].outcome == CheckOutcome.PASS
+    assert evidence[0].input_versions == [ref]
+
+
+class TestRecomputeFromSource:
+    """The second RECOMPUTE mode: actually recomputing `expected` from a
+    stored, structured source artifact -- distinct from the pre-existing
+    direct-comparison mode, which only compares two caller-supplied
+    numbers and was previously (inaccurately) the only thing "RECOMPUTE"
+    meant."""
+
+    def _store_with_source(self, content: str = "[10, 20, 5.5]"):
+        store = ArtifactGraphStore()
+        store.add_version("checked", ArtifactKind.BLOCK, content="x")
+        store.add_version("data_1", ArtifactKind.SOURCE_DATA, content=content)
+        return store, store.latest("checked").ref, store.latest("data_1").ref
+
+    def test_sum_matches_within_tolerance(self) -> None:
+        store, checked, source_ref = self._store_with_source()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked,
+            [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "sum", "observed": 35.5, "tolerance": 0.01}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+        assert evidence[0].input_versions == [source_ref]
+        assert "recomputed via 'sum'" in evidence[0].detail
+
+    def test_sum_mismatch_fails(self) -> None:
+        store, checked, source_ref = self._store_with_source()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked,
+            [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "sum", "observed": 999.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.FAIL
+
+    def test_unsupported_operation_is_unknown_not_representable(self) -> None:
+        store, checked, source_ref = self._store_with_source()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked,
+            [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "average", "observed": 1.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_missing_source_artifact_is_unknown_missing_dependency(self) -> None:
+        store, checked, _ = self._store_with_source()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        ghost_ref = ArtifactRef(artifact_id="ghost", version=1, kind=ArtifactKind.SOURCE_DATA)
+        evidence = checker.check(
+            checked,
+            [constraint],
+            context={"recompute": {"r1": {"source_ref": ghost_ref, "operation": "sum", "observed": 1.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.MISSING_DEPENDENCY
+
+    def test_non_numeric_json_content_is_unknown_not_representable(self) -> None:
+        store, checked, source_ref = self._store_with_source(content='{"not": "a list of numbers"}')
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked,
+            [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "sum", "observed": 1.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_direct_comparison_mode_still_works_and_carries_declared_source_refs(self) -> None:
+        """The original mode (caller supplies `expected` directly) is kept
+        for callers who already computed it elsewhere -- now correctly
+        understood as comparison, not recomputation, and still able to
+        declare provenance via `source_refs` for live-evidence invalidation."""
+        store, checked, source_ref = self._store_with_source()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked,
+            [constraint],
+            context={"recompute": {"r1": {"expected": 10.0, "observed": 10.0, "source_refs": [source_ref]}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+        assert evidence[0].input_versions == [source_ref]
+
+
 def test_check_answers_every_requested_constraint_not_a_subset() -> None:
     """Validator.check()'s contract (interfaces.py): never silently drop a
     requested constraint. A mixed batch -- one of each kind -- must come

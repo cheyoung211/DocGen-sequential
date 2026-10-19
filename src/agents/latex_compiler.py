@@ -102,7 +102,23 @@ class LatexCompiler:
         request_id: str,
         output_dir: str = "outputs/generations",
         event_logger: Optional[EventLogger] = None,
+        timeout: Optional[float] = None,
     ) -> bool:
+        """``timeout`` (seconds) is forwarded to each ``subprocess.run()``
+        call below -- added after a Stage 3 (``src/core/tool_executor.py``)
+        review pointed out that a local engine run with no limit at all
+        can hang indefinitely (e.g. a pathological/looping document) with
+        no way to recover. Defaults to ``None`` (unbounded, i.e.
+        unchanged) so every existing caller (``scripts/run_full_pipeline.py``,
+        ``src/baseline_single_llm/single_llm.py``, this module's own
+        tests) keeps its exact current behavior without passing anything.
+        On an actual timeout, ``subprocess.run`` kills the child process
+        and raises ``subprocess.TimeoutExpired`` -- deliberately **not**
+        caught here, propagating to the caller exactly like any other
+        unexpected exception this method does not already translate into
+        one of its own ``False`` return paths (missing ``main.tex``, no
+        engine found, a failed run); ``ToolExecutor`` is what turns this
+        into a structured ``ToolErrorCode.TIMEOUT``."""
         base_dir = Path(output_dir) / request_id
         main_tex_path = base_dir / "main.tex"
         if not main_tex_path.exists():
@@ -133,6 +149,7 @@ class LatexCompiler:
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    timeout=timeout,
                 )
                 if result.returncode != 0:
                     print(f"[Compiler Warning] Compilation failed. Check {log_path}.")
