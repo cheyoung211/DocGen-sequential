@@ -886,3 +886,136 @@ class ToolCallLogEntry(BaseModel):
     call: ToolCall = Field(discriminator="action")
     observation: ToolObservation
     created_at: datetime = Field(default_factory=datetime.now)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 ("고정 복구 정책과 분기 재실행") schemas. The behavior that produces
+# these lives in ``src/core/repair_operations.py`` (carrying out one
+# ``RepairAction`` -- regenerate its named target(s), then cascade through
+# ``ArtifactGraphStore.impact_candidates`` re-verifying everything reachable,
+# regenerating only what still fails and re-affirming the rest unchanged) and
+# ``src/core/branching_runner.py`` (branching the same checkpoint into several
+# independent episodes, one per initial policy, continuing each under one
+# shared fixed downstream policy). Plain data shapes only here, same
+# schema/behavior split as every earlier stage.
+# ---------------------------------------------------------------------------
+
+
+class RepairOutcome(str, Enum):
+    """What happened to one artifact a repair touched or tried to touch --
+    revision direction 1's three-way split ("수정 대상", "재검사 대상",
+    "재생성 대상") made into an explicit, inspectable result instead of a
+    bare success/fail bool, and the mechanism behind the Stage 4 completion
+    criterion "실패한 복구도 남는다" (a failed repair must also be recorded,
+    never silently dropped).
+    """
+
+    RESOLVED = "resolved"
+    """Regenerated, and a fresh re-check right afterward found no FAIL."""
+
+    STILL_FAILING = "still_failing"
+    """Regenerated, but a fresh re-check right afterward still found a
+    FAIL. ``RepairOperationExecutor.execute()`` does not retry internally --
+    see its docstring for why another attempt is a later round's, driven by
+    the caller re-calling a ``RepairPolicy``, not something buried inside
+    one execution."""
+
+    PRODUCTION_FAILED = "production_failed"
+    """The ``Producer.produce()`` call itself returned
+    ``ProductionStatus.FAILED`` (e.g. exhausted retries) -- nothing new was
+    written, so nothing propagates from here."""
+
+    NO_PRODUCER = "no_producer"
+    """``target.kind`` has no entry in the executor's producer registry --
+    e.g. one of direction 1's finer-grained kinds (DEFINITION/SYMBOL/
+    EQUATION/...) that, in this pipeline, has no independent generation call
+    of its own; see ``repair_operations.py``'s module docstring for why this
+    is a deliberate, bounded scope decision rather than a bug."""
+
+
+class RegeneratedArtifactRecord(BaseModel):
+    """One artifact a repair actually attempted to regenerate (called its
+    Producer and, on success, wrote a new version) -- as opposed to one that
+    was only re-verified and left untouched because it still passed (see
+    ``RepairExecutionResult.reverified_untouched``, which holds bare
+    ``ArtifactRef``s instead, since nothing was produced for those).
+
+    ``pre_repair_ref`` is the version being replaced, so a reader can always
+    answer "what did this used to be" without a separate lookup even after
+    the store has moved past it.
+    """
+
+    pre_repair_ref: ArtifactRef
+    production: ProductionResult
+    outcome: RepairOutcome
+    new_ref: Optional[ArtifactRef] = None
+    reverify_evidence: List[Evidence] = Field(default_factory=list)
+
+    def model_post_init(self, __context: object) -> None:
+        if self.outcome == RepairOutcome.RESOLVED and self.new_ref is None:
+            raise ValueError("RegeneratedArtifactRecord with outcome=RESOLVED requires new_ref.")
+        if self.outcome == RepairOutcome.STILL_FAILING and self.new_ref is None:
+            raise ValueError("RegeneratedArtifactRecord with outcome=STILL_FAILING requires new_ref.")
+        if self.outcome in (RepairOutcome.PRODUCTION_FAILED, RepairOutcome.NO_PRODUCER):
+            if self.new_ref is not None:
+                raise ValueError(
+                    f"RegeneratedArtifactRecord with outcome={self.outcome!r} must not carry new_ref "
+                    "-- nothing was actually written."
+                )
+
+
+class RepairExecutionResult(BaseModel):
+    """What actually happened when ``RepairOperationExecutor.execute()``
+    carried out one ``RepairAction`` end to end: the directly-named
+    target(s), plus every artifact the graph-aware cascade additionally
+    touched as a consequence -- never the whole conservative
+    ``impact_candidates`` set blindly regenerated, only whatever a fresh
+    re-check actually found broken (``regenerated``) vs. confirmed still
+    good (``reverified_untouched``). This pairing is the concrete evidence
+    behind the Stage 4 checklist line "필요한 항목만 재생성한다": a reader can
+    see exactly which artifacts were spared, not just trust a claim that
+    some were.
+    """
+
+    action: RepairAction
+    regenerated: List[RegeneratedArtifactRecord] = Field(default_factory=list)
+    reverified_untouched: List[ArtifactRef] = Field(default_factory=list)
+    overall_outcome: RepairOutcome
+    cost: List[CostRecord] = Field(default_factory=list)
+
+
+class BranchExecutionResult(BaseModel):
+    """One independent branch's full result, from an initial checkpoint
+    through a fixed number of rounds -- revision direction 4: "동일한
+    상태에서 서로 다른 repair action으로 분기"/"효과를 ... checkpoint·행동·후속
+    정책 조건에 한정해서 해석한다".
+
+    ``initial_action``/``initial_round`` (``None`` if the branch's own
+    initial policy decided there was nothing to do) are kept separate from
+    ``downstream_rounds`` precisely so a reader can isolate "what this
+    branch's own distinguishing choice was" from "what every branch did
+    afterward under the same shared policy" -- conflating the two would
+    make the checkpoint-branch comparison meaningless (``docs/
+    stage1_experiment_design.md`` §5, point 3: "그렇지 않으면 1단계 선택 효과와
+    이후 정책 효과가 혼재된다").
+    """
+
+    branch_id: str
+    source_checkpoint_id: str
+    policy_label: str
+    initial_action: Optional[RepairAction] = None
+    initial_round: Optional[RepairExecutionResult] = None
+    downstream_rounds: List[RepairExecutionResult] = Field(default_factory=list)
+    stopped_reason: str
+    final_checkpoint: Checkpoint
+    total_cost_tokens: float = 0.0
+
+
+class BranchComparisonResult(BaseModel):
+    """Every branch spun up from one shared source checkpoint -- the unit a
+    caller actually reads to compare repair actions "동일한 초기 상태에서"
+    (from the same initial state), per the Stage 4 completion criterion.
+    """
+
+    source_checkpoint_id: str
+    branches: List[BranchExecutionResult] = Field(default_factory=list)

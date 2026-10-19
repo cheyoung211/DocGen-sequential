@@ -27,6 +27,7 @@ from src.common.state import (
 )
 from src.core.adapters import (
     BlindRetryRepairPolicy,
+    BlockPatchProducer,
     ContractOnlyFinalEvaluator,
     PlannerAgentProducer,
     TextAgentProducer,
@@ -272,6 +273,121 @@ def test_planner_agent_producer_reports_success_with_a_real_artifact() -> None:
     assert result.status == ProductionStatus.SUCCESS
     assert result.artifact.artifact_id == "doc"
     assert producer.last_output is stub_plan
+
+
+# ---------------------------------------------------------------------------
+# BlockPatchProducer (Stage 4): wraps TextAgent.regenerate_blocks, giving
+# PATCH_BLOCK a real backing producer.
+# ---------------------------------------------------------------------------
+
+
+class _StubTextAgentForPatch:
+    """Duck-typed stand-in -- BlockPatchProducer only ever calls
+    .regenerate_blocks(...); records the call's arguments so a test can
+    assert node_id/block_id/error_message were threaded through correctly,
+    not just that *some* call happened."""
+
+    def __init__(self, result: Any) -> None:
+        self._result = result
+        self.calls: list = []
+
+    def regenerate_blocks(self, node_id, block_id, error_message, graph, request_id, **kwargs):
+        self.calls.append(
+            {
+                "node_id": node_id,
+                "block_id": block_id,
+                "error_message": error_message,
+                "request_id": request_id,
+                **kwargs,
+            }
+        )
+        if isinstance(self._result, BaseException):
+            raise self._result
+        return self._result
+
+
+def test_block_patch_producer_surfaces_exhausted_retries_as_failure() -> None:
+    """regenerate_blocks shares process_node's None-on-exhausted-retries
+    failure mode (text_agent.py) -- same normalization as
+    TextAgentProducer, read back off graph.nodes[node_id].last_error."""
+    graph = _graph_with_one_section()
+    graph.update_node_status(
+        "sec_intro", NodeStatus.ERROR, error="2 attempt(s) exhausted: compile_error"
+    )
+    producer = BlockPatchProducer(_StubTextAgentForPatch(None))
+
+    result = producer.produce(
+        "def1",
+        {"node_id": "sec_intro", "graph": graph, "request_id": "req-1", "error_message": "bad bracket"},
+    )
+
+    assert result.status == ProductionStatus.FAILED
+    assert result.artifact is None
+    assert result.error == "2 attempt(s) exhausted: compile_error"
+
+
+def test_block_patch_producer_surfaces_a_raised_precondition_failure() -> None:
+    graph = DocumentGraph()  # no "missing_node" registered at all
+    producer = BlockPatchProducer(
+        _StubTextAgentForPatch(ValueError("Node 'missing_node' not found in graph."))
+    )
+
+    result = producer.produce(
+        "def1",
+        {"node_id": "missing_node", "graph": graph, "request_id": "req-1", "error_message": "x"},
+    )
+
+    assert result.status == ProductionStatus.FAILED
+    assert result.artifact is None
+    assert "missing_node" in result.error
+
+
+def test_block_patch_producer_reports_success_with_a_real_artifact() -> None:
+    graph = _graph_with_one_section()
+    stub_output = object()
+    producer = BlockPatchProducer(_StubTextAgentForPatch(stub_output))
+
+    result = producer.produce(
+        "def1",
+        {"node_id": "sec_intro", "graph": graph, "request_id": "req-1", "error_message": "bad bracket"},
+    )
+
+    assert result.status == ProductionStatus.SUCCESS
+    assert result.artifact.artifact_id == "def1"
+    assert result.artifact.kind == ArtifactKind.BLOCK
+    assert producer.last_output is stub_output
+
+
+def test_block_patch_producer_requires_error_message_in_context() -> None:
+    """regenerate_blocks has no parameter to omit error_message (unlike
+    process_node) -- see BlockPatchProducer's docstring on the resulting
+    "blind patch" gap. A caller must make an explicit choice, not have one
+    silently manufactured."""
+    graph = _graph_with_one_section()
+    producer = BlockPatchProducer(_StubTextAgentForPatch(object()))
+
+    with pytest.raises(ValueError, match="error_message"):
+        producer.produce("def1", {"node_id": "sec_intro", "graph": graph, "request_id": "req-1"})
+
+
+def test_block_patch_producer_forwards_node_id_and_block_id_separately() -> None:
+    """artifact_id is the block id; node_id (the containing section) comes
+    from context and is a distinct, required field -- regenerate_blocks
+    needs both as separate parameters, unlike TextAgentProducer where
+    artifact_id alone is the section."""
+    graph = _graph_with_one_section()
+    stub_agent = _StubTextAgentForPatch(object())
+    producer = BlockPatchProducer(stub_agent)
+
+    producer.produce(
+        "def1",
+        {"node_id": "sec_intro", "graph": graph, "request_id": "req-1", "error_message": "msg"},
+    )
+
+    assert len(stub_agent.calls) == 1
+    assert stub_agent.calls[0]["node_id"] == "sec_intro"
+    assert stub_agent.calls[0]["block_id"] == "def1"
+    assert stub_agent.calls[0]["error_message"] == "msg"
 
 
 # ---------------------------------------------------------------------------

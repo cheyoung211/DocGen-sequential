@@ -144,6 +144,88 @@ class TextAgentProducer:
         )
 
 
+class BlockPatchProducer:
+    """Wraps ``TextAgent.regenerate_blocks`` as a ``Producer`` -- added in
+    Stage 4 to give ``RepairActionType.PATCH_BLOCK`` a real backing
+    producer (Stage 1 only had producers for ``process_node``/
+    ``generate_plan``, i.e. SECTION/DOCUMENT; nothing wrapped the
+    block-level repair call).
+
+    ``artifact_id`` here is the block id (matching this class's role: one
+    instance call regenerates exactly one block), and ``context`` must
+    carry ``"node_id"`` (the section the block belongs to -- unlike
+    ``TextAgentProducer``, where ``artifact_id`` already *is* the section,
+    ``regenerate_blocks`` needs both the section and the block id as
+    separate parameters, so there is no way to derive one from the other
+    here). ``"graph"``/``"request_id"`` are required exactly like
+    ``TextAgentProducer``; ``output_dir``/``event_logger``/``usage_sink``/
+    ``outer_iteration`` are forwarded when present.
+
+    ``"error_message"`` is read from ``context`` as the diagnostic text to
+    seed the regeneration with -- but ``regenerate_blocks`` takes
+    ``error_message`` as a required, non-optional positional parameter
+    (``text_agent.py:656-658``), unlike ``process_node``, which has no such
+    parameter at all. This means PATCH_BLOCK has no way to be truly
+    message-free the way ``RepairAction.use_diagnostic_feedback=False``
+    implies for the section-repair branch (see that field's and
+    ``RepairAction``'s own docstrings for the identical gap one level up,
+    at the repair-policy level): a caller that wants a "blind" patch must
+    still supply *some* string. This adapter does not invent one -- it
+    requires ``context["error_message"]`` unconditionally and raises a
+    clear ``KeyError``-free ``ValueError`` if it is missing, so a caller
+    choosing to go "blind" at this scope must make an explicit choice about
+    what placeholder text to pass (e.g. a content-free ``"retry"``) rather
+    than this adapter silently manufacturing one that could be mistaken for
+    real diagnostic feedback.
+
+    Failure-mode normalization mirrors ``TextAgentProducer`` exactly, since
+    ``regenerate_blocks`` shares the same two failure paths as
+    ``process_node`` (a precondition raise, or a ``None`` return with
+    ``graph.nodes[node_id].last_error`` set) -- both documented on that
+    class and not repeated here.
+    """
+
+    def __init__(self, text_agent: TextAgent) -> None:
+        self._text_agent = text_agent
+        self.last_output: Any = None
+
+    def produce(self, artifact_id: str, context: Dict[str, Any]) -> ProductionResult:
+        node_id = context["node_id"]
+        graph: DocumentGraph = context["graph"]
+        if "error_message" not in context:
+            raise ValueError(
+                "BlockPatchProducer requires context['error_message'] -- "
+                "regenerate_blocks has no parameter to omit it; see this "
+                "class's docstring for the 'blind patch' gap."
+            )
+        try:
+            self.last_output = self._text_agent.regenerate_blocks(
+                node_id,
+                artifact_id,
+                context["error_message"],
+                graph,
+                context["request_id"],
+                output_dir=context.get("output_dir", "outputs/generations"),
+                event_logger=context.get("event_logger"),
+                usage_sink=context.get("usage_sink"),
+                outer_iteration=context.get("outer_iteration"),
+            )
+        except Exception as exc:
+            return ProductionResult(status=ProductionStatus.FAILED, error=str(exc))
+
+        if self.last_output is None:
+            node = graph.nodes.get(node_id)
+            error = (node.last_error if node is not None else None) or (
+                "regenerate_blocks returned None with no recorded error"
+            )
+            return ProductionResult(status=ProductionStatus.FAILED, error=error)
+
+        return ProductionResult(
+            status=ProductionStatus.SUCCESS,
+            artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.BLOCK),
+        )
+
+
 # The two unconditional (never enabled_validators-gated) checks
 # _validate_one_block runs before anything else, IN THIS ORDER
 # (text_agent.py:1020-1037) -- each one's own early ``return errors`` means
@@ -562,6 +644,7 @@ class ContractOnlyFinalEvaluator:
 __all__ = [
     "PlannerAgentProducer",
     "TextAgentProducer",
+    "BlockPatchProducer",
     "TextAgentValidatorAdapter",
     "BlindRetryRepairPolicy",
     "TodayFixedRepairPolicyAdapter",
