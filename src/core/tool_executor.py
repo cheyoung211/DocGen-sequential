@@ -15,14 +15,28 @@ never needs its own copy of this bookkeeping (see ``interfaces.py``'s
 anything that "decides" must stay side-effect-free; only an actual
 execution step may advance counters).
 
-PATCH/REPLAN are schema-only this stage (see ``schemas.ToolActionKind``'s
-docstring) -- calling them always returns ``ToolErrorCode.NOT_IMPLEMENTED``
+PATCH/REPLAN were schema-only through Stage 3 (see ``schemas.ToolActionKind``'s
+docstring) -- calling them always returned ``ToolErrorCode.NOT_IMPLEMENTED``
 without touching budget/action-count at all, since nothing was actually
-run. INSPECT/QUERY/CHECK/COMPILE are fully dispatched to, respectively,
-``ArtifactGraphStore``, the same, a supplied ``Validator``
-(``constraint_checks.BasicConstraintChecker`` by default), and the real
-``LatexCompiler.compile_pdf`` (with a real, enforced timeout -- see
-``_dispatch_compile``). FINISH is always admissible regardless of
+run. **From Stage 5 on** ("5단계. LangGraph 기반 자율 controller MVP"), a
+``ToolExecutor`` constructed with both ``producer_registry`` and
+``constraint_provider`` dispatches PATCH/REPLAN for real, by lazily
+building its own ``repair_operations.RepairOperationExecutor`` bound to
+*this* executor (not a second, independent one) -- the same one-store/
+one-budget-ledger discipline Stage 4 already established, now also
+covering a PATCH/REPLAN call made by a Stage 5 controller through this
+class's own ``execute()`` entry point, not only through
+``RepairOperationExecutor.execute()`` called directly. A ``ToolExecutor``
+constructed *without* those two (every pre-Stage-5 call site, including
+every existing test) still gets the original schema-only behavior
+unchanged -- this is a strictly additive, backward-compatible extension,
+not a replacement of Stage 3's contract. See ``_dispatch_patch``/
+``_dispatch_replan`` for the ``PatchCall``/``ReplanCall`` ->
+``RepairAction`` mapping. INSPECT/QUERY/CHECK/COMPILE are fully dispatched
+to, respectively, ``ArtifactGraphStore``, the same, a supplied
+``Validator`` (``constraint_checks.BasicConstraintChecker`` by default),
+and the real ``LatexCompiler.compile_pdf`` (with a real, enforced timeout
+-- see ``_dispatch_compile``). FINISH is always admissible regardless of
 suspension or exhausted budget/action-count (see ``schemas.FinishCall``'s
 docstring).
 
@@ -69,13 +83,14 @@ from __future__ import annotations
 
 import subprocess
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from src.agents.latex_compiler import LatexCompiler
 from src.core.artifact_graph import ArtifactGraphStore
 from src.core.cost_tracking import CostTrackingProducer
 from src.core.interfaces import Producer, Validator
 from src.core.schemas import (
+    ArtifactKind,
     Budget,
     CheckCall,
     CheckResult,
@@ -87,8 +102,14 @@ from src.core.schemas import (
     GenerateResult,
     InspectArtifactCall,
     InspectArtifactResult,
+    PatchCall,
+    PatchToolResult,
     QueryDependenciesCall,
     QueryDependenciesResult,
+    RepairAction,
+    RepairActionType,
+    ReplanCall,
+    ReplanToolResult,
     ToolActionKind,
     ToolCall,
     ToolErrorCode,
@@ -96,6 +117,9 @@ from src.core.schemas import (
     ToolObservation,
 )
 from src.evaluation.event_logger import EventLogger
+
+if TYPE_CHECKING:
+    from src.core.repair_operations import ConstraintProvider, ProducerRegistry, RepairOperationExecutor
 
 
 class ToolExecutor:
@@ -118,6 +142,10 @@ class ToolExecutor:
         *,
         budget: Budget,
         max_actions: int,
+        producer_registry: Optional["ProducerRegistry"] = None,
+        constraint_provider: Optional["ConstraintProvider"] = None,
+        repair_context: Optional[Dict[str, Any]] = None,
+        model_name: str = "unknown",
     ) -> None:
         self._store = store
         self._checker = checker
@@ -126,6 +154,27 @@ class ToolExecutor:
         self._actions_taken = 0
         self._suspended = False
         self._suspend_reason: Optional[str] = None
+
+        # Stage 5: PATCH/REPLAN become real only when both of these are
+        # given. ``RepairOperationExecutor`` is imported locally (not at
+        # module level) because that module imports ``ToolExecutor`` from
+        # here -- a module-level import would be circular. Passing ``self``
+        # is safe: __init__ has already set every attribute
+        # ``RepairOperationExecutor`` touches, and it only stores the
+        # reference, it never calls back into ``self`` during its own
+        # construction.
+        self._repair_executor: Optional["RepairOperationExecutor"] = None
+        if producer_registry is not None and constraint_provider is not None:
+            from src.core.repair_operations import RepairOperationExecutor
+
+            self._repair_executor = RepairOperationExecutor(
+                store,
+                self,
+                producer_registry,
+                constraint_provider,
+                dict(repair_context) if repair_context is not None else {},
+                model_name=model_name,
+            )
 
     @property
     def budget(self) -> Budget:
@@ -179,10 +228,15 @@ class ToolExecutor:
             if admission_error is not None:
                 return ToolObservation(action=call.action, ok=False, error=admission_error, cost=None)
 
-        if call.action == ToolActionKind.PATCH or call.action == ToolActionKind.REPLAN:
-            # Schema-only this stage -- never charged, never counted as an
-            # action taken, since nothing was actually run. See this
-            # module's and ``ToolActionKind``'s docstrings.
+        if (
+            call.action == ToolActionKind.PATCH or call.action == ToolActionKind.REPLAN
+        ) and self._repair_executor is None:
+            # No repair executor configured -- preserve Stage 3's original
+            # schema-only behavior exactly: never charged, never counted as
+            # an action taken, since nothing was actually run. See this
+            # module's and ``ToolActionKind``'s docstrings. Every call site
+            # that does not pass ``producer_registry``/``constraint_provider``
+            # (every pre-Stage-5 one) takes this branch unchanged.
             return ToolObservation(
                 action=call.action,
                 ok=False,
@@ -190,9 +244,9 @@ class ToolExecutor:
                     code=ToolErrorCode.NOT_IMPLEMENTED,
                     action=call.action,
                     message=(
-                        f"{call.action.value} is schema-only in Stage 3 -- actual repair "
-                        "operations are Stage 4's scope (see docs/stage2_artifact_graph.md, "
-                        "\"하지 않은 것\")."
+                        f"{call.action.value} has no repair executor configured on this "
+                        "ToolExecutor -- pass producer_registry and constraint_provider to "
+                        "the constructor to dispatch it for real (Stage 5)."
                     ),
                 ),
                 cost=None,
@@ -360,6 +414,10 @@ class ToolExecutor:
             return self._dispatch_check(call)
         if isinstance(call, CompileCall):
             return self._dispatch_compile(call)
+        if isinstance(call, PatchCall):
+            return self._dispatch_patch(call)
+        if isinstance(call, ReplanCall):
+            return self._dispatch_replan(call)
         if isinstance(call, FinishCall):
             return self._dispatch_finish(call)
         raise TypeError(f"Unhandled ToolCall type: {type(call)!r}")
@@ -403,6 +461,55 @@ class ToolExecutor:
             call.request_id, output_dir=call.output_dir, event_logger=event_logger, timeout=call.timeout_s
         )
         return CompileToolResult(compile_success=compile_success, compile_result=event_logger.compile_result)
+
+    def _dispatch_patch(self, call: PatchCall) -> PatchToolResult:
+        """Only reached when ``self._repair_executor is not None`` (see
+        ``_execute_inner``'s guard above). ``call.target.kind`` picks the
+        recorded ``RepairActionType`` label -- a labeling choice only
+        (``RepairOperationExecutor`` runs PATCH_BLOCK/REGENERATE_SECTION/
+        REPLAN_SUBGRAPH through the identical selective cascade regardless
+        of which one is attached); see ``schemas.PatchCall``'s docstring."""
+        assert self._repair_executor is not None
+        if call.target.kind == ArtifactKind.BLOCK:
+            action_type = RepairActionType.PATCH_BLOCK
+        elif call.target.kind == ArtifactKind.SECTION:
+            action_type = RepairActionType.REGENERATE_SECTION
+        else:
+            action_type = RepairActionType.REPLAN_SUBGRAPH
+        action = RepairAction(
+            action_type=action_type,
+            target_artifacts=[call.target],
+            use_diagnostic_feedback=call.feedback_text is not None,
+            feedback_text=call.feedback_text,
+        )
+        result = self._repair_executor.execute(action)
+        return PatchToolResult(result=result)
+
+    def _dispatch_replan(self, call: ReplanCall) -> ReplanToolResult:
+        """Only reached when ``self._repair_executor is not None``. The
+        shape of ``call.targets`` (not a consulted ``RepairPolicy``) picks
+        the recorded ``RepairActionType``: a single DOCUMENT target ->
+        REGENERATE_DOCUMENT (the executor's unconditional path -- a
+        genuinely different mechanism, not just a label, see
+        ``repair_operations.RepairOperationExecutor``'s docstring); a
+        single SECTION target -> REGENERATE_SECTION; anything else ->
+        REPLAN_SUBGRAPH over exactly the given targets. See
+        ``schemas.ReplanCall``'s docstring."""
+        assert self._repair_executor is not None
+        if len(call.targets) == 1 and call.targets[0].kind == ArtifactKind.DOCUMENT:
+            action_type = RepairActionType.REGENERATE_DOCUMENT
+        elif len(call.targets) == 1 and call.targets[0].kind == ArtifactKind.SECTION:
+            action_type = RepairActionType.REGENERATE_SECTION
+        else:
+            action_type = RepairActionType.REPLAN_SUBGRAPH
+        action = RepairAction(
+            action_type=action_type,
+            target_artifacts=list(call.targets),
+            use_diagnostic_feedback=call.reason is not None,
+            feedback_text=call.reason,
+        )
+        result = self._repair_executor.execute(action)
+        return ReplanToolResult(result=result)
 
     def _dispatch_finish(self, call: FinishCall) -> FinishToolResult:
         return FinishToolResult(acknowledged=True)

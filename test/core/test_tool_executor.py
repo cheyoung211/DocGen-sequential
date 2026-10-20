@@ -1,10 +1,15 @@
-"""Coverage for src/core/tool_executor.py (Stage 3): dispatch for
-inspect/query/check/compile, NOT_IMPLEMENTED for patch/replan, FINISH's
-suspension exemption, and budget/max-actions/suspend-resume enforcement."""
+"""Coverage for src/core/tool_executor.py: dispatch for
+inspect/query/check/compile (Stage 3), FINISH's suspension exemption,
+budget/max-actions/suspend-resume enforcement, and patch/replan -- schema
+only (Stage 3, when constructed without producer_registry/
+constraint_provider) or dispatched for real through
+repair_operations.RepairOperationExecutor (Stage 5, when constructed with
+both)."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -15,14 +20,19 @@ from src.core.schemas import (
     ArtifactRef,
     Budget,
     CheckCall,
+    CheckOutcome,
     CompileCall,
     Constraint,
     ConstraintKind,
+    Evidence,
     FinishCall,
     InspectArtifactCall,
     PatchCall,
+    ProductionResult,
+    ProductionStatus,
     QueryDependenciesCall,
     ReplanCall,
+    RepairOutcome,
     ToolErrorCode,
 )
 from src.core.tool_executor import ToolExecutor
@@ -298,7 +308,7 @@ def test_compile_result_survives_a_checkpoint_json_round_trip_as_a_typed_object(
     assert logged_output.compile_result.pdf_exists is True
 
 
-# -- PATCH / REPLAN (schema-only this stage) --------------------------------
+# -- PATCH / REPLAN: schema-only (no repair executor configured) -----------
 
 
 @pytest.mark.parametrize(
@@ -308,7 +318,10 @@ def test_compile_result_survives_a_checkpoint_json_round_trip_as_a_typed_object(
         ReplanCall(targets=[ArtifactRef(artifact_id="a", version=1, kind=ArtifactKind.BLOCK)]),
     ],
 )
-def test_patch_and_replan_are_not_implemented(call) -> None:
+def test_patch_and_replan_are_not_implemented_without_a_repair_executor(call) -> None:
+    """``_executor()`` never passes producer_registry/constraint_provider --
+    every pre-Stage-5 construction (every other test in this file included)
+    must keep getting exactly this NOT_IMPLEMENTED behavior unchanged."""
     executor = _executor()
     obs = executor.execute(call)
     assert obs.ok is False
@@ -316,7 +329,7 @@ def test_patch_and_replan_are_not_implemented(call) -> None:
     assert obs.cost is None
 
 
-def test_patch_and_replan_do_not_consume_budget_or_action_count() -> None:
+def test_patch_and_replan_do_not_consume_budget_or_action_count_without_a_repair_executor() -> None:
     """Nothing was actually run, so neither the token budget nor the
     action-count cap -- both of which exist to bound real work -- should
     move at all."""
@@ -327,6 +340,124 @@ def test_patch_and_replan_do_not_consume_budget_or_action_count() -> None:
     executor.execute(ReplanCall(targets=[ArtifactRef(artifact_id="a", version=1, kind=ArtifactKind.BLOCK)]))
     assert executor.budget.spent == before_budget
     assert executor.actions_taken == before_actions
+
+
+# -- PATCH / REPLAN: real dispatch once a repair executor is configured (Stage 5) --
+
+
+class _FakeRepairProducer:
+    """Deliberately NOT named ``_FakeProducer`` -- that name is already
+    bound later in this same module (the ``run_generation`` section below)
+    with a different constructor/return shape, and Python's module
+    namespace keeps only the *last* ``class`` statement bound to a given
+    name. A first version of this file reused that name here and was
+    silently shadowed: every test in this section actually ran against
+    the *other* class's fake producer (``content=None``, ``kind=SECTION``
+    always) without raising anything, since both satisfy the same
+    ``Producer`` Protocol shape. Picked a distinct name instead of
+    reordering the file, since a future addition anywhere in this module
+    could reintroduce the same collision either way -- distinct names are
+    the only fix that does not depend on definition order."""
+
+    def __init__(self, fail_ids: frozenset = frozenset()) -> None:
+        self.fail_ids = set(fail_ids)
+        self.calls: List[str] = []
+
+    def produce(self, artifact_id: str, context: Dict[str, Any]) -> ProductionResult:
+        self.calls.append(artifact_id)
+        if artifact_id in self.fail_ids:
+            return ProductionResult(status=ProductionStatus.FAILED, error="fake failure")
+        sink = context.get("usage_sink")
+        if sink is not None:
+            sink.append({"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})
+        return ProductionResult(
+            status=ProductionStatus.SUCCESS,
+            artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.BLOCK),
+            content=f"fixed:{artifact_id}",
+            read_input_versions=context.get("read_input_versions"),
+        )
+
+
+class _AlwaysPassRepairValidator:
+    def __init__(self) -> None:
+        self.config: Dict[str, bool] = {}
+
+    def check(
+        self, artifact: ArtifactRef, constraints: List[Constraint], context: Optional[Dict[str, Any]] = None
+    ) -> List[Evidence]:
+        return [Evidence(constraint_id="c0", outcome=CheckOutcome.PASS, checked_artifact=artifact)]
+
+
+def _executor_with_repairs(store: ArtifactGraphStore, *, cap: float = 1000.0, max_actions: int = 100) -> ToolExecutor:
+    return ToolExecutor(
+        store,
+        _AlwaysPassRepairValidator(),
+        budget=Budget(cap=cap),
+        max_actions=max_actions,
+        producer_registry={ArtifactKind.BLOCK: _FakeRepairProducer()},
+        constraint_provider=lambda ref: [
+            Constraint(constraint_id="c0", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[ref])
+        ],
+    )
+
+
+def test_patch_dispatches_for_real_once_a_repair_executor_is_configured() -> None:
+    store = ArtifactGraphStore()
+    ref = store.add_version("a", ArtifactKind.BLOCK, content="broken").ref
+    executor = _executor_with_repairs(store)
+    obs = executor.execute(PatchCall(target=ref))
+    assert obs.ok is True
+    assert obs.output.result.overall_outcome == RepairOutcome.RESOLVED
+    assert store.latest("a").content == "fixed:a"
+
+
+def test_replan_with_a_document_target_runs_the_unconditional_path() -> None:
+    """A single DOCUMENT-kind target must map to REGENERATE_DOCUMENT (the
+    executor's unconditional path), never to the selective cascade -- see
+    ``ToolExecutor._dispatch_replan``'s docstring."""
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    executor = ToolExecutor(
+        store,
+        _AlwaysPassRepairValidator(),
+        budget=Budget(cap=1000.0),
+        max_actions=100,
+        producer_registry={ArtifactKind.DOCUMENT: _FakeRepairProducer()},
+        constraint_provider=lambda ref: [],
+    )
+    obs = executor.execute(ReplanCall(targets=[doc_ref]))
+    assert obs.ok is True
+    from src.core.schemas import RepairActionType
+
+    assert obs.output.result.action.action_type == RepairActionType.REGENERATE_DOCUMENT
+
+
+def test_patch_and_replan_charge_the_executors_own_budget_once_configured() -> None:
+    """Unlike the schema-only case, a real dispatch must consume budget --
+    the nested generation/check calls inside RepairOperationExecutor route
+    through this same ToolExecutor's run_generation()/execute(CheckCall(...)),
+    so spent must increase by at least one real call's worth."""
+    store = ArtifactGraphStore()
+    ref = store.add_version("a", ArtifactKind.BLOCK, content="broken").ref
+    executor = _executor_with_repairs(store, cap=1000.0)
+    before = executor.budget.spent
+    obs = executor.execute(PatchCall(target=ref))
+    assert obs.ok is True
+    assert executor.budget.spent > before
+
+
+def test_patch_rejected_when_executor_is_already_suspended_even_with_a_repair_executor() -> None:
+    """Admission is still checked before any real dispatch -- a repair
+    executor being configured does not bypass Stage 3's own suspend/
+    budget/max-actions enforcement."""
+    store = ArtifactGraphStore()
+    ref = store.add_version("a", ArtifactKind.BLOCK, content="broken").ref
+    executor = _executor_with_repairs(store, cap=1000.0)
+    executor.suspend("test")
+    obs = executor.execute(PatchCall(target=ref))
+    assert obs.ok is False
+    assert obs.error.code == ToolErrorCode.SUSPENDED
+    assert obs.cost is None
 
 
 # -- FINISH -------------------------------------------------------------------

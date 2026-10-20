@@ -581,10 +581,14 @@ class Checkpoint(BaseModel):
 
 class ToolActionKind(str, Enum):
     """The controller's action vocabulary (revision direction 2), exactly as
-    the Stage 3 checklist names it. ``PATCH``/``REPLAN`` are intentionally
-    not implemented this stage -- see ``tool_executor.ToolExecutor``'s
-    docstring: actually deciding regeneration scope and carrying it out is
-    Stage 4's "고정 복구 정책" / Stage 5's controller, not Stage 3's.
+    the Stage 3 checklist names it. Through Stage 3, ``PATCH``/``REPLAN``
+    were intentionally not implemented -- see ``tool_executor.ToolExecutor``'s
+    docstring: actually deciding regeneration scope and carrying it out was
+    Stage 4's "고정 복구 정책". From Stage 5 on, a ``ToolExecutor`` constructed
+    with ``producer_registry``/``constraint_provider`` dispatches both for
+    real, through ``repair_operations.RepairOperationExecutor`` -- an
+    executor constructed without those still returns ``NOT_IMPLEMENTED``
+    for both, so every pre-Stage-5 caller's behavior is unchanged.
 
     ``GENERATE`` is not one of the controller's seven selectable actions
     (direction 2 never lists "generate" as something the controller
@@ -723,10 +727,17 @@ class CheckResult(BaseModel):
 
 
 class PatchCall(BaseModel):
-    """patch_block: schema only this stage -- see ``ToolActionKind``'s
-    docstring. Defined now so the input shape a Stage 4 executor will
-    actually dispatch on is already fixed and testable; calling it through
-    ``ToolExecutor`` always returns ``ToolErrorCode.NOT_IMPLEMENTED``."""
+    """patch: request a narrow, single-target repair. Schema-only through
+    Stage 4 (always ``ToolErrorCode.NOT_IMPLEMENTED`` when the executor was
+    not given a repair executor -- see ``tool_executor.ToolExecutor``'s
+    ``producer_registry``/``constraint_provider`` constructor args). From
+    Stage 5 on, an executor configured with those dispatches this for
+    real through ``repair_operations.RepairOperationExecutor``: ``target``'s
+    own ``ArtifactKind`` picks the recorded ``RepairActionType`` label
+    (BLOCK -> PATCH_BLOCK, SECTION -> REGENERATE_SECTION, anything else ->
+    REPLAN_SUBGRAPH with this one target) -- a labeling choice only, since
+    ``RepairOperationExecutor`` runs all three through the identical
+    selective cascade regardless of which label is attached."""
 
     action: Literal[ToolActionKind.PATCH] = ToolActionKind.PATCH
     target: ArtifactRef
@@ -734,12 +745,47 @@ class PatchCall(BaseModel):
 
 
 class ReplanCall(BaseModel):
-    """replan_subgraph: schema only this stage -- see ``PatchCall``'s
-    docstring; the same applies here."""
+    """replan: request a wider repair naming one or more targets. Same
+    Stage-3-schema-only / Stage-5-real split as ``PatchCall``. ``targets``'
+    shape picks the recorded ``RepairActionType``: a single DOCUMENT-kind
+    target -> REGENERATE_DOCUMENT (carried out by
+    ``RepairOperationExecutor``'s unconditional, non-selective path -- see
+    that class's docstring for why that one is deliberately not the same
+    mechanism as the other three); a single SECTION-kind target ->
+    REGENERATE_SECTION; anything else (multiple targets, or one
+    non-document/non-section target) -> REPLAN_SUBGRAPH over exactly the
+    given ``targets``. The controller, not this call or its dispatcher,
+    decides what belongs in ``targets`` -- this schema only describes the
+    shape it was given, it never consults a ``RepairPolicy`` of its own to
+    expand or narrow it."""
 
     action: Literal[ToolActionKind.REPLAN] = ToolActionKind.REPLAN
     targets: List[ArtifactRef]
     reason: Optional[str] = None
+
+
+class PatchToolResult(BaseModel):
+    """Real result of a dispatched ``PatchCall`` (Stage 5) -- wraps
+    ``repair_operations.RepairExecutionResult`` unchanged, the same "wrap
+    the real thing, don't re-derive a thinner view" principle
+    ``CompileToolResult``/``GenerateResult`` already use. ``RepairExecutionResult``
+    is defined later in this file (Stage 4 section); referencing it here by
+    name works because this module uses ``from __future__ import
+    annotations`` (deferred string annotations, resolved by pydantic the
+    first time this model is actually used/validated, by which point the
+    whole module -- including ``RepairExecutionResult`` -- has finished
+    executing)."""
+
+    action: Literal[ToolActionKind.PATCH] = ToolActionKind.PATCH
+    result: RepairExecutionResult
+
+
+class ReplanToolResult(BaseModel):
+    """Real result of a dispatched ``ReplanCall`` (Stage 5) -- see
+    ``PatchToolResult``'s docstring; the same applies here."""
+
+    action: Literal[ToolActionKind.REPLAN] = ToolActionKind.REPLAN
+    result: RepairExecutionResult
 
 
 class CompileCall(BaseModel):
@@ -844,6 +890,8 @@ ToolCallResult = Union[
     CompileToolResult,
     FinishToolResult,
     GenerateResult,
+    PatchToolResult,
+    ReplanToolResult,
 ]
 
 
@@ -1126,3 +1174,103 @@ class BranchComparisonResult(BaseModel):
 
     source_checkpoint_id: str
     branches: List[BranchExecutionResult] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 ("LangGraph 기반 자율 controller MVP") schemas. Behavior lives in
+# ``src/core/controller.py`` (``ControllerPolicy`` Protocol,
+# ``RuleBasedController``/``LLMController``, the LangGraph graph itself) --
+# same schema/behavior split every earlier stage follows. Nothing below
+# imports ``langgraph`` -- these stay plain, testable, serializable data
+# shapes regardless of which graph runtime (if any) ends up driving them.
+# ---------------------------------------------------------------------------
+
+
+class ControllerStopReason(str, Enum):
+    """Why one controller episode stopped -- direction 2's completion
+    criterion ("종료 조건과 미해결 항목을 기록하고 종료") plus the Stage 5
+    checklist's explicit anti-infinite-loop/budget-overrun guards, each
+    given its own distinct value rather than folded into one generic
+    "finished" so a caller can tell a clean stop from a forced one."""
+
+    FINISHED = "finished"
+    MAX_STEPS_REACHED = "max_steps_reached"
+    REPEATED_ACTION_DETECTED = "repeated_action_detected"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+
+
+class ControllerStepRecord(BaseModel):
+    """One (action, observation) pair in the controller's own execution
+    trace -- the Stage 5 completion criterion's "관찰 결과가 달라지면 다음
+    행동과 복구 범위가 달라지는 실행 trace". Kept directly on
+    ``ControllerState`` rather than left only reconstructible from
+    ``ArtifactGraphStore.log.tool_calls``, because this list travels with
+    the LangGraph state itself across a checkpoint/resume -- a durable
+    resume reconstructs the artifact store under a *new* ``branch_id``
+    (Stage 2's own "복원 후 다시 LLM을 호출하는 후속 실행은 별도 run으로
+    기록한다" rule), which would otherwise leave the pre-resume portion of
+    this trace stranded in a branch nothing still reads.
+
+    ``call_summary`` is a short, deterministic one-line identity for the
+    dispatched call (e.g. ``"check:doc@3"``, ``"patch:block_2@1"``) -- used
+    both for the human-readable trace and, by equality, as this stage's
+    "동일 수정 반복" (repeated-fix) detector; see
+    ``controller._repeated_action``."""
+
+    step_index: int
+    action: ToolActionKind
+    call_summary: str
+    ok: bool
+    error_code: Optional[ToolErrorCode] = None
+
+
+class ControllerState(BaseModel):
+    """Typed state threaded through the Stage 5 LangGraph loop (a
+    ``controller`` node decides the next action, a ``tool`` node executes
+    it, a conditional edge routes back to ``controller`` or to ``END``) --
+    the checklist's own "typed state, conditional routing, checkpoint/
+    resume" triad made concrete as one pydantic model.
+
+    ``checkpoint`` is a periodic snapshot of the live ``ArtifactGraphStore``
+    driving this episode (refreshed by the ``tool`` node after every real
+    dispatch) -- not the live store itself, which stays held by
+    ``controller.ControllerRuntime`` across node calls within one episode,
+    so a normal step does not fragment one continuous run into a new
+    ``branch_id`` per step (``ArtifactGraphStore.from_checkpoint`` always
+    requires a fresh ``branch_id``, by design -- see that method's
+    docstring). This field exists so (a) LangGraph's own checkpointer can
+    snapshot/replay the whole typed state in-process, and (b) an actual
+    crash/interruption has something durable
+    (``Checkpoint.model_dump_json()``-serializable) to resume from under a
+    new ``branch_id`` -- see ``controller.ControllerRuntime.resume_from_checkpoint``.
+
+    ``pending_tool_call`` is set by the ``controller`` node and consumed by
+    the ``tool`` node in the very next step -- deciding and executing never
+    happen in the same node, mirroring this project's existing
+    decide-then-separately-execute discipline (``interfaces.RepairPolicy``'s
+    docstring)."""
+
+    document_ref: ArtifactRef
+    checkpoint: Checkpoint
+    budget: Budget
+    current_evidence: List[Evidence] = Field(default_factory=list)
+    compiled: bool = False
+    step_count: int = 0
+    history: List[ControllerStepRecord] = Field(default_factory=list)
+    pending_tool_call: Optional["ToolCall"] = Field(default=None, discriminator="action")
+    done: bool = False
+    stop_reason: Optional[ControllerStopReason] = None
+
+
+class LLMControllerDecision(BaseModel):
+    """The LLM controller's structured-output contract: exactly one next
+    ``ToolCall``, plus a short rationale kept only for the execution trace
+    -- never fed back into any decision logic itself, the same "an LLM's
+    own reported confidence/rationale is not a calibrated signal" caution
+    direction 2 gives generally. A plain wrapper, not the bare ``ToolCall``
+    union directly, because most structured-output APIs require one
+    top-level JSON object as the schema root, not a bare discriminated
+    union."""
+
+    call: "ToolCall" = Field(discriminator="action")
+    rationale: str = ""

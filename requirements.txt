@@ -13,5 +13,12 @@ httpx>=0.27
 tenacity>=8.0
 PyYAML>=6.0
 
+# src/core/controller.py (Stage 5 LangGraph controller MVP). Pinned exactly
+# (not >=) -- this project's convention for a dependency whose behavior
+# across major versions is not re-verified here each time (see the
+# qwen_vllm_local_llm_setup memory's identical vllm==0.19.1 pin for the
+# same reasoning).
+langgraph==1.2.16
+
 # Dev/test only, used by test/dataset/*.
 pytest>=8.0
