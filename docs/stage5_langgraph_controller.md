@@ -328,3 +328,104 @@ bare `Checkpoint`+`Budget`이 아니라 **직전 전체 `ControllerState`**를 �
 인자 추가, 기존 동작 불변), `src/core/schemas.py`(`ControllerState`에 `tracked_artifact_ids`/
 `blocked_artifact_ids`/`last_compile_failed`/`actions_taken`/`suspended`/`suspend_reason`
 추가, `ControllerStepRecord`에 `detail` 추가), `src/core/controller.py`(위 6.1-6.6 전체).
+
+## 7. 사용자 2차 재검토 후 수정 (2026-10-20)
+
+6절 수정을 반영한 코드를 사용자가 다시 리뷰해 5건을 추가로 지적했다 — 이번에는
+`tool_executor.py` 변경 없이 `artifact_graph.py`/`schemas.py`/`controller.py` 세 파일만
+바꿔서 전부 해결했다. 전체 상세는 `src/core/controller.py`의 모듈 docstring(8-12번 항목)과
+메모리 `docgen_stage_review_rigor`(패턴 #43 이후)에도 동일하게 남겼다.
+
+### 7.1 최종 PASS가 과거의 superseded FAIL에 덮임
+
+`a → b`에서 cascade가 `[b, a]` 순서로 돈다: `b`를 먼저 재생성하면 아직 `a`가 안 고쳐져서
+STILL_FAILING(기록은 `b@2`), 나중에 `a`를 고치고 나서야 cascade 자신의 재검사 sweep이 `b`를
+다시 확인해 — 내용은 그대로지만(`_reaffirm`) — `b@3`에 새 PASS를 재결합시킨다.
+`final_outcome_by_artifact["b"]`는 정확히 RESOLVED를 보고하는데, `_tool_node`는
+`regenerated[*].reverify_evidence`만 훑어서(`reverified_untouched`는 아예 보지 않음) 첫
+sweep의 stale FAIL을 다시 merge해버렸다 — `RepairExecutionResult` 자신의 docstring이 이미
+경고하는, "regenerated/reverified_untouched를 스캔해서 현재 상태를 재해석하지 말라"는 바로
+그 실수였다.
+
+**수정** (두 가지, 서로 다른 원인이라 둘 다 필요했다):
+- `_tool_node`의 PATCH/REPLAN 분기가 이제 `regenerated`/`reverified_untouched`를 전혀
+  스캔하지 않고, touched artifact마다 `ArtifactGraphStore.live_evidence()`를 새로 당겨온다 —
+  regenerate든 reaffirm이든 어느 경로로 settle됐는지와 무관하게 항상 "지금 이 artifact의
+  현재 버전에 대한 진짜 최신 판정"을 돌려주는, 이미 검증된 메서드다.
+- `ArtifactGraphStore._evidence_is_live()`(따라서 `is_evidence_still_valid()`)가 이제
+  `checked_artifact`가 **자기 artifact_id의 현재 버전인지**도 함께 검사한다 — 그 verdict
+  자신의 입력이 전혀 안 바뀌었어도, subject 자체가 더 새 버전으로 superseded됐다면 그
+  verdict는 결코 live가 아니다. `live_evidence()`가 내부적으로 이 메서드를 호출하는
+  지점에서는 이미 현재 버전으로 사전 필터링된 항목만 넘기므로 영향이 없고, 여러 스텝에
+  걸친 controller 자신의 evidence 캐시에만 실제로 의미 있는 강화다.
+
+### 7.2 무효화된 제약을 지운 뒤 재검사 없이 끝날 수 있음
+
+문서에 제약 A=FAIL, B=PASS가 있고, A가 의존하는 `Evidence.input_versions`의 artifact만
+바뀌는 경우(그 관계가 graph edge로는 전혀 선언되지 않아서 문서 자신은 `is_stale()`이 절대
+안 됨) — merge는 A의 무효화된 FAIL을 정확히 지우고 B의 유효한 PASS는 그대로 남기지만,
+`_classify()`는 남은 B의 PASS만 보고 "깨끗하다"고 읽어 COMPILE/FINISH로 그냥 진행했다.
+
+**수정**: `ControllerState`에 `needs_recheck_ids`를 추가했다. `_tool_node`의 CHECK/PATCH/
+REPLAN 두 분기 모두, merge 과정에서 `is_evidence_still_valid()`가 False로 판정해 떨어져
+나가는 항목이 있으면 그 artifact_id를 이 집합에 넣는다(해당 artifact를 실제로 다시 검사한
+분기에서는 그 artifact_id를 즉시 뺀다). `_compute_unresolved()`가 이 집합도 합치고,
+`RuleBasedController.decide()`는 "이미 evidence가 있다"는 판단에서 `needs_recheck_ids`에
+속한 artifact_id를 제외한다 — 그래서 다른 제약의 evidence가 남아있어도 "완전히
+확인됐다"고 보지 않고 다시 CHECK한다.
+
+### 7.3 LLM 결정 직후 중단되는 resume이 여전히 불완전함
+
+6.5에서 **도구 실행이 끝난 뒤**의 상태 복원은 고쳤지만, `_controller_node()` 자체가
+`self._policy.decide()`를 부르는 동안(LLM controller라면 `run_generation()`으로 실제 비용을
+씀) 반환하는 state 갱신은 `pending_tool_call`뿐이었다 — 실제 executor는 7토큰·1 action을
+썼는데 직렬화된 state는 0/0으로 남았고, 그 지점에서 resume하면 이미 결정되고 이미 비용을
+지불한 행동이 통째로 버려지고 LLM을 다시 불러 다른 행동으로 덮어썼다.
+
+**수정**: `_controller_node`가 반환 직전에(guard 경로·`decide()` 경로 모두 공통으로 딱 한
+번, **반드시 `call`이 확정된 뒤**) `checkpoint`/`budget`/`actions_taken`/`suspended`/
+`suspend_reason`을 이 runtime의 실제 `ToolExecutor`/`store`에서 새로 읽어 함께 반환한다
+(처음 구현에서는 이 스냅샷을 `decide()` 호출 *전*에 미리 찍어버리는 실수를 스스로 내서,
+새로 추가한 회귀 테스트로 바로 잡았다). 그리고 `_build_graph()`가 `START`를 고정
+`add_edge` 대신 새 조건부 edge(`_route_at_start`)로 바꿔, 재개한 state가 이미
+`pending_tool_call`을 들고 있으면 `controller`를 다시 거치지 않고 곧장 `tool`로 가서 그
+행동을 그대로 실행한다.
+
+### 7.4 강제 종료 시 미해결 artifact 목록이 빠짐
+
+`_controller_node`의 max-step·반복 guard가 `FinishCall.unresolved_artifact_ids`에
+`store.stale_artifacts`만 넣었다 — 의존성 때문이 아니라 **내용 자체가 FAIL**이거나
+`blocked_artifact_ids`에 남은 artifact는 한 번도 `is_stale()`이 된 적이 없어서 완전히
+빠졌다. 실제로 `doc`이 FAIL이고 `blocked_artifact_ids={"doc"}`인데도
+`max_steps_reached`의 `unresolved_artifact_ids=[]`가 나왔다.
+
+**수정**: 새 `_aggregate_unresolved(state, store)`를 추가했다 — `_compute_unresolved()`(이제
+`needs_recheck_ids`도 포함) ∪ 현재 evidence 중 FAIL/UNKNOWN인 artifact_id ∪ (마지막 컴파일이
+실패했다면 문서 자신). 이 함수를 guard 두 곳은 물론 `RuleBasedController`/`LLMController`가
+만드는 **모든** `FinishCall`에 공통으로 적용해, 어느 경로로 멈췄는지와 무관하게 항상 같은
+완전한 그림을 보고하게 했다.
+
+### 7.5 LLM controller에 실제 compile 실행 설정이 전달되지 않음
+
+생성자가 받은 `request_id`/`output_dir`를 프롬프트에도, 반환된 `CompileCall`에도 전혀
+반영하지 않았다 — 모델이 `compile`을 선택해도 어떤 `request_id` 밑에서 컴파일해야 하는지
+알 방법이 없었다.
+
+**수정**: 양쪽 다 고쳤다. 프롬프트에 "compile을 선택하면 request_id/output_dir는 항상
+`{request_id}`/`{output_dir}`로 강제된다"는 문장을 추가해 모델이 참고하게 하고,
+`LLMController.decide()`는 모델이 반환한 `CompileCall`이 있으면 `request_id`/`output_dir`를
+생성자가 알고 있는 값으로 무조건 덮어쓴다 — 모델은 "언제 compile할지"는 계속 스스로
+판단하지만 "어느 경로로 compile할지"는 더 이상 모델의 출력을 신뢰하지 않는다.
+
+### 검증
+
+`test/core/test_controller.py`가 27개→34개로 늘었다(신규 7개, 5건의 버그 각각에 최소 1개
+이상의 회귀 테스트). `test/core/` 251→258개 전부 통과. 전체 저장소 기준 804 passed, 기존과
+동일한 57건(무관) + 끊어진 테스트 파일 1개(동일) 외 회귀 없음. 변경된 파일:
+`src/core/artifact_graph.py`(`_evidence_is_live`에 버전-최신성 검사 추가),
+`src/core/schemas.py`(`ControllerState`에 `needs_recheck_ids` 추가),
+`src/core/controller.py`(위 7.1-7.5 전체 — `_invalidated_ids`/`_aggregate_unresolved` 신규,
+`_compute_unresolved`에 `needs_recheck_ids` 인자 추가, `_tool_node`의 PATCH/REPLAN 병합을
+`live_evidence()` 기반으로 교체, `_controller_node`의 상태 스냅샷을 `decide()` 호출 뒤로
+이동, `_build_graph`에 `START` 조건부 edge 추가). `tool_executor.py`는 이번 라운드에는
+변경하지 않았다.

@@ -583,35 +583,63 @@ class ArtifactGraphStore:
         return self.get_version(ref.artifact_id, ref.version) is None
 
     def _evidence_is_live(self, item: Evidence) -> bool:
-        """Whether every input a verdict actually depended on still holds
-        -- every ``input_versions`` entry is still live (``_ref_is_live``)
-        *and* every ``missing_inputs`` entry is still missing at that
-        exact version (``_still_missing``). Split out of ``live_evidence``
-        so it can be applied strictly *after* the single
+        """Whether ``item`` still describes a trustworthy verdict about its
+        own ``checked_artifact``: that ref must still be the CURRENT
+        version of its artifact_id (a caught review repro -- see
+        ``is_evidence_still_valid``'s docstring, point 1 below), and every
+        input the verdict actually depended on must still hold -- every
+        ``input_versions`` entry is still live (``_ref_is_live``) *and*
+        every ``missing_inputs`` entry is still missing at that exact
+        version (``_still_missing``). Split out of ``live_evidence`` so it
+        can be applied strictly *after* the single
         most-recent-per-``constraint_id`` entry has already been picked --
         see that method's docstring for why the order between "pick
-        latest" and "check validity" is not interchangeable."""
+        latest" and "check validity" is not interchangeable.
+
+        1. The ``checked_artifact`` version-currency check is redundant for
+           ``live_evidence()``'s own call site (it only ever hands this
+           method entries it already pre-filtered to the current version),
+           but NOT for ``is_evidence_still_valid()``'s direct callers,
+           which may hold a cached verdict spanning several versions back --
+           a user review of Stage 5's controller caught a real repro: a
+           repair cascade processed out of dependency order (``[b, a]``
+           where ``b`` depends on ``a``) regenerates ``b`` once (STILL_
+           FAILING, recorded against ``b@2``), then -- once ``a`` is fixed
+           afterward -- re-verifies ``b`` again with no further content
+           change, which ``_reaffirm`` records as a NEW version ``b@3``
+           with the fresh PASS rebound to it. The stale FAIL recorded
+           against ``b@2`` has no invalidated input of its own (nothing it
+           read moved) and so, without this check, still reads as "live"
+           forever after -- even though ``b`` itself has since moved on to
+           a different, superseding version. A verdict about a version that
+           is no longer current is never live, regardless of what its own
+           inputs did."""
+        current = self.latest(item.checked_artifact.artifact_id)
+        if current is None or current.ref.version != item.checked_artifact.version:
+            return False
         return all(self._ref_is_live(ref) for ref in item.input_versions) and all(
             self._still_missing(ref) for ref in item.missing_inputs
         )
 
     def is_evidence_still_valid(self, item: Evidence) -> bool:
-        """Public wrapper over ``_evidence_is_live`` -- whether every input
-        ``item`` actually depended on (``input_versions``/``missing_inputs``)
-        still holds, *without* the additional "``checked_artifact`` itself
-        is not stale" gate ``live_evidence()`` applies on top (added in
-        Stage 5: a caller tracking its own evidence across time needs to
-        tell "this verdict's own inputs moved" apart from "the artifact
-        this verdict is ABOUT is, unsurprisingly, still stale because the
-        repair that produced it never actually succeeded" -- the latter is
-        not a reason to discard a genuinely fresh verdict about that
-        artifact's current, stale content; ``live_evidence()``'s stricter
-        reading is correct for *its* purpose ("is there a trustworthy
-        verdict about this artifact's current settled state", which a
-        still-stale artifact definitionally does not have) but wrong for a
-        caller that specifically wants to know "did my last check of this
-        (possibly still-stale) target's content get invalidated by
-        something ELSE changing under it"."""
+        """Public wrapper over ``_evidence_is_live`` -- whether ``item``
+        still names the CURRENT version of its own ``checked_artifact``
+        (see that method's docstring, point 1) and every input ``item``
+        actually depended on (``input_versions``/``missing_inputs``) still
+        holds, *without* the additional "``checked_artifact`` itself is not
+        stale" gate ``live_evidence()`` applies on top (added in Stage 5: a
+        caller tracking its own evidence across time needs to tell "this
+        verdict's own inputs moved" apart from "the artifact this verdict
+        is ABOUT is, unsurprisingly, still stale because the repair that
+        produced it never actually succeeded" -- the latter is not a reason
+        to discard a genuinely fresh verdict about that artifact's current,
+        stale content; ``live_evidence()``'s stricter reading is correct
+        for *its* purpose ("is there a trustworthy verdict about this
+        artifact's current settled state", which a still-stale artifact
+        definitionally does not have) but wrong for a caller that
+        specifically wants to know "did my last check of this (possibly
+        still-stale) target's content get invalidated by something ELSE
+        changing under it"."""
         return self._evidence_is_live(item)
 
     def live_evidence(self, artifact_id: str) -> List[Evidence]:

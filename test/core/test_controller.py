@@ -300,7 +300,18 @@ def test_production_failure_does_not_let_the_controller_proceed_to_compile() -> 
     Stage 5 pass dropped the evidence for it without replacing it with
     anything, so the controller eventually read "nothing failing" and
     proceeded straight to COMPILE despite the artifact never actually
-    having been fixed."""
+    having been fixed.
+
+    Stop reason is REPEATED_ACTION_DETECTED, not MAX_STEPS_REACHED: "doc"
+    never changes version (production keeps failing), so
+    ``store.live_evidence("doc")`` keeps handing back the exact same FAIL
+    evidence every round (point 8 of this module's docstring) and the
+    policy keeps choosing the identical ``replan:doc@1`` -- the repeat
+    guard correctly catches this in 5 steps rather than grinding to
+    max_steps=10. The first Stage 5 pass's bug actually masked this: with
+    the old merge dropping "doc"'s evidence and never replacing it, the
+    controller alternated CHECK/REPLAN instead of repeating REPLAN
+    identically, which happened to dodge the repeat detector."""
     store = ArtifactGraphStore(branch_id="episode-prod-fail")
     doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
     policy = RuleBasedController(doc_ref, _constraint_provider, request_id="req1", output_dir="/tmp/x")
@@ -318,9 +329,13 @@ def test_production_failure_does_not_let_the_controller_proceed_to_compile() -> 
     final_state = runtime.run(thread_id="t-prod-fail")
     assert final_state.done is True
     assert not any(record.action == ToolActionKind.COMPILE for record in final_state.history)
-    assert final_state.stop_reason == ControllerStopReason.MAX_STEPS_REACHED
+    assert final_state.stop_reason == ControllerStopReason.REPEATED_ACTION_DETECTED
     assert "doc" in final_state.tracked_artifact_ids
     assert store.latest("doc").ref.version == 1  # production never actually succeeded, ever
+    # Bug 11 regression: a guard-forced stop must still report "doc" as
+    # unresolved (via blocked_artifact_ids), not an empty list just
+    # because "doc" was never is_stale()-true.
+    assert "doc" in final_state.history[-1].detail
 
 
 def test_production_failure_on_a_never_stale_artifact_is_not_hidden_by_an_unrelated_pass() -> None:
@@ -423,7 +438,7 @@ def test_tool_node_keeps_a_cascade_discovered_no_producer_failure_tracked_as_unr
     assert result.final_outcome_by_artifact["b"].value == "no_producer"
     assert store.is_stale("b") is True
 
-    unresolved = _compute_unresolved(store, {"a", "b", "c"}, set())
+    unresolved = _compute_unresolved(store, {"a", "b", "c"}, set(), set())
     assert unresolved == {"b"}
 
 
@@ -755,6 +770,286 @@ def test_llm_controller_executes_a_valid_structured_decision() -> None:
     assert final_state.stop_reason == ControllerStopReason.FINISHED
     assert generator.calls == 1
     assert final_state.history[0].call_summary == "finish:llm says done"
+
+
+# -- Second review round: bugs 8-12 (see controller.py's module docstring) --
+
+
+def test_tool_node_pulls_a_later_true_pass_over_an_earlier_superseded_fail_in_a_cascade() -> None:
+    """Bug 8 repro: a -> b, a cascade regenerates in the order [b, a]. "b"
+    still fails right after its own regenerate (checked while "a" was
+    still unfixed), recorded as STILL_FAILING against b@2 -- only once
+    "a" is fixed afterward does the cascade's own sweep re-verify "b"
+    again, confirming it clean with no further content change
+    (_reaffirm, which still writes a new version, b@3, with the fresh
+    PASS rebound to it: visible only via ArtifactGraphStore.live_evidence()/
+    reverified_untouched, never regenerated[*].reverify_evidence, which
+    still only shows the earlier, now-superseded STILL_FAILING attempt).
+    The Validator here deliberately never declares "b"'s dependency on
+    "a" via Evidence.input_versions (read directly off the store instead,
+    the way many real content checks work) -- so input-version tracking
+    alone could never catch this; it specifically exercises the OTHER
+    half of the fix, the version-currency check on checked_artifact
+    itself."""
+    store = ArtifactGraphStore(branch_id="episode-cascade-order")
+    a_ref = store.add_version("a", ArtifactKind.BLOCK, content="a-old").ref
+    store.add_version("b", ArtifactKind.BLOCK, content="b1", read_input_versions=[a_ref])
+
+    class _DependsOnCurrentA:
+        def __init__(self, store: ArtifactGraphStore) -> None:
+            self._store = store
+            self.config: Dict[str, bool] = {}
+
+        def check(self, artifact, constraints, context=None):  # noqa: ANN001
+            a_fixed = self._store.latest("a").ref.version >= 2
+            if artifact.artifact_id == "a":
+                outcome = CheckOutcome.PASS if artifact.version >= 2 else CheckOutcome.FAIL
+            else:
+                outcome = CheckOutcome.PASS if a_fixed else CheckOutcome.FAIL
+            return [Evidence(constraint_id=c.constraint_id, outcome=outcome, checked_artifact=artifact) for c in constraints]
+
+    policy = RuleBasedController(a_ref, _constraint_provider, request_id="req1", output_dir="/tmp/x")
+    runtime = ControllerRuntime(
+        store,
+        policy,
+        _DependsOnCurrentA(store),
+        {ArtifactKind.BLOCK: _FakeProducer()},
+        _constraint_provider,
+        document_ref=a_ref,
+        budget=Budget(cap=1000.0),
+    )
+    from src.core.schemas import ReplanCall
+
+    b_ref = store.latest("b").ref
+    state = ControllerState(
+        document_ref=a_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        pending_tool_call=ReplanCall(targets=[b_ref, a_ref]),
+        tracked_artifact_ids={"a", "b"},
+    )
+    updates = runtime._tool_node(state)
+
+    assert updates["blocked_artifact_ids"] == set()
+    assert updates["needs_recheck_ids"] == set()
+    by_artifact = {item.checked_artifact.artifact_id: item for item in updates["current_evidence"]}
+    assert by_artifact["b"].outcome == CheckOutcome.PASS
+    assert by_artifact["b"].checked_artifact.version == store.latest("b").ref.version == 3
+
+    # The next decision must NOT re-select a repair against the
+    # now-superseded b@2 just because a stale FAIL for it lingered.
+    next_state = state.model_copy(update=updates)
+    next_call = policy.decide(next_state, store, runtime._tool_executor)
+    assert next_call.action.value == "compile"
+
+
+def test_invalidated_constraint_is_queued_for_recheck_not_silently_dropped() -> None:
+    """Bug 9 repro: "doc" has constraint A=FAIL (depending on "z" only via
+    Evidence.input_versions, never via a graph edge -- so "doc" itself
+    never becomes is_stale()) and constraint B=PASS (independent). "z"
+    then changes for an unrelated reason. The merge correctly drops A's
+    now-invalid FAIL and keeps B's still-valid PASS -- but must not let
+    that read as "doc is fully covered": A is owed a fresh recheck."""
+    store = ArtifactGraphStore(branch_id="episode-needs-recheck")
+    z_ref = store.add_version("z", ArtifactKind.BLOCK, content="z1").ref
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="docv1").ref
+
+    fail_evidence = Evidence(
+        constraint_id="A", outcome=CheckOutcome.FAIL, checked_artifact=doc_ref, input_versions=[z_ref], detail="depends on z"
+    )
+    pass_evidence = Evidence(constraint_id="B", outcome=CheckOutcome.PASS, checked_artifact=doc_ref)
+
+    policy = RuleBasedController(doc_ref, _constraint_provider, request_id="req1", output_dir="/tmp/x")
+    runtime = ControllerRuntime(
+        store,
+        policy,
+        _VersionThresholdValidator(fail_below_version=0),  # always PASSes -- "z"'s own check is irrelevant here
+        {ArtifactKind.BLOCK: _FakeProducer()},
+        _constraint_provider,
+        document_ref=doc_ref,
+        budget=Budget(cap=1000.0),
+    )
+    from src.core.schemas import PatchCall
+
+    state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        current_evidence=[fail_evidence, pass_evidence],
+        tracked_artifact_ids={"doc", "z"},
+        pending_tool_call=PatchCall(target=z_ref),
+    )
+    updates = runtime._tool_node(state)
+
+    assert store.is_stale("doc") is False  # confirmed: no graph edge z->doc, so staleness never propagates
+    by_constraint = {
+        item.constraint_id: item for item in updates["current_evidence"] if item.checked_artifact.artifact_id == "doc"
+    }
+    assert "A" not in by_constraint  # the invalidated FAIL is gone
+    assert by_constraint["B"].outcome == CheckOutcome.PASS  # the still-valid PASS survives untouched
+    assert "doc" in updates["needs_recheck_ids"]
+
+    # The next decision must re-CHECK "doc" rather than treat B's lone
+    # surviving PASS as proof everything required is already covered.
+    next_state = state.model_copy(update=updates)
+    next_call = policy.decide(next_state, store, runtime._tool_executor)
+    assert next_call.action.value == "check"
+    assert next_call.artifact.artifact_id == "doc"
+
+
+def test_controller_node_syncs_cost_and_counters_right_after_an_llm_decision() -> None:
+    """Bug 10a repro: the real executor charged 7 tokens/1 action inside
+    LLMController.decide()'s own run_generation() call, but
+    _controller_node's returned update used to carry only
+    pending_tool_call -- a checkpoint/resume landing right here would
+    have serialized budget=0 spent / actions_taken=0 despite the real
+    executor already reflecting otherwise."""
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    decision_json = '{"call": {"action": "finish", "reason": "done", "unresolved_artifact_ids": []}, "rationale": ""}'
+    generator = _FakeLLMGenerator([decision_json], tokens_per_call=7)
+    policy = LLMController(doc_ref, generator, request_id="req1")
+    runtime = ControllerRuntime(
+        store,
+        policy,
+        _AlwaysFailValidator(),
+        {ArtifactKind.DOCUMENT: _FakeProducer()},
+        _constraint_provider,
+        document_ref=doc_ref,
+        budget=Budget(cap=1000.0),
+    )
+    state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        tracked_artifact_ids={"doc"},
+    )
+    updates = runtime._controller_node(state)
+    assert updates["actions_taken"] == 1
+    assert updates["budget"].spent == 7
+    assert updates["pending_tool_call"] is not None
+
+
+def test_resume_with_a_pending_call_executes_it_without_asking_the_policy_again() -> None:
+    """Bug 10b repro: a prior episode was interrupted right after
+    _controller_node set pending_tool_call but before _tool_node ever
+    executed it. run() used to always re-enter at controller regardless,
+    silently discarding that already-decided (and, for an LLM controller,
+    already-paid-for) action and asking the policy again -- which could
+    pick something else entirely. A tripwire policy here would make that
+    visible immediately: it is asked for a real decision exactly once,
+    strictly AFTER the pending INSPECT already ran, never instead of it."""
+    store = ArtifactGraphStore(branch_id="original")
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    checkpoint = store.save_checkpoint()
+
+    class _TripwirePolicy:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def decide(self, state, store, tool_executor):  # noqa: ANN001 - Protocol signature
+            self.calls += 1
+            from src.core.schemas import FinishCall
+
+            return FinishCall(reason="should_never_be_asked_before_the_pending_call", unresolved_artifact_ids=[])
+
+    from src.core.schemas import InspectArtifactCall
+
+    prior_state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=checkpoint,
+        budget=Budget(cap=1000.0),
+        pending_tool_call=InspectArtifactCall(artifact_id="doc"),
+        tracked_artifact_ids={"doc"},
+    )
+    policy = _TripwirePolicy()
+
+    def checker_factory(resumed_store: ArtifactGraphStore) -> _AlwaysFailValidator:
+        return _AlwaysFailValidator()
+
+    resumed_runtime = ControllerRuntime.resume_from_checkpoint(
+        prior_state,
+        policy,
+        checker_factory,
+        {ArtifactKind.DOCUMENT: _FakeProducer()},
+        _constraint_provider,
+        new_branch_id="resumed",
+        max_steps=5,
+        repeat_threshold=3,
+    )
+    final_state = resumed_runtime.run(thread_id="t-resume-pending")
+
+    assert final_state.history[0].action.value == "inspect"  # the pending call ran FIRST
+    assert final_state.history[0].ok is True
+    assert policy.calls == 1  # asked exactly once -- for the step AFTER the pending call, never instead of it
+    assert final_state.history[1].call_summary == "finish:should_never_be_asked_before_the_pending_call"
+
+
+def test_max_steps_guard_reports_a_content_level_failure_that_was_never_stale() -> None:
+    """Bug 11 repro: "doc" is FAILing its own content check (current
+    evidence) and sitting in blocked_artifact_ids, but is NEVER
+    is_stale()-true -- a guard-forced FinishCall that only ever read
+    store.stale_artifacts reported unresolved_artifact_ids=[] regardless."""
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    assert store.is_stale("doc") is False
+    policy = RuleBasedController(doc_ref, _constraint_provider, request_id="req1", output_dir="/tmp/x")
+    runtime = ControllerRuntime(
+        store,
+        policy,
+        _AlwaysFailValidator(),
+        {ArtifactKind.DOCUMENT: _FakeProducer()},
+        _constraint_provider,
+        document_ref=doc_ref,
+        budget=Budget(cap=1000.0),
+        max_steps=3,
+        repeat_threshold=100,
+    )
+    state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        current_evidence=[Evidence(constraint_id="c0", outcome=CheckOutcome.FAIL, checked_artifact=doc_ref)],
+        tracked_artifact_ids={"doc"},
+        blocked_artifact_ids={"doc"},
+        step_count=3,  # already at max_steps
+    )
+    updates = runtime._controller_node(state)
+    call = updates["pending_tool_call"]
+    assert call.reason == "max_steps_reached"
+    assert call.unresolved_artifact_ids == ["doc"]
+    assert store.stale_artifacts == frozenset()  # the old signal alone would have reported nothing
+
+
+def test_llm_controller_forces_its_own_request_id_and_output_dir_onto_a_compile_call() -> None:
+    """Bug 12 repro: the model echoes back a request_id/output_dir that do
+    not match this episode's actual execution config -- the controller
+    must never trust that, since it already knows the one correct pair
+    and the model has no legitimate way to know a different one is
+    right."""
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    decision_json = (
+        '{"call": {"action": "compile", "request_id": "wrong-request", "output_dir": "/wrong/dir"}, "rationale": ""}'
+    )
+    generator = _FakeLLMGenerator([decision_json])
+    policy = LLMController(doc_ref, generator, request_id="req1", output_dir="/tmp/correct")
+    tool_executor = ToolExecutor(store, _AlwaysFailValidator(), budget=Budget(cap=1000.0), max_actions=10)
+    state = ControllerState(document_ref=doc_ref, checkpoint=store.save_checkpoint(), budget=Budget(cap=1000.0))
+    call = policy.decide(state, store, tool_executor)
+    assert call.action.value == "compile"
+    assert call.request_id == "req1"
+    assert call.output_dir == "/tmp/correct"
+
+
+def test_llm_controller_prompt_states_the_authoritative_compile_config() -> None:
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    policy = LLMController(doc_ref, _FakeLLMGenerator([]), request_id="req1", output_dir="/tmp/correct")
+    state = ControllerState(document_ref=doc_ref, checkpoint=store.save_checkpoint(), budget=Budget(cap=100.0))
+    prompt = policy._user_prompt(state, store)
+    assert "req1" in prompt
+    assert "/tmp/correct" in prompt
 
 
 # -- Anti-infinite-loop / repeated-fix guard ---------------------------------

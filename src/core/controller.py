@@ -140,6 +140,106 @@ pass** (recorded in Notion Progress.ver2, the 2026-10-20 Stage 5 entry):
    (``interfaces.py``: never raise past this boundary for an expected,
    routine failure).
 
+**Revised a second time after a user review found 5 more real bugs**
+(full pattern detail in memory ``docgen_stage_review_rigor``):
+
+8. A later, truer PASS could still lose to an earlier, superseded FAIL.
+   Repro: ``a -> b``, a cascade processes targets ``[b, a]`` in that
+   order -- ``b`` is regenerated first and still fails (``a`` is not
+   fixed yet), recorded as ``STILL_FAILING`` against ``b@2``; only once
+   ``a`` is fixed afterward does the cascade's own sweep re-verify ``b``
+   again, this time confirming it clean with no further content change
+   (``_reaffirm``, which still writes a new version, ``b@3``, with the
+   fresh PASS rebound to it). ``final_outcome_by_artifact["b"]`` correctly
+   reads ``RESOLVED`` -- but ``_tool_node`` only ever scanned
+   ``regenerated[*].reverify_evidence`` (the STILL_FAILING record from the
+   first sweep), never ``reverified_untouched`` (bare ``ArtifactRef``s
+   with no evidence attached at all) or the store's own log, so it kept
+   re-merging the stale FAIL and the controller chose ``patch:b@2`` again
+   on the very next step despite the store itself agreeing nothing was
+   still wrong. Two independent fixes, because this had two independent
+   causes: (a) ``_tool_node``'s PATCH/REPLAN branch now re-pulls
+   ``ArtifactGraphStore.live_evidence()`` fresh for every touched id
+   instead of scanning ``regenerated``/``reverified_untouched`` at all --
+   exactly what ``RepairExecutionResult``'s own docstring already warns
+   against, for the identical reason; (b) ``ArtifactGraphStore.
+   _evidence_is_live`` (and therefore ``is_evidence_still_valid``) now
+   also rejects any entry whose ``checked_artifact`` is no longer its own
+   artifact_id's current version -- a verdict about a superseded version
+   is never live regardless of what its own inputs did, which a cached
+   evidence entry spanning a version bump (as opposed to
+   ``live_evidence()``'s own call site, which only ever hands this check
+   entries already pre-filtered to the current version) could not
+   otherwise ever detect.
+9. An invalidated constraint could be deleted and never rechecked. Repro:
+   one document with constraint A=FAIL and constraint B=PASS; A's (not
+   B's) input changes through a relation recorded only on ``Evidence.
+   input_versions`` -- with no matching graph edge, so the document
+   itself never becomes ``is_stale()``. The next merge correctly dropped
+   exactly A's now-invalid FAIL (``is_evidence_still_valid`` turned False
+   for it) and kept B's still-valid PASS -- but nothing recorded that A
+   was now *owed* a recheck, so ``_classify()`` read the one remaining
+   entry (B, PASS) as a clean "PASS" and proceeded straight to COMPILE/
+   FINISH without ever re-examining A. Fixed with a new ``ControllerState.
+   needs_recheck_ids``: any id losing an entry to invalidation
+   (``_invalidated_ids``) joins this set in both the CHECK and PATCH/
+   REPLAN branches of ``_tool_node``, unioned into ``_compute_unresolved()``
+   so ``RuleBasedController.decide()`` treats it as still needing a fresh
+   CHECK regardless of what other, still-valid evidence happens to
+   survive for the same artifact_id -- cleared the moment that fresh
+   CHECK (which re-examines every constraint ``constraint_provider``
+   currently names, not just the one that was invalidated) actually runs.
+10. Resume landing in the window right after an ``LLMController`` decision
+    was made (and paid for) but before it was executed lost both the
+    decision and its own cost. ``_controller_node`` previously returned
+    only ``pending_tool_call`` -- by the time ``self._policy.decide()``
+    returns, ``LLMController`` may already have called ``tool_executor.
+    run_generation()`` (points 6-7 above) and mutated that executor's real
+    ledger, but nothing synced that ledger into the typed state this node
+    returns. A real repro showed the executor having actually charged 7
+    tokens/1 action while the serialized ``ControllerState`` immediately
+    after this node still read 0/0; resuming from exactly that
+    checkpoint silently reopened budget already spent, AND ``run()``
+    always re-entered at ``controller`` regardless, which re-decided from
+    scratch and overwrote the still-pending, already-paid-for decision
+    with a different one. Fixed two ways: ``_controller_node`` now folds
+    ``budget``/``actions_taken``/``suspended``/``suspend_reason``/a fresh
+    ``checkpoint`` into every return path (mirroring what ``_tool_node``
+    already did), and ``_build_graph`` now routes ``START`` through a new
+    conditional edge (``_route_at_start``) that goes straight to ``tool``
+    whenever the state it is given already carries a ``pending_tool_call``
+    -- executing the one decision that already happened instead of asking
+    the policy again.
+11. A guard-forced termination (``max_steps_reached``/
+    ``repeated_action_detected``) could report an empty
+    ``unresolved_artifact_ids`` while real problems existed.
+    ``_controller_node``'s own guard trips reported only
+    ``sorted(self._store.stale_artifacts)`` -- which a FAIL on an
+    artifact's own *content* (never a dependency issue, so never
+    ``is_stale()``-true -- the same root cause as point 2 above) or a
+    ``blocked_artifact_ids`` entry both leave completely silent. A real
+    repro: ``doc`` was FAILing its own content check and sitting in
+    ``blocked_artifact_ids``, yet ``max_steps_reached`` still reported
+    ``unresolved_artifact_ids=[]``. Fixed with one new ``_aggregate_unresolved()``
+    -- structurally unresolved ids (``_compute_unresolved``, now also
+    covering point 9's ``needs_recheck_ids``) plus every id with current
+    FAIL/UNKNOWN evidence plus the document itself if the last compile
+    failed -- used by EVERY ``FinishCall`` this module ever constructs,
+    guard-forced or policy-chosen alike, so a caller never has to know or
+    care which path produced it.
+12. ``LLMController`` never told the model, or enforced on its own output,
+    the one correct ``request_id``/``output_dir`` for a ``compile`` it
+    might choose -- both were known to the constructor the whole time but
+    never reached the prompt or the dispatched ``CompileCall``, so a model
+    deciding to compile ``doc`` under request ``req1`` had no way to know
+    that was the right pair, and nothing corrected it if it guessed wrong.
+    Fixed both ways: the prompt now states the exact values that will be
+    used, and ``decide()`` unconditionally overwrites
+    ``request_id``/``output_dir`` on any ``CompileCall`` the model returns
+    -- the model can still reason about *whether*/*when* to compile, but
+    never decides *which* request/output path that compile actually
+    targets.
+
 See ``docs/stage5_langgraph_controller.md`` for the full write-up.
 """
 
@@ -263,20 +363,73 @@ def _drop_evidence_for(existing: List[Evidence], artifact_ids: Set[str]) -> List
     return [item for item in existing if item.checked_artifact.artifact_id not in artifact_ids]
 
 
-def _compute_unresolved(store: ArtifactGraphStore, tracked_ids: Set[str], blocked_ids: Set[str]) -> Set[str]:
+def _compute_unresolved(
+    store: ArtifactGraphStore, tracked_ids: Set[str], blocked_ids: Set[str], needs_recheck_ids: Set[str]
+) -> Set[str]:
     """Which of ``tracked_ids`` still have unresolved work right now:
-    either flagged stale by the store (a dependency moved and nothing has
+    flagged stale by the store (a dependency moved and nothing has
     re-settled it yet -- covers a budget-cut-short cascade's own
     ``left_stale``, which is itself defined as "whatever is still
     ``is_stale()``-true" in ``repair_operations.py``), OR in
     ``blocked_ids`` (this module's docstring, point 2): an artifact whose
     most recent repair attempt could not even produce new content
-    (``RepairOutcome.PRODUCTION_FAILED``/``NO_PRODUCER``). The two sets
-    are not redundant -- an artifact failing its own *content* check (not
-    a dependency that moved) is never marked stale in the first place, so
-    a production failure against it leaves no trace in ``is_stale()`` at
-    all; ``blocked_ids`` is the only thing that still catches it."""
-    return {aid for aid in tracked_ids if store.is_stale(aid)} | (blocked_ids & tracked_ids)
+    (``RepairOutcome.PRODUCTION_FAILED``/``NO_PRODUCER``), OR in
+    ``needs_recheck_ids`` (point 2b below): an artifact whose cached
+    evidence was just invalidated and has not been freshly re-checked
+    since. None of the three is redundant with either other: an artifact
+    failing its own *content* check (not a dependency that moved) is never
+    marked stale in the first place, so a production failure against it
+    leaves no trace in ``is_stale()`` at all (``blocked_ids`` is the only
+    thing that still catches it); and an invalidated verdict whose
+    dependency was recorded only on ``Evidence.input_versions``, with no
+    matching graph edge, never marks the checked artifact stale either
+    (``needs_recheck_ids`` is the only thing that still catches that one)."""
+    return (
+        {aid for aid in tracked_ids if store.is_stale(aid)}
+        | (blocked_ids & tracked_ids)
+        | (needs_recheck_ids & tracked_ids)
+    )
+
+
+def _invalidated_ids(store: ArtifactGraphStore, evidence: List[Evidence]) -> Set[str]:
+    """Which artifact_ids have at least one entry in ``evidence`` that
+    ``store.is_evidence_still_valid`` now rejects -- the ids
+    ``_prune_invalidated_evidence`` is about to drop something for. Used
+    to feed ``ControllerState.needs_recheck_ids`` (point 2b, this module's
+    docstring): dropping an invalidated verdict must never be silent --
+    the artifact it was about is now *owed* a fresh CHECK, not simply
+    forgotten."""
+    return {item.checked_artifact.artifact_id for item in evidence if not store.is_evidence_still_valid(item)}
+
+
+def _aggregate_unresolved(state: ControllerState, store: ArtifactGraphStore) -> Set[str]:
+    """The complete "what is still wrong, right now" picture: every
+    structurally unresolved id (``_compute_unresolved``) plus every
+    artifact_id ``state.current_evidence`` currently reports FAIL or
+    UNKNOWN for, plus the document itself if the last COMPILE failed.
+    Added after a second user review found every termination path
+    (``ControllerRuntime._controller_node``'s own guard trips, in
+    particular) reporting its ``FinishCall.unresolved_artifact_ids`` from
+    a DIFFERENT, each ad hoc and each incomplete, subset of this same
+    picture -- a real repro: a guard tripped while ``doc`` was FAILing its
+    own content check AND sitting in ``blocked_artifact_ids``, with
+    neither fact reflected because the guard's own ``FinishCall`` only
+    ever looked at ``store.stale_artifacts`` (empty here -- ``doc`` was
+    never stale to begin with, same root cause as this module's docstring,
+    point 2). Every ``FinishCall`` this module ever constructs -- a
+    policy's own voluntary stop, or a guard's forced one -- now reports
+    exactly this same aggregate, so a caller reading
+    ``unresolved_artifact_ids`` never has to know or care *which* path
+    produced it."""
+    unresolved = _compute_unresolved(store, state.tracked_artifact_ids, state.blocked_artifact_ids, state.needs_recheck_ids)
+    unresolved |= {
+        item.checked_artifact.artifact_id
+        for item in state.current_evidence
+        if item.outcome in (CheckOutcome.FAIL, CheckOutcome.UNKNOWN)
+    }
+    if state.last_compile_failed:
+        unresolved.add(state.document_ref.artifact_id)
+    return unresolved
 
 
 def _update_blocked(existing: Set[str], result: RepairExecutionResult) -> Set[str]:
@@ -550,8 +703,13 @@ class RuleBasedController:
         current = store.latest(self._document_ref.artifact_id)
         live_document_ref = current.ref if current is not None else self._document_ref
 
-        unresolved = _compute_unresolved(store, state.tracked_artifact_ids, state.blocked_artifact_ids)
-        checked_ids = {item.checked_artifact.artifact_id for item in state.current_evidence}
+        unresolved = _compute_unresolved(store, state.tracked_artifact_ids, state.blocked_artifact_ids, state.needs_recheck_ids)
+        # An id owed a recheck (``needs_recheck_ids``) must never read as
+        # "already checked" just because some OTHER, still-valid entry for
+        # it survives -- see this module's docstring, point 2b: dropping
+        # only the invalidated constraint while leaving an unrelated PASS
+        # in place must not let that id look fully covered.
+        checked_ids = {item.checked_artifact.artifact_id for item in state.current_evidence} - state.needs_recheck_ids
 
         if not state.current_evidence and not unresolved:
             return CheckCall(
@@ -567,7 +725,7 @@ class RuleBasedController:
             if not actions:
                 return FinishCall(
                     reason="repair_policy_returned_nothing",
-                    unresolved_artifact_ids=sorted({item.checked_artifact.artifact_id for item in failing}),
+                    unresolved_artifact_ids=sorted(_aggregate_unresolved(state, store)),
                 )
             chosen = sorted(actions, key=lambda action: action.target_artifacts[0].artifact_id)[0]
             return _repair_action_to_tool_call(chosen)
@@ -579,17 +737,18 @@ class RuleBasedController:
             return CheckCall(artifact=target.ref, constraints=self._constraints_for(target.ref), context={})
 
         if unresolved:
-            return FinishCall(reason="unresolved_remaining", unresolved_artifact_ids=sorted(unresolved))
+            return FinishCall(reason="unresolved_remaining", unresolved_artifact_ids=sorted(_aggregate_unresolved(state, store)))
 
         if classification == "UNKNOWN":
-            unknown_ids = sorted(
-                {item.checked_artifact.artifact_id for item in state.current_evidence if item.outcome == CheckOutcome.UNKNOWN}
+            return FinishCall(
+                reason="evidence_inconclusive", unresolved_artifact_ids=sorted(_aggregate_unresolved(state, store))
             )
-            return FinishCall(reason="evidence_inconclusive", unresolved_artifact_ids=unknown_ids)
 
         if not state.compiled:
             if state.last_compile_failed:
-                return FinishCall(reason="compile_failed", unresolved_artifact_ids=[live_document_ref.artifact_id])
+                return FinishCall(
+                    reason="compile_failed", unresolved_artifact_ids=sorted(_aggregate_unresolved(state, store))
+                )
             return CompileCall(request_id=self._request_id, output_dir=self._output_dir)
 
         return FinishCall(reason="resolved", unresolved_artifact_ids=[])
@@ -715,17 +874,30 @@ class LLMController:
             assert observation.error is not None
             return FinishCall(
                 reason=f"llm_controller_call_rejected_{observation.error.code.value}",
-                unresolved_artifact_ids=[self._document_ref.artifact_id],
+                unresolved_artifact_ids=sorted(_aggregate_unresolved(state, store)),
             )
         assert observation.output is not None
         production = observation.output.production
         if production.status == ProductionStatus.FAILED or production.content is None:
             return FinishCall(
                 reason="llm_controller_exhausted_retries",
-                unresolved_artifact_ids=[self._document_ref.artifact_id],
+                unresolved_artifact_ids=sorted(_aggregate_unresolved(state, store)),
             )
         decision = LLMControllerDecision.model_validate_json(production.content)
-        return decision.call
+        call = decision.call
+        if isinstance(call, CompileCall):
+            # Never trust the model's own echo of request_id/output_dir --
+            # this controller already knows the one correct execution
+            # config for this episode (constructor-only, never shown to
+            # the model as something it could legitimately choose
+            # differently); a second user review found neither value ever
+            # reached the model OR the dispatched call, so a model with no
+            # way to know "which request_id is this" could silently send
+            # COMPILE down the wrong path. Telling it the right values in
+            # the prompt (below) still lets it reason about WHEN to
+            # compile; this makes WHICH compile correct regardless.
+            call = call.model_copy(update={"request_id": self._request_id, "output_dir": self._output_dir})
+        return call
 
     def _system_prompt(self) -> str:
         return (
@@ -739,7 +911,7 @@ class LLMController:
         )
 
     def _user_prompt(self, state: ControllerState, store: ArtifactGraphStore) -> str:
-        unresolved = _compute_unresolved(store, state.tracked_artifact_ids, state.blocked_artifact_ids)
+        unresolved = _compute_unresolved(store, state.tracked_artifact_ids, state.blocked_artifact_ids, state.needs_recheck_ids)
         evidence_lines = [
             f"- {item.checked_artifact.artifact_id}@{item.checked_artifact.version}: "
             f"{item.outcome.value} ({item.constraint_id}) {item.detail}".strip()
@@ -755,9 +927,12 @@ class LLMController:
             f"Document artifact: {self._document_ref.artifact_id}\n"
             f"Budget remaining: {state.budget.remaining} / cap {state.budget.cap}\n"
             f"Compiled this episode: {state.compiled} (last compile failed: {state.last_compile_failed})\n"
+            f"If you choose 'compile', the request_id/output_dir will always be forced to "
+            f"{self._request_id!r}/{self._output_dir!r} regardless of what you put in those fields -- "
+            f"only use them to help you decide, never invent different ones.\n"
             f"Tracked artifacts with unresolved work but no fresh pass/fail evidence of their own "
-            f"(e.g. a production failure, a missing producer, or left stale by a budget cutoff): "
-            f"{sorted(unresolved)}\n"
+            f"(e.g. a production failure, a missing producer, a dropped-and-not-yet-rechecked "
+            f"verdict, or left stale by a budget cutoff): {sorted(unresolved)}\n"
             "Current evidence (pass/fail/unknown per constraint, on currently non-stale artifacts):\n"
             + "\n".join(evidence_lines)
             + "\n"
@@ -925,10 +1100,29 @@ class ControllerRuntime:
         graph = StateGraph(ControllerState)
         graph.add_node("controller", self._controller_node)
         graph.add_node("tool", self._tool_node)
-        graph.add_edge(START, "controller")
+        graph.add_conditional_edges(START, self._route_at_start, {"controller": "controller", "tool": "tool"})
         graph.add_edge("controller", "tool")
         graph.add_conditional_edges("tool", self._route_after_tool, {"controller": "controller", END: END})
         return graph
+
+    @staticmethod
+    def _route_at_start(state: ControllerState) -> str:
+        """A fresh episode's initial state never carries a
+        ``pending_tool_call`` (``run()``'s own construction), so this
+        always routes to ``controller`` for a normal start -- but a
+        RESUMED episode may be restarted from a state that was
+        checkpointed in the narrow window right *after* ``controller``
+        already decided (and, for ``LLMController``, already spent real
+        budget deciding) but *before* ``tool`` ever executed that
+        decision. A third user review found ``run()`` always entering at
+        ``controller`` regardless silently re-decided from scratch in
+        that case -- discarding the pending decision entirely (along with
+        whatever it cost to produce) and asking the policy again, which
+        could pick a *different* action the second time. Routing straight
+        to ``tool`` whenever a pending call already survived into the
+        resumed state executes exactly the one decision that was already
+        made and already paid for, instead of silently replacing it."""
+        return "tool" if state.pending_tool_call is not None else "controller"
 
     @staticmethod
     def _route_after_tool(state: ControllerState) -> str:
@@ -943,23 +1137,49 @@ class ControllerRuntime:
         reason string identifying exactly which guard fired; the ``tool``
         node (not this one) is what actually executes it and marks
         ``done=True`` -- deciding and executing never happen in the same
-        node (``schemas.ControllerState``'s own docstring)."""
+        node (``schemas.ControllerState``'s own docstring).
+
+        The executor/store snapshot (``checkpoint``/``budget``/
+        ``actions_taken``/``suspended``/``suspend_reason``) is taken ONCE,
+        right before returning -- deliberately *after* ``call`` is fully
+        decided, never before. A third user review found this node
+        previously returned only ``pending_tool_call``, and this method's
+        own first fix for that mistakenly read the snapshot too early (as
+        a local ``base_updates`` built before ``self._policy.decide()``
+        ever ran) -- harmless for the two guard trips, which never touch
+        the executor, but wrong for the real decision path:
+        ``self._policy.decide()`` may itself have already spent real
+        budget/action-count by the time it returns (``LLMController``'s
+        own call to ``tool_executor.run_generation()``, this module's
+        docstring points 6-7), and a snapshot taken before that call ran
+        is exactly the stale 0/0 this fix exists to stop. A real repro
+        showed the executor having actually charged 7 tokens and 1 action
+        while the serialized ``ControllerState`` right after this node
+        still read 0/0, so a checkpoint/resume landing in that exact
+        window silently reopened budget that had, in reality, already
+        been spent."""
         if state.done:
             return {}
         if state.step_count >= self._max_steps:
             call: ToolCall = FinishCall(
                 reason="max_steps_reached",
-                unresolved_artifact_ids=sorted(self._store.stale_artifacts),
+                unresolved_artifact_ids=sorted(_aggregate_unresolved(state, self._store)),
             )
-            return {"pending_tool_call": call}
-        if _repeated_action(state.history, threshold=self._repeat_threshold):
+        elif _repeated_action(state.history, threshold=self._repeat_threshold):
             call = FinishCall(
                 reason="repeated_action_detected",
-                unresolved_artifact_ids=sorted(self._store.stale_artifacts),
+                unresolved_artifact_ids=sorted(_aggregate_unresolved(state, self._store)),
             )
-            return {"pending_tool_call": call}
-        call = self._policy.decide(state, self._store, self._tool_executor)
-        return {"pending_tool_call": call}
+        else:
+            call = self._policy.decide(state, self._store, self._tool_executor)
+        return {
+            "pending_tool_call": call,
+            "checkpoint": self._store.save_checkpoint(label=f"controller-{state.step_count}"),
+            "budget": self._tool_executor.budget,
+            "actions_taken": self._tool_executor.actions_taken,
+            "suspended": self._tool_executor.is_suspended,
+            "suspend_reason": self._tool_executor.suspend_reason,
+        }
 
     def _tool_node(self, state: ControllerState) -> Dict[str, Any]:
         """Executes ``state.pending_tool_call`` through this runtime's one
@@ -972,17 +1192,45 @@ class ControllerRuntime:
           whatever artifact they named; CHECK additionally merges its
           fresh evidence per ``(artifact_id, constraint_id)``
           (``_merge_evidence``) and prunes anything now invalidated by a
-          changed input (``_prune_invalidated_evidence``).
+          changed input (``_prune_invalidated_evidence``) -- any id that
+          loses an entry this way (``_invalidated_ids``) joins
+          ``needs_recheck_ids`` (this module's docstring, point 2b) rather
+          than simply vanishing, and the just-checked artifact itself is
+          always cleared from that set (a fresh CHECK, by construction,
+          just re-examined every constraint ``constraint_provider``
+          currently names for it).
         - PATCH/REPLAN grow ``tracked_artifact_ids`` to include every
           artifact the repair's own cascade touched or discovered broken
           (``RepairExecutionResult.final_outcome_by_artifact``/
-          ``.left_stale``), drop stale evidence for all of them, then
-          re-merge whatever fresh reverify evidence the repair itself
-          produced -- an artifact left ``is_stale()``-true with no fresh
-          evidence of its own (a production failure, a missing producer,
-          a budget-cut-short cascade) is still tracked and will surface
-          through ``_compute_unresolved()`` even with no Evidence to show
-          for it. Any successful dispatch also invalidates ``compiled``/
+          ``.left_stale``), drop stale evidence for all of them, then pull
+          each one's own ``ArtifactGraphStore.live_evidence()`` fresh --
+          never the ``regenerated``/``reverified_untouched`` audit lists
+          directly, which ``RepairExecutionResult``'s own docstring already
+          warns against scanning for "current truth" (the same artifact_id
+          can legitimately appear more than once across a multi-sweep
+          cascade, superseded entries included). A second user review
+          found the original version merged ONLY ``regenerated[*].
+          reverify_evidence``, which both (a) always skipped
+          ``reverified_untouched`` entirely -- an artifact re-confirmed
+          PASS without being regenerated has no ``RegeneratedArtifactRecord``
+          at all, so its fresh verdict (recorded by ``_reaffirm``, rebound
+          to the artifact's new version) never reached the controller --
+          and (b) could resurrect a STALE, already-superseded record from
+          an early sweep pass for an id later reaffirmed clean, exactly
+          the failure mode ``final_outcome_by_artifact``'s own docstring
+          warns about. ``live_evidence()`` sidesteps both: it always
+          reflects the artifact's truly current version, regardless of
+          which mechanism (regenerate vs. reaffirm) last settled it.
+          Whatever still gets dropped after that re-pull (an id left
+          genuinely stale, or with no live verdict at all) joins
+          ``needs_recheck_ids`` precisely like the CHECK branch, then every
+          touched id is cleared from it (a fresh re-pull, same as a fresh
+          CHECK, just happened for all of them). An artifact left
+          ``is_stale()``-true with no fresh evidence of its own (a
+          production failure, a missing producer, a budget-cut-short
+          cascade) is still tracked and will surface through
+          ``_compute_unresolved()`` even with no Evidence to show for it.
+          Any successful dispatch also invalidates ``compiled``/
           ``last_compile_failed`` (point 3 of this module's docstring),
           and an exhausted cascade (``result.budget_exhausted``) ends the
           episode immediately rather than waiting for the next call to be
@@ -1029,8 +1277,10 @@ class ControllerRuntime:
             assert observation.output is not None
             if isinstance(call, CheckCall):
                 merged = _merge_evidence(state.current_evidence, observation.output.evidence)
+                invalidated = _invalidated_ids(self._store, merged)
                 updates["current_evidence"] = _prune_invalidated_evidence(self._store, merged)
                 updates["tracked_artifact_ids"] = state.tracked_artifact_ids | {call.artifact.artifact_id}
+                updates["needs_recheck_ids"] = (state.needs_recheck_ids | invalidated) - {call.artifact.artifact_id}
             elif isinstance(call, InspectArtifactCall):
                 updates["tracked_artifact_ids"] = state.tracked_artifact_ids | {call.artifact_id}
             elif isinstance(call, QueryDependenciesCall):
@@ -1040,12 +1290,13 @@ class ControllerRuntime:
                 touched_ids = set(result.final_outcome_by_artifact.keys())
                 touched_ids |= {ref.artifact_id for ref in result.left_stale}
                 pruned = _drop_evidence_for(state.current_evidence, touched_ids)
-                for record in result.regenerated:
-                    if record.reverify_evidence:
-                        pruned = _merge_evidence(pruned, record.reverify_evidence)
+                for artifact_id in sorted(touched_ids):
+                    pruned = _merge_evidence(pruned, self._store.live_evidence(artifact_id))
+                invalidated = _invalidated_ids(self._store, pruned)
                 updates["current_evidence"] = _prune_invalidated_evidence(self._store, pruned)
                 updates["tracked_artifact_ids"] = state.tracked_artifact_ids | touched_ids
                 updates["blocked_artifact_ids"] = _update_blocked(state.blocked_artifact_ids, result)
+                updates["needs_recheck_ids"] = (state.needs_recheck_ids | invalidated) - touched_ids
                 updates["compiled"] = False
                 updates["last_compile_failed"] = False
                 if result.budget_exhausted:
