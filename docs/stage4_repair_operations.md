@@ -18,9 +18,11 @@ Stage 2(`docs/stage2_artifact_graph.md`), Stage 3(`docs/stage3_tool_executor.md`
   `BlockPatchProducer`) 모두 실제 산출물·입력을 `ProductionResult`에 싣도록 수정(§5.1).
 - `src/core/schemas.py` — `ProductionResult`에 `content`/`read_input_versions` 추가;
   `RepairOutcome`(RESOLVED/STILL_FAILING/**INCONCLUSIVE**/PRODUCTION_FAILED/NO_PRODUCER),
-  `RegeneratedArtifactRecord`, `RepairExecutionResult`(+ **left_stale**/**budget_exhausted**),
-  `RepairRound`, `BranchExecutionResult`(**rounds: List[RepairRound]**), `BranchComparisonResult`.
-- `test/core/test_repair_operations.py`(29), `test/core/test_branching_runner.py`(16),
+  `RegeneratedArtifactRecord`, `RepairExecutionResult`(+ **left_stale**/**budget_exhausted**/
+  **final_outcome_by_artifact: Dict[str, RepairOutcome]**, §5-3), `RepairRound`,
+  `BranchExecutionResult`(**rounds: List[RepairRound]**), `BranchComparisonResult`;
+  공개 상수 `BUDGET_ERROR_CODES`(§5-2).
+- `test/core/test_repair_operations.py`(33), `test/core/test_branching_runner.py`(20),
   `test/core/test_adapters.py`에 `BlockPatchProducer`/content 테스트 추가.
 
 Zero changes to `scripts/run_full_pipeline.py` 또는 agent 코드 — Stage 1-3과 동일한 원칙으로
@@ -303,6 +305,63 @@ evidence로 돌아와 기존 UNKNOWN/`left_stale` 경로가 그대로 정직하�
 테스트는 실제 `TextAgentOutput`/`ContentBlock`을 쓰도록 수정만 하고 새로 세지 않음). 210→218.
 각 새 테스트는 수정 전 코드에 그대로 돌려 실제로 깨지는 것까지 확인했다. 전체 저장소 테스트도
 기존과 동일한 57건 외 회귀 없음 — 756→764 passed.
+
+---
+
+## 5-3. 사용자 재검토 후 수정 (3차, 2026.10.20)
+
+2차 수정의 두 가지 서로 다른 집계 지점(`RepairOperationExecutor._combine_outcomes()`와
+`BranchingRunner._apply_round_to_pending()`)이 공유하는 근본 결함 하나를 사용자가 양방향
+재현으로 지적했다: 같은 artifact_id가 한 번의 실행 안에서 `regenerated`/`reverified_untouched`
+양쪽(또는 한쪽에 여러 번)에 나타날 수 있는데, 두 집계 지점 모두 "가장 최근 기록이 무엇인가"가
+아니라 "두 목록을 어떤 고정된 순서로 훑었을 때 마지막에 본 것"으로 최종 상태를 판단했다 — 그
+고정된 순서가 실제 실행 순서와 일치하지 않으면 과거 기록이 최신 기록을 이긴다.
+
+**재현 1 (방향 A: 과거 PASS가 최신 FAIL을 지움, branching runner).** a→z→b에서 a를 복구하면
+z·b가 모두 stale이 된다. sweep이 알파벳 순으로 b를 먼저 보고 PASS로 재확인(reaffirm, b@2)한
+뒤, z를 보고 FAIL이라 재생성(z가 바뀌며 b가 다시 stale)한다. 다시 b를 보면 이번엔 FAIL이라
+재생성한다(b@3, STILL_FAILING). 결과적으로 b는 `reverified_untouched`(낡은 b@2)와
+`regenerated`(최신 b@3, STILL_FAILING) 양쪽에 있다. 기존 `_apply_round_to_pending()`은
+`regenerated`를 전부 처리한 뒤 `reverified_untouched`를 전부 처리했는데, 이 두 번째 단계가
+무조건 `pending.pop(artifact_id)`/`unresolved_ids.discard(artifact_id)`를 호출해 방금 막 올바르게
+추가한 b의 STILL_FAILING 신호를 지워버렸다. 재현 결과: 최신 live evidence는 b@3 FAIL, 복구
+결과는 STILL_FAILING인데 `stopped_reason="no_more_failures"`로 종료.
+
+**재현 2 (방향 B: 과거 FAIL이 최신 PASS를 덮음, `_combine_outcomes`).** a→b에서 복구 대상을
+`[b, a]` 순서로 지정하면, b가 먼저 생성되어 FAIL(STILL_FAILING, b@2)로 기록된 뒤 a가 수정되고
+b가 다시 stale이 되어 재확인되면 이번엔 PASS로 재확인(b@3, RESOLVED)된다. 기존
+`_combine_outcomes()`는 `regenerated` 리스트를 "FAIL이 하나라도 있는가"로 스캔했는데, 이 리스트는
+과거 b@2 기록을 그대로 담고 있어 최신 b@3이 RESOLVED여도 전체 `overall_outcome=STILL_FAILING`을
+반환했다. 재현 결과: 최종 `store.is_stale("b")`는 False, b@3 live evidence는 PASS인데
+`overall_outcome=STILL_FAILING`.
+
+**수정**: 두 지점이 각자 `regenerated`/`reverified_untouched`를 재해석하는 대신, 하나의 공통
+소스를 공유하게 했다. `RepairOperationExecutor`가 이미 내부적으로 유지하던 `last_outcome`
+(artifact_id별 실행 순서대로 갱신되는 최신 결과 — 2차 수정에서 `left_stale` 판정에만 쓰던 것)을
+`RepairExecutionResult.final_outcome_by_artifact: Dict[str, RepairOutcome]`로 **외부에 노출**했다.
+- `_combine_outcomes()`는 더 이상 `regenerated` 리스트를 스캔하지 않고 `final_outcome_by_artifact
+  .values()`에 대해서만 worst-first 판단을 내린다.
+- `BranchingRunner._apply_round_to_pending()`은 `result.regenerated`/`.reverified_untouched`를
+  직접 순회하는 대신 `result.final_outcome_by_artifact.items()`를 순회한다 — RESOLVED면
+  pending/unresolved에서 제거, STILL_FAILING/INCONCLUSIVE면 추가(가능하면 `regenerated`에서 그
+  artifact_id의 **가장 최근** 레코드를 찾아 FAIL evidence를 pending에 채움), PRODUCTION_FAILED/
+  NO_PRODUCER면 unresolved에만 추가. `reverified_untouched`는 더 이상 이 메서드의 판단에
+  관여하지 않는다 — 감사 로그로만 남는다.
+- 과거 기록은 `regenerated`/`reverified_untouched`에 그대로 보존된다(순서 변경·삭제 없음) —
+  "artifact별 최신 유효 버전과 마지막 처리 결과"만 별도로 계산해 두 집계 지점에 공통으로
+  공급하고, 과거 기록 자체는 감사 추적 용도로 남기라는 요구를 그대로 따랐다. 단순히 두 목록의
+  처리 순서를 뒤집는 식의 수정은 반대 방향 버그를 남긴다는 지적대로, 순서 변경이 아니라 "진짜
+  최신이 무엇인가"를 **한 곳에서만 계산**하는 방식으로 바꿨다.
+
+(`test_overall_outcome_reflects_the_latest_record_not_an_earlier_still_failing_one` —
+`test_repair_operations.py`, 재현 2 / `_combine_outcomes`;
+`test_a_still_failing_candidate_is_not_cleared_by_an_earlier_superseded_reaffirm` —
+`test_branching_runner.py`, 재현 1 / `_apply_round_to_pending`)
+
+**검증**: `test/core/`에 2개 테스트 추가(`test_repair_operations.py` 32→33,
+`test_branching_runner.py` 19→20). 218→220. 두 테스트 모두 수정 전 코드로 되돌려 실제로
+실패하는 것까지 확인했다. 전체 저장소 테스트도 기존과 동일한 57건 외 회귀 없음 — 764→766
+passed.
 
 ---
 

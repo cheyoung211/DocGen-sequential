@@ -1045,12 +1045,35 @@ class RepairExecutionResult(BaseModel):
     its own cascade because the underlying ``ToolExecutor`` ran out of
     budget/actions -- whatever is left in ``left_stale``/unprocessed is
     *not* a resolved state, it is simply where the cascade had to stop.
+
+    ``final_outcome_by_artifact`` is the one authoritative answer to "what
+    is this artifact_id's state as of the END of this execution" -- a
+    review found that ``regenerated``/``reverified_untouched`` are both
+    plain append-in-chronological-order audit logs, and the SAME
+    artifact_id can legitimately appear more than once across either list
+    within one multi-sweep execution (reaffirmed PASS in an early sweep,
+    then re-invalidated and found FAIL in a later one, or the reverse).
+    Any consumer that scans those lists for "does this id appear with
+    outcome X anywhere" -- rather than "what did the LAST thing that
+    happened to this id say" -- silently lets a stale early record outvote
+    a later, truer one, in either direction. ``RepairOperationExecutor``
+    computes this map internally in true execution order (last write
+    wins) and is the one place both this class's own ``overall_outcome``
+    and any external caller (``BranchingRunner``'s ``pending``/
+    ``unresolved_ids`` bookkeeping) must read from -- never re-derive their
+    own interpretation of ``regenerated``/``reverified_untouched`` by
+    scanning them independently. Those two lists remain exactly what they
+    were: a full, superseded-entries-included audit trail, not pruned or
+    reordered -- only this map resolves "which one is current" per id.
+    Absent from this map entirely means "never actually resolved one way
+    or the other" -- i.e. it is instead in ``left_stale``.
     """
 
     action: RepairAction
     regenerated: List[RegeneratedArtifactRecord] = Field(default_factory=list)
     reverified_untouched: List[ArtifactRef] = Field(default_factory=list)
     left_stale: List[ArtifactRef] = Field(default_factory=list)
+    final_outcome_by_artifact: Dict[str, RepairOutcome] = Field(default_factory=dict)
     overall_outcome: RepairOutcome
     cost: List[CostRecord] = Field(default_factory=list)
     budget_exhausted: bool = False

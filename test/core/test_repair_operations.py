@@ -5,10 +5,10 @@ implementations. Uses Protocol-conforming fakes throughout -- no real LLM
 call anywhere in this file, per this stage's explicit scope decision (see
 repair_operations.py's module docstring).
 
-Revised after a user review found 8 real bugs in the first pass, and a
-second review found 2 more (see memory docgen_stage_review_rigor) -- every
-fix below has at least one regression test named after the repro that
-caught it."""
+Revised after a user review found 8 real bugs in the first pass, a second
+review found 2 more, and a third review found 1 more (see memory
+docgen_stage_review_rigor) -- every fix below has at least one regression
+test named after the repro that caught it."""
 
 from __future__ import annotations
 
@@ -94,6 +94,34 @@ class _FakeValidator:
                 for c in constraints
             ]
         outcome = CheckOutcome.FAIL if artifact.artifact_id in self.fail_ids else CheckOutcome.PASS
+        return [
+            Evidence(constraint_id=c.constraint_id, outcome=outcome, checked_artifact=artifact, detail="fake")
+            for c in constraints
+        ]
+
+
+class _SequencedValidator:
+    """Returns a scripted sequence of outcomes per artifact_id, one per
+    successive check call against that id (repeating the final entry once
+    the script runs out); PASS for any id never scripted at all. Lets a
+    test drive a candidate through FAIL-then-PASS (or the reverse)
+    deterministically, across however many times the real cascade
+    actually ends up checking it -- without hand-constructing a
+    ``RepairExecutionResult``."""
+
+    def __init__(self, script: Dict[str, List[CheckOutcome]]) -> None:
+        self._script = {artifact_id: list(outcomes) for artifact_id, outcomes in script.items()}
+        self._seen: Dict[str, int] = {}
+        self.calls: List[str] = []
+
+    def check(
+        self, artifact: ArtifactRef, constraints: List[Constraint], context: Optional[Dict[str, Any]] = None
+    ) -> List[Evidence]:
+        self.calls.append(artifact.artifact_id)
+        index = self._seen.get(artifact.artifact_id, 0)
+        self._seen[artifact.artifact_id] = index + 1
+        sequence = self._script.get(artifact.artifact_id)
+        outcome = sequence[min(index, len(sequence) - 1)] if sequence else CheckOutcome.PASS
         return [
             Evidence(constraint_id=c.constraint_id, outcome=outcome, checked_artifact=artifact, detail="fake")
             for c in constraints
@@ -555,6 +583,44 @@ def test_a_validator_crash_is_not_misreported_as_budget_exhaustion() -> None:
     a_record = next(r for r in result.regenerated if r.pre_repair_ref.artifact_id == "a")
     assert a_record.outcome == RepairOutcome.INCONCLUSIVE  # a's own reverify check crashed
     assert "b" in {r.artifact_id for r in result.left_stale}  # b's cascade check crashed too
+
+
+# ---------------------------------------------------------------------------
+# Third review round: _combine_outcomes() must judge each artifact_id by its
+# LATEST record, never "does any record for it say X" -- the same id can
+# legitimately appear more than once across a multi-sweep execution.
+# ---------------------------------------------------------------------------
+
+
+def test_overall_outcome_reflects_the_latest_record_not_an_earlier_still_failing_one() -> None:
+    """Review repro: explicit targets [b, a] where a -> b. b is regenerated
+    FIRST (seed) and its own reverify FAILs (STILL_FAILING) -- then a is
+    regenerated and resolves, which marks b stale again; the sweep
+    re-checks b and this time it PASSes, so b is reaffirmed (RESOLVED).
+    The old _combine_outcomes() scanned the raw `regenerated` list for "any
+    STILL_FAILING" and found b's now-superseded first record, reporting
+    overall_outcome=STILL_FAILING even though the store has nothing stale
+    left and b's live evidence is PASS."""
+    store = ArtifactGraphStore()
+    _store_with_chain(store, ("a", ArtifactKind.SECTION), ("b", ArtifactKind.SECTION))
+    producer = _FakeProducer()
+    validator = _SequencedValidator({"b": [CheckOutcome.FAIL, CheckOutcome.PASS]})
+    executor = _executor(store, {ArtifactKind.SECTION: producer}, validator)
+
+    b_ref = store.latest("b").ref
+    a_ref = store.latest("a").ref
+    result = executor.execute(_action(RepairActionType.REGENERATE_SECTION, [b_ref, a_ref]))
+
+    # The superseded STILL_FAILING record for b is still there -- an audit
+    # trail, not pruned -- but it must not win the aggregate verdict.
+    assert any(
+        r.pre_repair_ref.artifact_id == "b" and r.outcome == RepairOutcome.STILL_FAILING for r in result.regenerated
+    )
+    assert any(r.artifact_id == "b" for r in result.reverified_untouched)
+    assert result.final_outcome_by_artifact["b"] == RepairOutcome.RESOLVED
+    assert store.is_stale("b") is False
+    assert result.left_stale == []
+    assert result.overall_outcome == RepairOutcome.RESOLVED
 
 
 # ---------------------------------------------------------------------------

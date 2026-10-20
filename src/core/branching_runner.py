@@ -99,6 +99,7 @@ from src.core.schemas import (
     Checkpoint,
     Constraint,
     Evidence,
+    RegeneratedArtifactRecord,
     RepairExecutionResult,
     RepairOutcome,
     RepairRound,
@@ -349,33 +350,51 @@ class BranchingRunner:
         FAIL Evidence available to feed back for a production failure or a
         left-stale/UNKNOWN candidate) still has to leave some trace,
         exactly what ``unresolved_ids`` exists for.
+
+        Reads ``result.final_outcome_by_artifact`` -- never
+        ``result.regenerated``/``.reverified_untouched`` directly. A
+        review found this method used to process ``regenerated`` in full,
+        then unconditionally process ``reverified_untouched`` afterward,
+        regardless of which one actually happened LAST for a given
+        artifact_id within a multi-sweep execution -- so an early PASS
+        reaffirm could pop a later, truer FAIL back out of ``pending``
+        (and vice versa: an early FAIL regeneration record could outlive a
+        later PASS). ``final_outcome_by_artifact`` is already resolved to
+        the one current outcome per artifact_id by the executor itself, in
+        true execution order, so this method no longer needs -- or is
+        allowed -- to re-derive its own chronology from the two raw lists.
         """
+        latest_record_by_id: Dict[str, RegeneratedArtifactRecord] = {}
         for record in result.regenerated:
-            artifact_id = record.pre_repair_ref.artifact_id
-            if record.outcome == RepairOutcome.RESOLVED:
+            latest_record_by_id[record.pre_repair_ref.artifact_id] = record
+
+        for artifact_id, outcome in result.final_outcome_by_artifact.items():
+            if outcome == RepairOutcome.RESOLVED:
                 pending.pop(artifact_id, None)
                 unresolved_ids.discard(artifact_id)
-            elif record.outcome in (RepairOutcome.STILL_FAILING, RepairOutcome.INCONCLUSIVE):
+            elif outcome in (RepairOutcome.STILL_FAILING, RepairOutcome.INCONCLUSIVE):
                 unresolved_ids.add(artifact_id)
-                fail_evidence = next(
-                    (item for item in record.reverify_evidence if item.outcome == CheckOutcome.FAIL), None
+                record = latest_record_by_id.get(artifact_id)
+                fail_evidence = (
+                    next((item for item in record.reverify_evidence if item.outcome == CheckOutcome.FAIL), None)
+                    if record is not None
+                    else None
                 )
                 if fail_evidence is not None:
                     pending[artifact_id] = fail_evidence
-                # else: INCONCLUSIVE with no FAIL evidence at all -- leave
-                # whatever was already pending for it (if anything)
-                # unchanged; there is nothing new, honest to replace it
-                # with. Marking it unresolved above is bookkeeping, not an
-                # Evidence fabrication -- it never reaches `decide()`.
+                # else: INCONCLUSIVE with no FAIL evidence at all (or this
+                # artifact_id's current outcome came from a reaffirm, which
+                # has no record at all) -- leave whatever was already
+                # pending for it (if anything) unchanged; there is nothing
+                # new, honest to replace it with. Marking it unresolved
+                # above is bookkeeping, not an Evidence fabrication -- it
+                # never reaches `decide()`.
             else:  # PRODUCTION_FAILED / NO_PRODUCER
                 unresolved_ids.add(artifact_id)
                 # `pending` itself deliberately left untouched -- the
                 # underlying problem was never actually re-examined, so
                 # whatever was already pending for it (the original
                 # trigger, if any) remains exactly as it was.
-        for ref in result.reverified_untouched:
-            pending.pop(ref.artifact_id, None)
-            unresolved_ids.discard(ref.artifact_id)
         for ref in result.left_stale:
             unresolved_ids.add(ref.artifact_id)
             # No Evidence to add to `pending` -- these remain visible via

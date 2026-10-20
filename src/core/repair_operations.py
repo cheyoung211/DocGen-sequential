@@ -383,7 +383,8 @@ class RepairOperationExecutor:
             regenerated=regenerated,
             reverified_untouched=reverified_untouched,
             left_stale=left_stale,
-            overall_outcome=self._combine_outcomes(regenerated, left_stale, budget_exhausted),
+            final_outcome_by_artifact=last_outcome,
+            overall_outcome=self._combine_outcomes(last_outcome, left_stale, budget_exhausted),
             cost=costs,
             budget_exhausted=budget_exhausted,
         )
@@ -529,7 +530,8 @@ class RepairOperationExecutor:
             regenerated=regenerated,
             reverified_untouched=[],
             left_stale=left_stale,
-            overall_outcome=self._combine_outcomes(regenerated, left_stale, budget_exhausted),
+            final_outcome_by_artifact=last_outcome,
+            overall_outcome=self._combine_outcomes(last_outcome, left_stale, budget_exhausted),
             cost=costs,
             budget_exhausted=budget_exhausted,
         )
@@ -808,23 +810,38 @@ class RepairOperationExecutor:
 
     @staticmethod
     def _combine_outcomes(
-        records: List[RegeneratedArtifactRecord], left_stale: List[ArtifactRef], budget_exhausted: bool
+        final_outcome_by_artifact: Dict[str, RepairOutcome], left_stale: List[ArtifactRef], budget_exhausted: bool
     ) -> RepairOutcome:
-        """Worst-first. ``budget_exhausted``/non-empty ``left_stale`` both
-        mean "this execution did not reach a clean final state" and
-        outrank everything else -- a caller reading only
-        ``overall_outcome`` must never see RESOLVED when something affected
-        was left unresolved for any reason, including simply running out of
-        room to look at it."""
+        """Worst-first, over each artifact_id's **final** outcome only --
+        never the raw ``regenerated`` record list, which a review found
+        this method used to scan directly. The same artifact_id can appear
+        in ``regenerated`` more than once across a multi-sweep execution
+        (e.g. STILL_FAILING in an early sweep, then RESOLVED once its own
+        upstream was fixed later in the same call, or the reverse: PASS
+        reaffirmed early, then found FAIL once a sibling invalidated it
+        afterward) -- scanning "does ANY record say X" instead of "what
+        does the LAST record for this id say" let a superseded outcome in
+        either direction outvote the true current one.
+        ``final_outcome_by_artifact`` is already resolved to exactly one
+        (the latest) outcome per artifact_id by the caller, in true
+        execution order, so a plain membership check over its values is
+        correct here with no further chronology to reconstruct.
+
+        ``budget_exhausted``/non-empty ``left_stale`` both mean "this
+        execution did not reach a clean final state" and outrank
+        everything else -- a caller reading only ``overall_outcome`` must
+        never see RESOLVED when something affected was left unresolved for
+        any reason, including simply running out of room to look at it."""
         if budget_exhausted or left_stale:
             return RepairOutcome.INCONCLUSIVE
-        if any(r.outcome == RepairOutcome.STILL_FAILING for r in records):
+        outcomes = set(final_outcome_by_artifact.values())
+        if RepairOutcome.STILL_FAILING in outcomes:
             return RepairOutcome.STILL_FAILING
-        if any(r.outcome == RepairOutcome.PRODUCTION_FAILED for r in records):
+        if RepairOutcome.PRODUCTION_FAILED in outcomes:
             return RepairOutcome.PRODUCTION_FAILED
-        if any(r.outcome == RepairOutcome.NO_PRODUCER for r in records):
+        if RepairOutcome.NO_PRODUCER in outcomes:
             return RepairOutcome.NO_PRODUCER
-        if any(r.outcome == RepairOutcome.INCONCLUSIVE for r in records):
+        if RepairOutcome.INCONCLUSIVE in outcomes:
             return RepairOutcome.INCONCLUSIVE
         return RepairOutcome.RESOLVED
 

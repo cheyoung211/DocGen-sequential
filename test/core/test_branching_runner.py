@@ -5,9 +5,9 @@ and termination (budget/round-cap/stalled-without-evidence) -- all with
 Protocol-conforming fakes, per this stage's scope decision.
 
 Revised after a user review found 3 real bugs affecting this module (see
-memory docgen_stage_review_rigor, points 5/6/7), and a second review found
-2 more (points 8/9) -- every fix below has at least one regression test
-named after the repro that caught it."""
+memory docgen_stage_review_rigor, points 5/6/7), a second review found 2
+more (points 8/9), and a third review found 1 more -- every fix below has
+at least one regression test named after the repro that caught it."""
 
 from __future__ import annotations
 
@@ -162,6 +162,31 @@ class _RaisingValidator:
 
     def check(self, artifact, constraints, context=None) -> List[Evidence]:
         raise RuntimeError("validator exploded")
+
+
+class _SequencedValidator:
+    """Returns a scripted sequence of outcomes per artifact_id, one per
+    successive check call against that id (repeating the final entry once
+    the script runs out); PASS for any id never scripted at all. Lets a
+    test drive a candidate through PASS-then-FAIL (or the reverse)
+    deterministically across a real multi-sweep cascade, instead of
+    hand-constructing a ``RepairExecutionResult``."""
+
+    def __init__(self, script: Dict[str, List[CheckOutcome]]) -> None:
+        self._script = {artifact_id: list(outcomes) for artifact_id, outcomes in script.items()}
+        self._seen: Dict[str, int] = {}
+        self.calls: List[str] = []
+
+    def check(self, artifact, constraints, context=None) -> List[Evidence]:
+        self.calls.append(artifact.artifact_id)
+        index = self._seen.get(artifact.artifact_id, 0)
+        self._seen[artifact.artifact_id] = index + 1
+        sequence = self._script.get(artifact.artifact_id)
+        outcome = sequence[min(index, len(sequence) - 1)] if sequence else CheckOutcome.PASS
+        return [
+            Evidence(constraint_id=c.constraint_id, outcome=outcome, checked_artifact=artifact, detail="fake")
+            for c in constraints
+        ]
 
 
 def _checkpoint_with_a_dependency_chain(*artifact_ids: str):
@@ -535,6 +560,56 @@ def test_final_only_initial_check_crash_is_not_misreported_as_budget_exhaustion(
     branch = result.branches[0]
     assert branch.stopped_reason == "initial_check_failed"
     assert branch.rounds == []
+
+
+# ---------------------------------------------------------------------------
+# Third review round: _apply_round_to_pending() must judge each artifact_id
+# by its LATEST disposition, never by processing `regenerated` in full and
+# then `reverified_untouched` in full regardless of true chronology.
+# ---------------------------------------------------------------------------
+
+
+def test_a_still_failing_candidate_is_not_cleared_by_an_earlier_superseded_reaffirm() -> None:
+    """Review repro: a -> z -> b. Repairing 'a' cascades and marks z and b
+    both stale. The sweep visits 'b' first (alphabetically before 'z'),
+    where it PASSes and is reaffirmed -- then visits 'z', which FAILs and
+    is regenerated, re-invalidating 'b' again; revisited once more, 'b'
+    FAILs this time and is genuinely regenerated (STILL_FAILING). So 'b'
+    ends up in BOTH `reverified_untouched` (the now-superseded early PASS)
+    and `regenerated` (the true, later STILL_FAILING). The old
+    _apply_round_to_pending() processed all of `regenerated` first (adding
+    b to pending/unresolved_ids), then unconditionally processed all of
+    `reverified_untouched` afterward, which popped b right back out --
+    reporting stopped_reason="no_more_failures" with b left genuinely
+    broken."""
+    checkpoint, refs = _checkpoint_with_a_dependency_chain("a", "z", "b")
+    producer = _FakeProducer()
+    validator = _SequencedValidator(
+        {"z": [CheckOutcome.FAIL, CheckOutcome.PASS], "b": [CheckOutcome.PASS, CheckOutcome.FAIL]}
+    )
+    runner = _runner(producer, lambda store: validator)
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["a"])]
+
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+    )
+
+    branch = result.branches[0]
+    executions = _all_executions(branch)
+    # Confirm the repro actually happened: b appears in both the audit-log
+    # lists, with the regenerated one's outcome being the true, later one.
+    assert any(
+        r.pre_repair_ref.artifact_id == "b" and r.outcome == RepairOutcome.STILL_FAILING
+        for ex in executions
+        for r in ex.regenerated
+    )
+    assert any(ref.artifact_id == "b" for ex in executions for ref in ex.reverified_untouched)
+    assert branch.stopped_reason != "no_more_failures"
 
 
 # ---------------------------------------------------------------------------
