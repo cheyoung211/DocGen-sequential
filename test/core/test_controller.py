@@ -831,7 +831,7 @@ def test_tool_node_pulls_a_later_true_pass_over_an_earlier_superseded_fail_in_a_
     updates = runtime._tool_node(state)
 
     assert updates["blocked_artifact_ids"] == set()
-    assert updates["needs_recheck_ids"] == set()
+    assert updates["needs_recheck_keys"] == set()
     by_artifact = {item.checked_artifact.artifact_id: item for item in updates["current_evidence"]}
     assert by_artifact["b"].outcome == CheckOutcome.PASS
     assert by_artifact["b"].checked_artifact.version == store.latest("b").ref.version == 3
@@ -887,7 +887,8 @@ def test_invalidated_constraint_is_queued_for_recheck_not_silently_dropped() -> 
     }
     assert "A" not in by_constraint  # the invalidated FAIL is gone
     assert by_constraint["B"].outcome == CheckOutcome.PASS  # the still-valid PASS survives untouched
-    assert "doc" in updates["needs_recheck_ids"]
+    assert ("doc", "A") in updates["needs_recheck_keys"]
+    assert ("doc", "B") not in updates["needs_recheck_keys"]  # B was never invalidated -- only A is owed a recheck
 
     # The next decision must re-CHECK "doc" rather than treat B's lone
     # surviving PASS as proof everything required is already covered.
@@ -1050,6 +1051,98 @@ def test_llm_controller_prompt_states_the_authoritative_compile_config() -> None
     prompt = policy._user_prompt(state, store)
     assert "req1" in prompt
     assert "/tmp/correct" in prompt
+
+
+# -- Third review round: bugs 13-14 (see controller.py's module docstring) --
+
+
+def test_check_naming_only_some_constraints_does_not_clear_other_pending_rechecks() -> None:
+    """Bug 13 repro: needs_recheck_keys used to be cleared for the WHOLE
+    artifact_id the moment any CHECK touched it, regardless of which
+    constraints that CheckCall actually named. "doc" has constraint A
+    already pending a recheck (invalidated earlier) and constraint B
+    already PASSing; a CHECK naming only B must not silently clear A's
+    own, still-unexamined, obligation -- and the next decision must still
+    treat "doc" as needing another look, never silently proceed to
+    COMPILE just because the one remaining evidence entry (B) looks
+    clean."""
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+
+    class _OnlyEverChecksB:
+        def check(self, artifact, constraints, context=None):  # noqa: ANN001
+            return [Evidence(constraint_id="B", outcome=CheckOutcome.PASS, checked_artifact=artifact)]
+
+    policy = RuleBasedController(doc_ref, _constraint_provider, request_id="req1", output_dir="/tmp/x")
+    runtime = ControllerRuntime(
+        store,
+        policy,
+        _OnlyEverChecksB(),
+        {ArtifactKind.DOCUMENT: _FakeProducer()},
+        _constraint_provider,
+        document_ref=doc_ref,
+        budget=Budget(cap=1000.0),
+    )
+    state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        current_evidence=[Evidence(constraint_id="B", outcome=CheckOutcome.PASS, checked_artifact=doc_ref)],
+        tracked_artifact_ids={"doc"},
+        needs_recheck_keys={("doc", "A")},  # A was invalidated earlier, still owed a recheck
+        pending_tool_call=CheckCall(
+            artifact=doc_ref,
+            constraints=[Constraint(constraint_id="B", kind=ConstraintKind.SCHEMA_CONTRACT, description="x")],
+        ),
+    )
+    updates = runtime._tool_node(state)
+
+    assert ("doc", "A") in updates["needs_recheck_keys"]  # still pending -- A was never re-examined by this CHECK
+    assert ("doc", "B") not in updates["needs_recheck_keys"]
+
+    next_state = state.model_copy(update=updates)
+    next_call = policy.decide(next_state, store, runtime._tool_executor)
+    assert next_call.action.value == "check"
+    assert next_call.artifact.artifact_id == "doc"
+
+
+def test_llm_chosen_finish_call_still_gets_the_full_unresolved_aggregate() -> None:
+    """Bug 14 repro: _aggregate_unresolved() was only ever invoked from the
+    two guard branches and from LLMController's own FAILURE fallbacks
+    (admission-rejected, retries-exhausted) -- a model that successfully
+    parsed a FinishCall of its OWN choosing bypassed it entirely. "doc" is
+    FAILing and sitting in blocked_artifact_ids; the model decides
+    reason="cannot_repair" with its own (wrong) empty unresolved list --
+    the runtime must still record the real picture, regardless of what
+    the model itself supplied."""
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    decision_json = (
+        '{"call": {"action": "finish", "reason": "cannot_repair", "unresolved_artifact_ids": []}, "rationale": ""}'
+    )
+    generator = _FakeLLMGenerator([decision_json])
+    policy = LLMController(doc_ref, generator, request_id="req1")
+    runtime = ControllerRuntime(
+        store,
+        policy,
+        _AlwaysFailValidator(),
+        {ArtifactKind.DOCUMENT: _FakeProducer()},
+        _constraint_provider,
+        document_ref=doc_ref,
+        budget=Budget(cap=1000.0),
+    )
+    state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        current_evidence=[Evidence(constraint_id="c0", outcome=CheckOutcome.FAIL, checked_artifact=doc_ref)],
+        tracked_artifact_ids={"doc"},
+        blocked_artifact_ids={"doc"},
+    )
+    updates = runtime._controller_node(state)
+    call = updates["pending_tool_call"]
+    assert call.reason == "cannot_repair"  # the model's own reason is preserved
+    assert call.unresolved_artifact_ids == ["doc"]  # but the real unresolved picture is enforced regardless
 
 
 # -- Anti-infinite-loop / repeated-fix guard ---------------------------------

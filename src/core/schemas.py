@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -1294,22 +1294,29 @@ class ControllerState(BaseModel):
       cleanly with an honest reason instead of blindly repeating an
       identical COMPILE call until the repeated-action guard eventually
       intervenes.
-    - ``needs_recheck_ids``: artifact_ids whose cached evidence was just
-      dropped because one of its own inputs moved (``ArtifactGraphStore.
-      is_evidence_still_valid`` turned False for it), added after a second
-      user review found that dropping an invalidated verdict and simply
-      leaving nothing behind was not enough: a document with constraint
-      A=FAIL and constraint B=PASS, where A's (but not B's) input changes
-      through a relation recorded only on ``Evidence.input_versions`` (no
-      matching graph edge, so the document itself never becomes
-      ``is_stale()``), lost exactly A's now-invalid FAIL and kept B's
-      still-valid PASS -- leaving ``_classify()`` reading a clean "PASS"
-      and proceeding straight to COMPILE/FINISH without ever re-checking
-      the one constraint that actually needed it. An id in this set is
-      "owed a fresh CHECK" regardless of what evidence (if any) still
-      happens to remain for it; cleared the moment a fresh CHECK (or a
-      repair's own re-verification) actually runs against it again,
-      whatever that check then finds.
+    - ``needs_recheck_keys``: ``(artifact_id, constraint_id)`` pairs whose
+      cached evidence was just dropped because one of its own inputs moved
+      (``ArtifactGraphStore.is_evidence_still_valid`` turned False for
+      it), added after a second user review found that dropping an
+      invalidated verdict and simply leaving nothing behind was not
+      enough: a document with constraint A=FAIL and constraint B=PASS,
+      where A's (but not B's) input changes through a relation recorded
+      only on ``Evidence.input_versions`` (no matching graph edge, so the
+      document itself never becomes ``is_stale()``), lost exactly A's
+      now-invalid FAIL and kept B's still-valid PASS -- leaving
+      ``_classify()`` reading a clean "PASS" and proceeding straight to
+      COMPILE/FINISH without ever re-checking the one constraint that
+      actually needed it. Keyed per-constraint, not just per-artifact
+      (a third user review: a single CHECK can legitimately name only
+      SOME of an artifact's constraints -- ``CheckCall.constraints`` is
+      never required to equal the full set a ``ConstraintProvider`` would
+      return -- so clearing every pending obligation for an artifact just
+      because *any* CHECK touched it could clear A's own obligation while
+      only B was actually re-examined). A pair is "owed a fresh CHECK"
+      regardless of what evidence (if any) still happens to remain for
+      that artifact; cleared only once a fresh CHECK (or a repair's own
+      re-verification) actually produces new, currently-valid evidence
+      for that *exact* ``(artifact_id, constraint_id)`` pair again.
     """
 
     document_ref: ArtifactRef
@@ -1318,7 +1325,7 @@ class ControllerState(BaseModel):
     current_evidence: List[Evidence] = Field(default_factory=list)
     tracked_artifact_ids: Set[str] = Field(default_factory=set)
     blocked_artifact_ids: Set[str] = Field(default_factory=set)
-    needs_recheck_ids: Set[str] = Field(default_factory=set)
+    needs_recheck_keys: Set[Tuple[str, str]] = Field(default_factory=set)
     compiled: bool = False
     last_compile_failed: bool = False
     step_count: int = 0

@@ -429,3 +429,60 @@ REPLAN 두 분기 모두, merge 과정에서 `is_evidence_still_valid()`가 Fals
 `live_evidence()` 기반으로 교체, `_controller_node`의 상태 스냅샷을 `decide()` 호출 뒤로
 이동, `_build_graph`에 `START` 조건부 edge 추가). `tool_executor.py`는 이번 라운드에는
 변경하지 않았다.
+
+## 8. 사용자 3차 재검토 후 수정 (2026-10-20)
+
+7절 수정본을 사용자가 다시 리뷰해 2건을 추가로 지적했다 — 둘 다 7절 자신의 새 메커니즘
+(`needs_recheck_ids`, `_aggregate_unresolved`) *내부*의 결함이었다. 이번에도
+`schemas.py`/`controller.py` 두 파일만 수정했다. 전체 상세는 `src/core/controller.py`의
+모듈 docstring(13-14번 항목)과 메모리 `docgen_stage_review_rigor`(패턴 #52 이후)에도 동일하게
+남겼다.
+
+### 8.1 일부 제약만 검사해도 재검사 대기가 전부 해제됨
+
+`needs_recheck_ids`(7.2)는 `artifact_id`로만 키를 뒀다. `_tool_node`의 CHECK 분기는 CHECK가
+실행되면 `call.artifact.artifact_id`를 무조건 집합에서 제거했는데, `CheckCall.constraints`는
+그 artifact가 가질 수 있는 제약의 전체 집합과 같다는 보장이 전혀 없다 — 특히
+`LLMController`의 CheckCall은 모델의 구조화 출력에서 그대로 오므로 임의의 부분집합일 수
+있다. 재현: 문서에 제약 A(무효화되어 재검사 대기 중)·B(이미 PASS)가 있는 상태에서, B만
+검사하는 CheckCall이 실행되면 — A는 전혀 다시 검사되지 않았는데도 — A의 재검사 대기가 함께
+해제됐다. 그 뒤 `_classify()`는 남은 B의 PASS만 보고 깨끗하다고 판단해 COMPILE →
+`finish:resolved`로 진행할 수 있었다.
+
+**수정**: `ControllerState.needs_recheck_ids`(`Set[str]`)를 `needs_recheck_keys`
+(`Set[Tuple[str, str]]`, `(artifact_id, constraint_id)`)로 재설계했다 — `_merge_evidence`가
+이미 쓰는 것과 같은 키다. `_invalidated_ids` → `_invalidated_keys`로 바꿔 쌍 단위로
+무효화를 기록하고, `_tool_node`의 CHECK·PATCH/REPLAN 두 분기 모두 "이번 호출이 실제로
+유효한 새 evidence를 만들어낸 바로 그 쌍"만 해제한다(`observation.output.evidence`/
+`live_evidence()` 결과를 직접 보고 계산) — 같은 artifact의 다른 쌍은 전혀 건드리지 않는다.
+
+### 8.2 LLM이 반환한 FINISH는 미해결 목록 집계를 우회함
+
+`_aggregate_unresolved()`(7.4)는 guard 두 곳과 `LLMController`의 *실패* fallback(admission
+거부, 재시도 소진)에만 적용돼 있었다. 모델이 **정상적으로 파싱에 성공한** 자기 자신의
+FinishCall(예: `reason="cannot_repair"`)은 그대로 반환·실행돼, 이 경로는 집계를 전혀 거치지
+않았다. 재현: `doc`이 FAIL이고 `blocked_artifact_ids={"doc"}`인 상태에서 모델이
+`unresolved_artifact_ids=[]`를 반환하면, 종료 기록도 그대로 `[]`로 남았다.
+
+**수정**: 집계 호출을 각 경로(guard, `RuleBasedController`, `LLMController`) 내부에 두는
+대신, `_controller_node`가 `call`이 확정된 **직후** 단 한 곳에서 `isinstance(call,
+FinishCall)`이면 `_aggregate_unresolved(state, store)`를 `call.unresolved_artifact_ids`에
+합집합으로 덮어쓴다 — 어느 경로가 그 FinishCall을 만들었는지와 무관하게 항상 적용된다. 두
+guard는 이제 빈 리스트만 넘기고 이 중앙 처리에 전적으로 의존하도록 단순화했다(기존
+`RuleBasedController`/`LLMController`의 fallback 쪽 `_aggregate_unresolved()` 호출은 중복이
+됐지만 그대로 둬도 안전하므로 — 합집합은 멱등이다 — 건드리지 않았다).
+
+### 검증
+
+`test/core/test_controller.py`가 34개→36개로 늘었다(신규 2개, 기존 2개는 이름/필드 변경에
+맞춰 갱신). `test/core/` 258→260개 전부 통과. 전체 저장소 기준 806 passed, 기존과 동일한
+57건(무관) + 끊어진 테스트 파일 1개(동일) 외 회귀 없음. 변경된 파일: `src/core/schemas.py`
+(`ControllerState.needs_recheck_ids` → `needs_recheck_keys: Set[Tuple[str, str]]`),
+`src/core/controller.py`(위 8.1-8.2 전체 — `_invalidated_ids`→`_invalidated_keys`,
+`_compute_unresolved`/`_aggregate_unresolved`가 새 키를 사용, `_tool_node`의 CHECK·
+PATCH/REPLAN 분기가 쌍 단위로만 해제, `_controller_node`가 모든 FinishCall에 집계를 한
+곳에서 강제). `artifact_graph.py`/`tool_executor.py`는 이번 라운드에는 변경하지 않았다.
+**교훈**: 7라운드 자신이 도입한 두 메커니즘(`needs_recheck_ids`, `_aggregate_unresolved`) 각각이
+"이 메커니즘을 적용하는 호출 지점이 정말 전부인가"를 충분히 따져보지 않아서 생긴 결함이었다 —
+키의 세밀도(artifact 단위 vs constraint 단위)와 호출 지점의 완전성(일부 경로만 적용 vs 모든
+경로)은 매 라운드 새 메커니즘을 추가할 때마다 다시 확인해야 하는 축이다.
