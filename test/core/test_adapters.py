@@ -356,8 +356,11 @@ def test_block_patch_producer_surfaces_a_raised_precondition_failure() -> None:
 
 def test_block_patch_producer_reports_success_with_a_real_artifact() -> None:
     graph = _graph_with_one_section()
-    stub_output = MagicMock()
-    stub_output.model_dump_json.return_value = "stub-block-json"
+    stub_output = TextAgentOutput(
+        request_id="req-1",
+        section_id="sec_intro",
+        blocks=[ContentBlock(block_id="def1", type=SemanticBlockType.PARAGRAPH, text="patched body")],
+    )
     producer = BlockPatchProducer(_StubTextAgentForPatch(stub_output))
 
     result = producer.produce(
@@ -375,8 +378,55 @@ def test_block_patch_producer_reports_success_with_a_real_artifact() -> None:
     assert result.artifact.artifact_id == "def1"
     assert result.artifact.kind == ArtifactKind.BLOCK
     assert producer.last_output is stub_output
-    assert result.content == "stub-block-json"
+    assert result.content == stub_output.blocks[0].model_dump_json()
     assert result.read_input_versions == []
+
+
+def test_block_patch_producer_extracts_only_the_patched_block_not_the_whole_section() -> None:
+    """regenerate_blocks returns the WHOLE section's blocks -- the patched
+    one plus every other block it loaded and kept untouched
+    (text_agent.py's own docstring). A review found the previous version
+    serialized that entire multi-block payload as this one BLOCK-kind
+    artifact's content; only the block actually named by artifact_id is
+    real content for THIS artifact."""
+    graph = _graph_with_one_section()
+    stub_output = TextAgentOutput(
+        request_id="req-1",
+        section_id="sec_intro",
+        blocks=[
+            ContentBlock(block_id="other_block", type=SemanticBlockType.PARAGRAPH, text="untouched sibling"),
+            ContentBlock(block_id="def1", type=SemanticBlockType.PARAGRAPH, text="patched body"),
+        ],
+    )
+    producer = BlockPatchProducer(_StubTextAgentForPatch(stub_output))
+
+    result = producer.produce(
+        "def1",
+        {"node_id": "sec_intro", "graph": graph, "request_id": "req-1", "error_message": "bad bracket"},
+    )
+
+    assert result.status == ProductionStatus.SUCCESS
+    assert result.content == stub_output.blocks[1].model_dump_json()
+    assert "other_block" not in result.content
+    assert "untouched sibling" not in result.content
+
+
+def test_block_patch_producer_reports_failure_when_no_returned_block_matches() -> None:
+    graph = _graph_with_one_section()
+    stub_output = TextAgentOutput(
+        request_id="req-1",
+        section_id="sec_intro",
+        blocks=[ContentBlock(block_id="some_other_block", type=SemanticBlockType.PARAGRAPH, text="x")],
+    )
+    producer = BlockPatchProducer(_StubTextAgentForPatch(stub_output))
+
+    result = producer.produce(
+        "def1",
+        {"node_id": "sec_intro", "graph": graph, "request_id": "req-1", "error_message": "bad bracket"},
+    )
+
+    assert result.status == ProductionStatus.FAILED
+    assert "def1" in result.error
 
 
 def test_block_patch_producer_requires_error_message_in_context() -> None:
@@ -397,8 +447,11 @@ def test_block_patch_producer_forwards_node_id_and_block_id_separately() -> None
     needs both as separate parameters, unlike TextAgentProducer where
     artifact_id alone is the section."""
     graph = _graph_with_one_section()
-    stub_output = MagicMock()
-    stub_output.model_dump_json.return_value = "stub-block-json"
+    stub_output = TextAgentOutput(
+        request_id="req-1",
+        section_id="sec_intro",
+        blocks=[ContentBlock(block_id="def1", type=SemanticBlockType.PARAGRAPH, text="x")],
+    )
     stub_agent = _StubTextAgentForPatch(stub_output)
     producer = BlockPatchProducer(stub_agent)
 

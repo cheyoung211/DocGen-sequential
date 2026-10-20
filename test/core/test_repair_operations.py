@@ -5,9 +5,10 @@ implementations. Uses Protocol-conforming fakes throughout -- no real LLM
 call anywhere in this file, per this stage's explicit scope decision (see
 repair_operations.py's module docstring).
 
-Revised after a user review found 8 real bugs in the first pass (see
-memory docgen_stage_review_rigor) -- every fix below has at least one
-regression test named after the repro that caught it."""
+Revised after a user review found 8 real bugs in the first pass, and a
+second review found 2 more (see memory docgen_stage_review_rigor) -- every
+fix below has at least one regression test named after the repro that
+caught it."""
 
 from __future__ import annotations
 
@@ -97,6 +98,17 @@ class _FakeValidator:
             Evidence(constraint_id=c.constraint_id, outcome=outcome, checked_artifact=artifact, detail="fake")
             for c in constraints
         ]
+
+
+class _RaisingValidator:
+    """Always raises instead of returning Evidence -- models a real
+    ``Validator.check()`` crash, which ``ToolExecutor`` reports as
+    ``ToolErrorCode.EXECUTION_FAILED``, never any budget code."""
+
+    def check(
+        self, artifact: ArtifactRef, constraints: List[Constraint], context: Optional[Dict[str, Any]] = None
+    ) -> List[Evidence]:
+        raise RuntimeError("validator exploded")
 
 
 def _one_constraint_per_artifact(no_constraints_for: FrozenSet[str] = frozenset()):
@@ -450,6 +462,99 @@ def test_reaffirmed_evidence_is_rebound_to_the_new_version_so_live_evidence_is_n
     live = store.live_evidence("b")
     assert len(live) == 1
     assert live[0].checked_artifact.version == store.latest("b").ref.version
+
+
+# ---------------------------------------------------------------------------
+# Second review round, issue 1: left_stale/overall_outcome must reflect the
+# CURRENT final state, regardless of processing history -- not whatever a
+# RESOLVED record claimed before a later sibling re-invalidated it.
+# ---------------------------------------------------------------------------
+
+
+def test_multiple_explicit_targets_out_of_dependency_order_leave_no_target_stale() -> None:
+    """Review repro: explicit targets given as [b, a] where a -> b.
+    Regenerating b FIRST, then a, used to leave b genuinely stale with its
+    only RegeneratedArtifactRecord dated from *before* a ever changed --
+    reported RESOLVED with left_stale=[] regardless."""
+    store = ArtifactGraphStore()
+    _store_with_chain(store, ("a", ArtifactKind.SECTION), ("b", ArtifactKind.SECTION))
+    producer = _FakeProducer()
+    validator = _FakeValidator(fail_ids=frozenset())  # everything passes its own content check
+    executor = _executor(store, {ArtifactKind.SECTION: producer}, validator)
+
+    b_ref = store.latest("b").ref
+    a_ref = store.latest("a").ref
+    result = executor.execute(_action(RepairActionType.REGENERATE_SECTION, [b_ref, a_ref]))
+
+    assert store.is_stale("b") is False
+    assert "b" not in {r.artifact_id for r in result.left_stale}
+    assert result.overall_outcome == RepairOutcome.RESOLVED
+    final_b = store.latest("b")
+    final_a = store.latest("a")
+    assert final_b.ref.read_input_versions[0].version == final_a.ref.version
+
+
+def test_regenerate_document_settles_a_multi_hop_chain_regardless_of_processing_order() -> None:
+    """Review repro: doc -> z -> b (doc upstream; z reads doc; b reads z).
+    Plain id-sort processing order forces doc, b, z in that order -- doc
+    was regenerated against z's OLD version, and nothing ever revisited it
+    once z changed afterward. Must settle to a genuinely fresh final
+    state, never RESOLVED with something still actually stale."""
+    store = ArtifactGraphStore()
+    doc_result = store.add_version("doc", ArtifactKind.DOCUMENT, content=None)
+    z_result = store.add_version("z", ArtifactKind.SECTION, content=None, read_input_versions=[doc_result.ref])
+    store.add_version("b", ArtifactKind.SECTION, content=None, read_input_versions=[z_result.ref])
+
+    producer = _FakeProducer()
+    validator = _FakeValidator(fail_ids=frozenset())
+    executor = _executor(store, {ArtifactKind.DOCUMENT: producer, ArtifactKind.SECTION: producer}, validator)
+
+    action = _action(RepairActionType.REGENERATE_DOCUMENT, [store.latest("doc").ref], feedback=False)
+    result = executor.execute(action)
+
+    assert store.is_stale("doc") is False
+    assert store.is_stale("z") is False
+    assert store.is_stale("b") is False
+    assert result.left_stale == []
+    assert result.overall_outcome == RepairOutcome.RESOLVED
+    final_doc = store.latest("doc")
+    final_z = store.latest("z")
+    final_b = store.latest("b")
+    assert final_z.ref.read_input_versions[0].version == final_doc.ref.version
+    assert final_b.ref.read_input_versions[0].version == final_z.ref.version
+
+
+# ---------------------------------------------------------------------------
+# Second review round, issue 2 (in this file's own _check(), not
+# branching_runner.py's): a validator CRASH during a check must not be
+# misread as budget exhaustion -- only schemas.BUDGET_ERROR_CODES earns that.
+# ---------------------------------------------------------------------------
+
+
+def test_a_validator_crash_is_not_misreported_as_budget_exhaustion() -> None:
+    """Review repro: the wrapped Validator.check() raises --
+    ToolExecutor reports ToolErrorCode.EXECUTION_FAILED, with 10,000
+    budget remaining and the executor never suspended. Must not abort the
+    whole cascade as "out of room"; the affected candidates are left
+    genuinely unresolved (INCONCLUSIVE / left_stale), never silently
+    treated as a budget stop."""
+    store = ArtifactGraphStore()
+    _store_with_chain(store, ("a", ArtifactKind.SECTION), ("b", ArtifactKind.SECTION))
+    producer = _FakeProducer()
+    validator = _RaisingValidator()
+    tool_executor = ToolExecutor(store, validator, budget=Budget(cap=10_000.0), max_actions=1_000)
+    executor = RepairOperationExecutor(
+        store, tool_executor, {ArtifactKind.SECTION: producer}, _one_constraint_per_artifact(), {}, model_name="fake"
+    )
+
+    result = executor.execute(_action(RepairActionType.REGENERATE_SECTION, [store.latest("a").ref]))
+
+    assert result.budget_exhausted is False
+    assert tool_executor.is_suspended is False
+    assert tool_executor.budget.remaining > 9_000
+    a_record = next(r for r in result.regenerated if r.pre_repair_ref.artifact_id == "a")
+    assert a_record.outcome == RepairOutcome.INCONCLUSIVE  # a's own reverify check crashed
+    assert "b" in {r.artifact_id for r in result.left_stale}  # b's cascade check crashed too
 
 
 # ---------------------------------------------------------------------------

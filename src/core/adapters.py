@@ -234,12 +234,31 @@ class BlockPatchProducer:
             )
             return ProductionResult(status=ProductionStatus.FAILED, error=error)
 
+        # `self.last_output` is a `TextAgentOutput` for the WHOLE section --
+        # `regenerate_blocks` returns every block of the section, the
+        # patched one plus every other block it loaded and kept untouched
+        # (text_agent.py's own docstring on this method). A review found
+        # the previous version serialized that entire section-wide payload
+        # as if it were this one BLOCK-kind artifact's content, so a
+        # block-level content/provenance comparison was silently comparing
+        # mismatched units (one block's "before" against two blocks'
+        # "after"). Only the one block actually named by `artifact_id` is
+        # this artifact's real content.
+        patched_block = next(
+            (block for block in self.last_output.blocks if block.block_id == artifact_id), None
+        )
+        if patched_block is None:
+            return ProductionResult(
+                status=ProductionStatus.FAILED,
+                error=(
+                    f"regenerate_blocks succeeded but its returned blocks contain "
+                    f"no block_id matching '{artifact_id}'"
+                ),
+            )
         return ProductionResult(
             status=ProductionStatus.SUCCESS,
             artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.BLOCK),
-            # See PlannerAgentProducer's identical comment -- same Stage 4
-            # review finding, same fix.
-            content=self.last_output.model_dump_json(),
+            content=patched_block.model_dump_json(),
             read_input_versions=context.get("read_input_versions"),
         )
 

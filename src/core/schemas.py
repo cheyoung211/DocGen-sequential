@@ -620,6 +620,24 @@ class ToolErrorCode(str, Enum):
     EXECUTION_FAILED = "execution_failed"
 
 
+BUDGET_ERROR_CODES = frozenset(
+    {ToolErrorCode.BUDGET_EXCEEDED, ToolErrorCode.MAX_ACTIONS_EXCEEDED, ToolErrorCode.SUSPENDED}
+)
+"""Every ``ToolErrorCode`` that means "no room was left to even attempt this
+call" -- as opposed to ``EXECUTION_FAILED``/``TIMEOUT``/``NOT_IMPLEMENTED``/
+``UNKNOWN_ARTIFACT``, which mean a call genuinely ran (or was dispatched)
+and something about the call itself failed, not this executor's own
+admission state. A caller distinguishing "stop the whole cascade/branch,
+nothing further can run" from "this one call just errored, everything else
+can still proceed" must branch on membership in this set, never treat every
+``not observation.ok`` as the former -- a Stage 4 review found exactly this
+collapse in both ``repair_operations.RepairOperationExecutor._check()`` and
+``branching_runner.BranchingRunner``'s own ``check_timing="final_only"``
+initial check, each of which previously read a ``Validator.check()`` that
+raised (surfaced as ``EXECUTION_FAILED``) as if it were a budget
+exhaustion."""
+
+
 class ToolExecutionError(BaseModel):
     """One structured execution failure for one ``ToolCall``. Never a bare
     exception/string: ``code`` is always one of ``ToolErrorCode`` so a

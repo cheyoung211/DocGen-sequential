@@ -48,6 +48,43 @@ detail in memory ``docgen_stage_review_rigor``) -- this revision:
    "fixed graph-aware"'s rare fallback case instead of the deliberately
    blind baseline ``docs/stage1_experiment_design.md`` defines.
 
+**Revised a second time after a user review found 2 more real bugs in
+this file** (full detail in memory ``docgen_stage_review_rigor``):
+
+9. ``_execute_selective``'s final ``left_stale`` computation (and the
+   same-shaped one in ``_execute_unconditional``) no longer trusts
+   "received a ``RegeneratedArtifactRecord``/reaffirmation at some point
+   during this call" as proof of a *final* resolved state. Two concrete
+   repros: (a) explicit targets given out of dependency order (``[b, a]``
+   where ``b`` depends on ``a``) -- regenerating ``b`` first, then ``a``,
+   leaves ``b`` stale again with its only record dated *before* ``a`` ever
+   changed; (b) ``_execute_unconditional``'s plain id-sort processing
+   order (``doc``, ``b``, ``z`` for a ``doc -> z -> b`` chain) means
+   ``doc`` gets regenerated from ``z``'s *old* version, and nothing ever
+   revisits it once ``z`` changes afterward. Both previously reported
+   ``RepairOutcome.RESOLVED`` with the store's own ``is_stale()`` still
+   ``True`` for the affected artifact -- the two disagreeing is exactly
+   what this module's own completion criterion forbids. Fixed by (i) no
+   longer excluding explicitly-named targets from the selective cascade's
+   own re-sweep pool, (ii) giving the unconditional path the same
+   fixed-point sweep ``_execute_selective`` already had plus a best-effort
+   ``_dependency_order`` for its first pass, and (iii) computing the
+   final ``left_stale`` in both from a fresh ``is_stale()`` check across
+   the whole relevant id set, excluding only ids a
+   ``PRODUCTION_FAILED``/``NO_PRODUCER`` record already fully explains --
+   never excluding on "was touched at some point" alone.
+10. ``_check()`` no longer treats every non-budget ``CheckCall`` rejection
+    as budget exhaustion. A real repro: the wrapped ``Validator.check()``
+    raises, ``ToolExecutor`` correctly reports
+    ``ToolErrorCode.EXECUTION_FAILED`` (10,000 budget still remaining,
+    executor not suspended) -- the previous version still returned
+    ``budget_rejected=True`` for *any* ``not observation.ok``, which
+    wrongly aborted the whole cascade as out of room. Now only
+    ``schemas.BUDGET_ERROR_CODES`` membership sets that flag; anything
+    else (``EXECUTION_FAILED``/``TIMEOUT``) comes back as empty evidence,
+    which the existing UNKNOWN/``left_stale`` path already handles
+    honestly with no new return state needed.
+
 Two components:
 
 - ``RepairOperationExecutor`` carries out one ``RepairAction`` -- the
@@ -91,6 +128,7 @@ from src.core.schemas import (
     ArtifactKind,
     ArtifactRef,
     Budget,
+    BUDGET_ERROR_CODES,
     CheckCall,
     CheckOutcome,
     Constraint,
@@ -104,7 +142,6 @@ from src.core.schemas import (
     RepairActionType,
     RepairExecutionResult,
     RepairOutcome,
-    ToolErrorCode,
 )
 from src.core.tool_executor import ToolExecutor
 
@@ -127,11 +164,6 @@ internally). Returning an empty list means "nothing to check this artifact
 against": a cascade candidate in that state is left exactly as-is
 (reported via ``RepairExecutionResult.left_stale``, never fabricated a
 verdict either way)."""
-
-_BUDGET_ERROR_CODES = frozenset(
-    {ToolErrorCode.BUDGET_EXCEEDED, ToolErrorCode.MAX_ACTIONS_EXCEEDED, ToolErrorCode.SUSPENDED}
-)
-
 
 def _classify_evidence(evidence: List[Evidence]) -> str:
     """One of ``"FAIL"``/``"PASS"``/``"UNKNOWN"`` -- the three-way split a
@@ -222,6 +254,17 @@ class RepairOperationExecutor:
         costs: List[CostRecord] = []
         budget_exhausted = False
         blocked_ids: Set[str] = set()
+        # The most recent thing that actually happened to each artifact_id,
+        # updated in true chronological execution order (never
+        # reconstructed after the fact from `regenerated`/
+        # `reverified_untouched`, since the same id can appear in both --
+        # regenerated, then later reaffirmed, or vice versa -- across
+        # different sweep passes, and only the *last* one is still true).
+        # Drives the final ``left_stale`` decision below: only
+        # ``RESOLVED``/reaffirmed-PASS can be *wrong* about whether this id
+        # is still stale right now; every other outcome already reports
+        # its own current unresolved state honestly.
+        last_outcome: Dict[str, RepairOutcome] = {}
 
         seed_refs: List[ArtifactRef] = []
         seen_ids: Set[str] = set()
@@ -238,6 +281,7 @@ class RepairOperationExecutor:
             live_ref = remaining_seeds.pop(0)
             record, cost, exhausted = self._regenerate(live_ref, action)
             regenerated.append(record)
+            last_outcome[live_ref.artifact_id] = record.outcome
             if cost is not None:
                 costs.append(cost)
             if exhausted:
@@ -247,10 +291,10 @@ class RepairOperationExecutor:
                 blocked_ids.add(live_ref.artifact_id)
             else:
                 affected_ids |= self._store.impact_candidates(live_ref.artifact_id)
-        for ref in remaining_seeds:  # never reached -- budget ran out first
+        left_stale_ids: Set[str] = set()
+        for ref in remaining_seeds:  # never even attempted -- budget ran out first
             left_stale.append(ref)
-
-        affected_ids -= seen_ids
+            left_stale_ids.add(ref.artifact_id)
 
         if not budget_exhausted:
             max_sweeps = len(affected_ids) + 1
@@ -281,6 +325,7 @@ class RepairOperationExecutor:
                     if classification == "FAIL":
                         record, cost, exhausted = self._regenerate(live_ref, action)
                         regenerated.append(record)
+                        last_outcome[candidate_id] = record.outcome
                         if cost is not None:
                             costs.append(cost)
                         if exhausted:
@@ -296,27 +341,42 @@ class RepairOperationExecutor:
                     elif classification == "PASS":
                         new_ref = self._reaffirm(live_ref, evidence)
                         reverified_untouched.append(new_ref)
+                        last_outcome[candidate_id] = RepairOutcome.RESOLVED
                         affected_ids |= self._store.impact_candidates(new_ref.artifact_id) - {candidate_id}
                     # "UNKNOWN": leave exactly as-is (still stale) -- collected
                     # into left_stale below if it remains so at the end.
                 if not made_progress:
                     break
 
-        # Only artifact_ids that received NEITHER a RegeneratedArtifactRecord
-        # (any outcome) NOR a reaffirmation belong in left_stale -- those two
-        # already report their own final state in full; this list is
-        # reserved for candidates that were never actually resolved one way
-        # or the other at all (no constraints, or classified UNKNOWN).
-        touched_ids = {r.pre_repair_ref.artifact_id for r in regenerated} | {
-            r.artifact_id for r in reverified_untouched
-        }
-        for candidate_id in sorted(affected_ids):
-            if candidate_id in touched_ids:
+        # Regardless of processing history, every explicitly-named target AND
+        # every impact candidate that is CURRENTLY still stale belongs in
+        # left_stale -- unless its own `last_outcome` already honestly
+        # reports it as unresolved (STILL_FAILING/INCONCLUSIVE/
+        # PRODUCTION_FAILED/NO_PRODUCER via `regenerated`), or it was
+        # already listed above as never even attempted. Only RESOLVED (a
+        # fresh regenerate's own check passing, or a reaffirm) claims "this
+        # is fine now" -- and a review found that claim can go stale within
+        # this same call, when a *sibling* processed afterward invalidates
+        # it (e.g. explicit targets given as ``[b, a]`` where ``b`` depends
+        # on ``a``: regenerating ``b`` first, then ``a``, leaves ``b``
+        # stale again with its only record dated from *before* ``a`` ever
+        # changed). ``is_stale()`` is this store's one source of truth
+        # (``artifact_graph.py``'s own module docstring) -- an earlier
+        # RESOLVED claim is simply not proof of a *later* final state, so a
+        # candidate whose last known outcome is RESOLVED (or never touched
+        # at all) still gets a fresh live check here rather than being
+        # trusted on the strength of that one past record.
+        for candidate_id in sorted(seen_ids | affected_ids):
+            if candidate_id in left_stale_ids:
                 continue
+            outcome = last_outcome.get(candidate_id)
+            if outcome is not None and outcome != RepairOutcome.RESOLVED:
+                continue  # already honestly reported as unresolved via `regenerated`
             if self._store.is_stale(candidate_id):
                 current = self._store.latest(candidate_id)
                 if current is not None:
                     left_stale.append(current.ref)
+                    left_stale_ids.add(candidate_id)
 
         return RepairExecutionResult(
             action=action,
@@ -339,11 +399,38 @@ class RepairOperationExecutor:
         stage1_experiment_design.md`` §3); routing REGENERATE_DOCUMENT
         through the same selective cascade as the other three action types
         (the first-pass bug) made the two baselines behave identically
-        once either one escalated to document scope."""
+        once either one escalated to document scope.
+
+        A later review found that forcing everything exactly once, in
+        plain id-sort order, is not the same as everything actually being
+        fresh afterward: if an artifact processed early is itself an input
+        to one processed later (e.g. ``doc`` reads ``z`` reads ``b``,
+        id-sorted order visits ``doc``, ``b``, ``z``), the early one is
+        regenerated from what was, at that moment, still the *old* version
+        of its own input, and nothing ever revisited it once that input
+        changed. Two things fix this, mirroring ``_execute_selective``'s
+        own established pattern rather than inventing a new one: a
+        best-effort dependency order for the first pass
+        (``_dependency_order`` -- a pure ordering optimization, not a
+        correctness requirement, since the dependency graph is explicitly
+        allowed to contain cycles that no order can fully satisfy, per
+        ``artifact_graph.py``'s own module docstring), followed by a
+        bounded fixed-point sweep that keeps re-regenerating whatever is
+        still (or newly) stale until a full pass makes no further
+        progress. The final ``left_stale`` is then computed from a fresh
+        ``is_stale()`` check across the *whole* impact set, regardless of
+        processing history -- the same fix ``_execute_selective`` needed
+        for the identical reason."""
         regenerated: List[RegeneratedArtifactRecord] = []
         left_stale: List[ArtifactRef] = []
         costs: List[CostRecord] = []
         budget_exhausted = False
+        blocked_ids: Set[str] = set()
+        # Same role as `_execute_selective`'s own `last_outcome`: the most
+        # recent thing that actually happened to each artifact_id, updated
+        # in true chronological order -- only a RESOLVED outcome can be
+        # *wrong* about whether this id is still stale right now.
+        last_outcome: Dict[str, RepairOutcome] = {}
 
         document_refs = [ref for ref in action.target_artifacts if ref.kind == ArtifactKind.DOCUMENT]
         if not document_refs:
@@ -362,8 +449,8 @@ class RepairOperationExecutor:
 
         current = self._store.latest(document_refs[0].artifact_id)
         document_ref = current.ref if current is not None else document_refs[0]
-        rest = sorted(self._store.impact_candidates(document_ref.artifact_id) - {document_ref.artifact_id})
-        order = [document_ref.artifact_id] + rest
+        all_ids = self._store.impact_candidates(document_ref.artifact_id)
+        order = self._dependency_order(all_ids)
 
         processed_ids: Set[str] = set()
         for artifact_id in order:
@@ -372,22 +459,70 @@ class RepairOperationExecutor:
             current = self._store.latest(artifact_id)
             if current is None:
                 continue
-            live_ref = current.ref
-            record, cost, exhausted = self._regenerate(live_ref, action)
+            record, cost, exhausted = self._regenerate(current.ref, action)
             regenerated.append(record)
+            last_outcome[artifact_id] = record.outcome
             processed_ids.add(artifact_id)
             if cost is not None:
                 costs.append(cost)
             if exhausted:
                 budget_exhausted = True
+            elif record.outcome in (RepairOutcome.PRODUCTION_FAILED, RepairOutcome.NO_PRODUCER):
+                blocked_ids.add(artifact_id)
 
         if budget_exhausted:
-            for artifact_id in order:
-                if artifact_id in processed_ids:
+            for artifact_id in order:  # never even attempted -- budget ran out first
+                if artifact_id not in processed_ids:
+                    current = self._store.latest(artifact_id)
+                    if current is not None:
+                        left_stale.append(current.ref)
+        else:
+            remaining = set(order) - blocked_ids
+            max_sweeps = len(remaining) + 1
+            for _ in range(max_sweeps):
+                if budget_exhausted:
+                    break
+                made_progress = False
+                for artifact_id in sorted(remaining):
+                    if budget_exhausted:
+                        break
+                    if artifact_id in blocked_ids or not self._store.is_stale(artifact_id):
+                        continue
+                    current = self._store.latest(artifact_id)
+                    if current is None:
+                        continue
+                    record, cost, exhausted = self._regenerate(current.ref, action)
+                    regenerated.append(record)
+                    last_outcome[artifact_id] = record.outcome
+                    made_progress = True
+                    if cost is not None:
+                        costs.append(cost)
+                    if exhausted:
+                        budget_exhausted = True
+                        break
+                    if record.outcome in (RepairOutcome.PRODUCTION_FAILED, RepairOutcome.NO_PRODUCER):
+                        blocked_ids.add(artifact_id)
+                if not made_progress:
+                    break
+
+            # Regardless of processing history -- forced once, swept again
+            # any number of times, or never reached a sweep pass at all --
+            # every artifact in this document's impact set that is
+            # CURRENTLY still stale belongs in left_stale, unless its own
+            # `last_outcome` already honestly reports it as unresolved
+            # (STILL_FAILING/INCONCLUSIVE/PRODUCTION_FAILED/NO_PRODUCER).
+            # Only RESOLVED (or never having been reached at all, e.g. the
+            # sweep bound ran out) leaves room for the live check below to
+            # actually matter -- see `_execute_selective`'s identical
+            # reasoning.
+            for artifact_id in sorted(all_ids):
+                outcome = last_outcome.get(artifact_id)
+                if outcome is not None and outcome != RepairOutcome.RESOLVED:
                     continue
-                current = self._store.latest(artifact_id)
-                if current is not None:
-                    left_stale.append(current.ref)
+                if self._store.is_stale(artifact_id):
+                    current = self._store.latest(artifact_id)
+                    if current is not None:
+                        left_stale.append(current.ref)
 
         return RepairExecutionResult(
             action=action,
@@ -398,6 +533,55 @@ class RepairOperationExecutor:
             cost=costs,
             budget_exhausted=budget_exhausted,
         )
+
+    def _dependency_order(self, ids: Set[str]) -> List[str]:
+        """Best-effort order, restricted to ``ids``, with each artifact
+        ahead of anything that currently declares depending on it --
+        Kahn's algorithm over the same "currently applicable edge" notion
+        ``ArtifactGraphStore._current_dependents`` uses (an edge whose
+        ``to_artifact`` is no longer that artifact's current version is
+        ignored, exactly like that method). The dependency graph is
+        **not** assumed acyclic (``artifact_graph.py``'s own module
+        docstring says so explicitly) -- any ``ids`` left over once no
+        further zero-dependency node remains (a genuine cycle within this
+        set) are appended in plain id-sort order instead of raising.
+
+        This ordering only ever *reduces how often*
+        ``_execute_unconditional``'s own fixed-point sweep has to do
+        further work after the first pass -- it is never what makes the
+        final result correct on its own (a cycle, or an input declared
+        only after this call started, can still leave something stale
+        after even a perfect topological pass); the sweep, and the final
+        live ``is_stale()`` check after it, are."""
+        successors: Dict[str, Set[str]] = {artifact_id: set() for artifact_id in ids}
+        in_degree: Dict[str, int] = {artifact_id: 0 for artifact_id in ids}
+        for edge in self._store.edges:
+            from_id = edge.from_artifact.artifact_id
+            to_id = edge.to_artifact.artifact_id
+            if from_id not in ids or to_id not in ids or from_id == to_id or to_id in successors[from_id]:
+                continue
+            current = self._store.latest(to_id)
+            if current is None or current.ref.version != edge.to_artifact.version:
+                continue  # superseded edge -- no longer a live relation
+            successors[from_id].add(to_id)
+            in_degree[to_id] += 1
+
+        order: List[str] = []
+        seen: Set[str] = set()
+        ready = sorted(artifact_id for artifact_id in ids if in_degree[artifact_id] == 0)
+        while ready:
+            node = ready.pop(0)
+            seen.add(node)
+            order.append(node)
+            newly_ready = set()
+            for dependent in successors[node]:
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    newly_ready.add(dependent)
+            if newly_ready:
+                ready = sorted(set(ready) | newly_ready)
+        order.extend(sorted(ids - seen))  # a genuine cycle -- the sweep fixes correctness, not this order
+        return order
 
     # -- ToolExecutor-routed primitives --
 
@@ -416,7 +600,7 @@ class RepairOperationExecutor:
         )
         if not observation.ok:
             assert observation.error is not None
-            rejected = observation.error.code in _BUDGET_ERROR_CODES
+            rejected = observation.error.code in BUDGET_ERROR_CODES
             return (
                 ProductionResult(status=ProductionStatus.FAILED, error=observation.error.message),
                 observation.cost,
@@ -426,18 +610,32 @@ class RepairOperationExecutor:
         return observation.output.production, observation.cost, False
 
     def _check(self, ref: ArtifactRef, constraints: List[Constraint]) -> Tuple[List[Evidence], bool]:
-        """Returns ``(evidence, admission_rejected)``. Routes through
+        """Returns ``(evidence, budget_rejected)``. Routes through
         ``ToolExecutor.execute(CheckCall(...))`` -- which already records
         the resulting ``Evidence`` to the store itself
         (``ToolExecutor._dispatch_check``), so this method must not record
-        it again. A rejected ``CheckCall`` can only mean budget/max-actions/
-        suspension (CHECK has no other rejection path), so
-        ``admission_rejected`` is unconditionally the whole story for a
-        ``not observation.ok`` result here."""
+        it again.
+
+        A rejected ``CheckCall`` does **not** only mean budget/max-actions/
+        suspension -- a review found a real repro where the wrapped
+        ``Validator.check()`` itself raised (e.g. a ``RuntimeError``),
+        which ``ToolExecutor._execute_inner`` correctly reports as
+        ``ToolErrorCode.EXECUTION_FAILED``, not any budget code, with
+        plenty of budget still remaining. The earlier version of this
+        method treated *every* ``not observation.ok`` as a budget
+        rejection, which made a single flaky check call wrongly abort the
+        entire cascade/branch as "budget exhausted". ``budget_rejected`` is
+        now only ``True`` for ``schemas.BUDGET_ERROR_CODES`` membership;
+        any other failure (``EXECUTION_FAILED``/``TIMEOUT``) comes back as
+        ``([], False)`` -- empty evidence, same as a genuinely unknown
+        verdict, which the existing ``_classify_evidence``/``UNKNOWN``
+        path already handles honestly (left stale, never fabricated)
+        without this method needing a third return state."""
         call = CheckCall(artifact=ref, constraints=constraints, context=dict(self._base_context))
         observation = self._tool_executor.execute(call)
         if not observation.ok:
-            return [], True
+            assert observation.error is not None
+            return [], observation.error.code in BUDGET_ERROR_CODES
         assert observation.output is not None
         return observation.output.evidence, False
 

@@ -48,6 +48,33 @@ design, fixed back in Stage 1 and executed here for the first time:
    as a side effect) was silently shared across branches, breaking the
    "same initial state" guarantee the whole point of branching depends on.
 
+**Revised a second time after a user review found 2 more real bugs
+affecting this module** (full detail in memory ``docgen_stage_review_rigor``):
+
+8. **A sub-failure a round's cascade discovers for the first time (never
+   part of that round's starting ``pending``) no longer vanishes.** Real
+   repro: only ``a`` is reported failing; repairing ``a`` cascades into a
+   downstream ``b`` whose production then fails. ``b`` has no FAIL
+   Evidence to re-enter ``pending`` with (production failures/left-stale
+   candidates carry none), so the round ended with an empty ``pending``
+   and ``stopped_reason="no_more_failures"`` even though ``b`` was left
+   genuinely broken -- the same misreport for ``b`` classified UNKNOWN or
+   with no constraints to check it against at all. Fixed with a second,
+   persistent ``unresolved_ids`` set (``_apply_round_to_pending``) that
+   accumulates every artifact_id any round ever reports
+   PRODUCTION_FAILED/NO_PRODUCER/left_stale and has not since reported
+   RESOLVED or reaffirmed PASS -- purely bookkeeping for
+   ``_finalize_stopped_reason`` to pick an honest label with, never
+   Evidence fed into ``decide()`` (UNKNOWN is still never promoted to
+   FAIL, per the review's own explicit note).
+9. ``check_timing="final_only"``'s one-shot initial check no longer
+   treats every rejection as budget exhaustion -- the same
+   ``schemas.BUDGET_ERROR_CODES`` distinction ``repair_operations.
+   RepairOperationExecutor._check()`` needed for the identical reason
+   (see that module's own docstring, point 10): a ``Validator.check()``
+   that raises is ``EXECUTION_FAILED``, not a budget code, even with
+   plenty of budget left.
+
 Nothing here is wired into ``scripts/run_full_pipeline.py`` -- same scope
 decision as ``repair_operations.py`` (proven with Protocol-conforming
 fakes this stage; a real small-scale pilot against the local Qwen3.6
@@ -56,7 +83,7 @@ pipeline is a deferred follow-up, not part of this stage's own code).
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
 from src.core.artifact_graph import ArtifactGraphStore
 from src.core.interfaces import RepairPolicy, Validator
@@ -66,6 +93,7 @@ from src.core.schemas import (
     Budget,
     BranchComparisonResult,
     BranchExecutionResult,
+    BUDGET_ERROR_CODES,
     CheckCall,
     CheckOutcome,
     Checkpoint,
@@ -213,18 +241,34 @@ class BranchingRunner:
                 assert observation.output is not None
                 current_evidence = observation.output.evidence
             else:
-                # Budget/max-actions/suspended before the very first check
-                # could even run -- nothing to decide from, and no round
-                # ever starts.
+                # Not every rejection here means budget/max-actions/
+                # suspended -- the wrapped Validator.check() can itself
+                # raise (surfaced as ToolErrorCode.EXECUTION_FAILED), which
+                # a review found this branch previously misreported as
+                # "budget_exhausted" even with plenty of budget left and
+                # the executor not suspended. Only schemas.BUDGET_ERROR_CODES
+                # membership earns that label; anything else is its own,
+                # honestly distinct reason -- still no round ever starts
+                # either way, since there is nothing to decide from.
+                assert observation.error is not None
+                reason = "budget_exhausted" if observation.error.code in BUDGET_ERROR_CODES else "initial_check_failed"
                 return BranchExecutionResult(
                     branch_id=spec.label,
                     source_checkpoint_id=checkpoint.checkpoint_id,
                     policy_label=spec.label,
                     rounds=[],
-                    stopped_reason="budget_exhausted",
+                    stopped_reason=reason,
                     final_checkpoint=store.save_checkpoint(label=f"{spec.label}-final"),
                     total_cost_tokens=tool_executor.budget.spent,
                 )
+
+        # Artifact_ids this branch has at some point seen reported
+        # PRODUCTION_FAILED/NO_PRODUCER/left_stale and not since reported
+        # RESOLVED or reaffirmed PASS -- see `_apply_round_to_pending`.
+        # Purely a bookkeeping set for choosing an honest `stopped_reason`
+        # below; never fed into `decide()` as fabricated Evidence (a
+        # review's explicit note: UNKNOWN must never be promoted to FAIL).
+        unresolved_ids: Set[str] = set()
 
         for round_index in range(self._max_downstream_rounds + 1):
             if tool_executor.is_suspended or tool_executor.budget.remaining <= 0:
@@ -234,9 +278,10 @@ class BranchingRunner:
             policy = spec.policy if round_index == 0 else downstream_policy
             decisions = policy.decide(current_evidence, store.edges, tool_executor.budget)
             if not decisions:
-                stopped_reason = (
+                clean_reason = (
                     "initial_policy_returned_nothing" if round_index == 0 else "downstream_policy_returned_nothing"
                 )
+                stopped_reason = self._finalize_stopped_reason(clean_reason, unresolved_ids)
                 break
 
             executions: List[RepairExecutionResult] = []
@@ -252,7 +297,7 @@ class BranchingRunner:
                     break
                 result = executor.execute(action, triggering_evidence=current_evidence)
                 executions.append(result)
-                self._apply_round_to_pending(pending, result)
+                self._apply_round_to_pending(pending, unresolved_ids, result)
                 if result.budget_exhausted:
                     round_budget_exhausted = True
                     break
@@ -271,7 +316,7 @@ class BranchingRunner:
 
             current_evidence = list(pending.values())
             if not any(item.outcome == CheckOutcome.FAIL for item in current_evidence):
-                stopped_reason = "no_more_failures"
+                stopped_reason = self._finalize_stopped_reason("no_more_failures", unresolved_ids)
                 break
         else:
             stopped_reason = "max_rounds_reached"
@@ -287,19 +332,31 @@ class BranchingRunner:
         )
 
     @staticmethod
-    def _apply_round_to_pending(pending: Dict[str, Evidence], result: RepairExecutionResult) -> None:
-        """Updates ``pending`` (artifact_id -> its current FAIL Evidence) in
-        place from one executed action's result -- never wholesale-replaces
-        it. This is the point 5 fix: an artifact nobody's executed action
-        touched this round simply stays in ``pending`` unchanged, so it is
-        never silently dropped just because some *other* action in the same
-        round was the one that got executed.
+    def _apply_round_to_pending(
+        pending: Dict[str, Evidence], unresolved_ids: Set[str], result: RepairExecutionResult
+    ) -> None:
+        """Updates ``pending`` (artifact_id -> its current FAIL Evidence,
+        fed back into the next round's ``decide()`` call) and
+        ``unresolved_ids`` (artifact_id -> "not confirmed resolved",
+        bookkeeping only for ``stopped_reason``, never fed into
+        ``decide()``) from one executed action's result -- never
+        wholesale-replaces either. This is the point 5 fix (``pending``)
+        plus a later review's fix (``unresolved_ids``): an artifact nobody's
+        executed action touched this round simply stays as it was in both,
+        and a sub-failure DISCOVERED only by this action's own cascade
+        (never part of this round's starting ``pending`` -- e.g. a
+        downstream artifact a repair's cascade newly finds broken, with no
+        FAIL Evidence available to feed back for a production failure or a
+        left-stale/UNKNOWN candidate) still has to leave some trace,
+        exactly what ``unresolved_ids`` exists for.
         """
         for record in result.regenerated:
             artifact_id = record.pre_repair_ref.artifact_id
             if record.outcome == RepairOutcome.RESOLVED:
                 pending.pop(artifact_id, None)
+                unresolved_ids.discard(artifact_id)
             elif record.outcome in (RepairOutcome.STILL_FAILING, RepairOutcome.INCONCLUSIVE):
+                unresolved_ids.add(artifact_id)
                 fail_evidence = next(
                     (item for item in record.reverify_evidence if item.outcome == CheckOutcome.FAIL), None
                 )
@@ -307,17 +364,40 @@ class BranchingRunner:
                     pending[artifact_id] = fail_evidence
                 # else: INCONCLUSIVE with no FAIL evidence at all -- leave
                 # whatever was already pending for it (if anything)
-                # unchanged; there is nothing new, honest to replace it with.
-            # PRODUCTION_FAILED / NO_PRODUCER: deliberately left untouched --
-            # the underlying problem was never actually re-examined, so
-            # whatever was already pending for it (the original trigger)
-            # remains exactly as it was.
+                # unchanged; there is nothing new, honest to replace it
+                # with. Marking it unresolved above is bookkeeping, not an
+                # Evidence fabrication -- it never reaches `decide()`.
+            else:  # PRODUCTION_FAILED / NO_PRODUCER
+                unresolved_ids.add(artifact_id)
+                # `pending` itself deliberately left untouched -- the
+                # underlying problem was never actually re-examined, so
+                # whatever was already pending for it (the original
+                # trigger, if any) remains exactly as it was.
         for ref in result.reverified_untouched:
             pending.pop(ref.artifact_id, None)
-        # result.left_stale entries have no Evidence to add to `pending` --
-        # they remain visible via RepairExecutionResult.left_stale itself,
-        # which every round's `executions` keeps, rather than being
-        # fabricated into a FAIL this method never actually observed.
+            unresolved_ids.discard(ref.artifact_id)
+        for ref in result.left_stale:
+            unresolved_ids.add(ref.artifact_id)
+            # No Evidence to add to `pending` -- these remain visible via
+            # RepairExecutionResult.left_stale itself, which every round's
+            # `executions` keeps, rather than being fabricated into a FAIL
+            # this method never actually observed.
+
+    @staticmethod
+    def _finalize_stopped_reason(clean_reason: str, unresolved_ids: Set[str]) -> str:
+        """``clean_reason`` ("no_more_failures"/"*_policy_returned_nothing")
+        is only actually true if nothing was left unresolved along the
+        way. A review found both reasons reported even when a sub-failure
+        a cascade discovered mid-run was never part of ``pending`` at all
+        (a production failure, or a left-stale/UNKNOWN candidate) -- such a
+        failure simply has no FAIL Evidence to re-enter ``pending`` with,
+        so ``current_evidence`` goes empty and these reasons fire as if
+        everything were actually fine. This never promotes UNKNOWN into a
+        FAIL fed back into ``decide()`` (an explicit review note) -- it
+        only changes which *label* describes a stop that was already about
+        to happen, based on ``unresolved_ids`` (see
+        ``_apply_round_to_pending``)."""
+        return "unresolved_remaining" if unresolved_ids else clean_reason
 
 
 __all__ = ["BranchSpec", "BranchingRunner"]

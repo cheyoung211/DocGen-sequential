@@ -227,11 +227,82 @@ None)`으로 명시적으로 제거하고, `BlockPatchProducer`처럼 메시지�
 `"retry"`로 대체한다. (`test_blind_action_clears_a_stale_error_message_from_base_context`,
 `test_blind_patch_block_gets_a_neutral_placeholder_not_a_stale_message`)
 
-**검증**: `test/core/`에 45개 테스트 추가(`test_repair_operations.py` 16→29,
-`test_branching_runner.py` 11→16, `test_adapters.py` +content 검증). 전체 210개 통과. 전체
-저장소 테스트 실행 결과도 기존과 동일한 57건(무관, Stage 1부터 기록된 결함) 외 회귀 없음 —
-756 passed. 이번 리뷰는 코드 리뷰 전이 아니라 **첫 공개 이후** 받은 리뷰이며, Stage 1-3과
-마찬가지로 다음 리뷰 라운드가 또 있을 수 있다는 전제로 다룬다.
+**검증**: `test/core/`에 18개 테스트 추가(`test_repair_operations.py` 16→29,
+`test_branching_runner.py` 11→16, `test_adapters.py` +content 검증 — 192→210). 전체 저장소
+테스트 실행 결과도 기존과 동일한 57건(무관, Stage 1부터 기록된 결함) 외 회귀 없음 — 756 passed.
+이번 리뷰는 코드 리뷰 전이 아니라 **첫 공개 이후** 받은 리뷰이며, Stage 1-3과 마찬가지로 다음
+리뷰 라운드가 또 있을 수 있다는 전제로 다룬다.
+
+(이 수치는 2026.10.20 리뷰에서 사용자가 직접 정정했다 — 192→210 증가량은 18개이며, 처음
+보고했던 "45개 테스트 추가"는 오기였다. 자세한 내용은 §5-2 참고.)
+
+---
+
+## 5-2. 사용자 재검토 후 수정 (2차, 2026.10.20)
+
+1차 수정 이후 사용자가 다시 코드를 검토해 4건의 실제 결함(과 1건의 문서 오기)을 재현 시나리오와
+함께 지적했다. 전부 수정했고, 각 수정마다 회귀 테스트를 추가했다 — 수정 전 코드에 그 테스트를
+그대로 돌려 실제로 실패하는지까지 확인했다(`docgen_stage_review_rigor` 메모에 패턴으로 기록).
+
+**1. 복수 대상 복구와 전체 재생성에서는 여전히 stale이 남아도 RESOLVED.** 두 재현:
+(a) a→b에서 복구 대상을 `[b, a]` 순서로 지정하면, b가 a보다 먼저 처리되어 "resolved"로 기록된
+뒤 a가 나중에 바뀌며 b가 다시 stale이 되는데, `_execute_selective()`가 명시적으로 지정한 대상을
+재검사 후보(`affected_ids`)에서 빼버려서 b가 다시는 점검되지 않았다. (b) `doc→z→b`(doc이
+상류, z는 doc을 읽고, b는 z를 읽음) 전체 문서 재생성에서 `_execute_unconditional()`이 여전히
+ID 정렬 순서(`doc, b, z`)로 처리해, doc이 z의 **구버전**을 기준으로 재생성된 뒤 z가 나중에
+바뀌어도 아무도 doc을 다시 보지 않았다. **수정**: (i) `_execute_selective()`에서 명시적 대상을
+재검사 후보에서 빼는 코드를 제거해 sweep이 모든 대상을 계속 추적하게 했다. (ii)
+`_execute_unconditional()`에 `_execute_selective()`와 동일한 고정점 sweep을 추가하고, 1차
+처리 순서도 `_dependency_order()`(Kahn 알고리즘, 순환이 있으면 ID 정렬로 대체 — `artifact_
+graph.py`가 순환을 명시적으로 허용하므로 toposort를 정확성의 전제로 삼지 않음)로 바꿔 sweep이
+해야 할 일을 줄였다. (iii) 두 메서드 모두 최종 `left_stale` 판정을 "한 번이라도 손댔으면
+제외"가 아니라 `last_outcome`(artifact_id별 가장 최근 결과, 실행 순서대로 갱신)이 RESOLVED이거나
+아예 없는 경우에만 `is_stale()`을 다시 확인하도록 바꿨다 — STILL_FAILING/INCONCLUSIVE/
+PRODUCTION_FAILED/NO_PRODUCER는 이미 `regenerated`로 정직하게 보고되므로 제외. (`test_multiple_
+explicit_targets_out_of_dependency_order_leave_no_target_stale`, `test_regenerate_document_
+settles_a_multi_hop_chain_regardless_of_processing_order`)
+
+**2. 복구 도중 새로 발견한 하위 실패는 branching runner에서 사라짐.** a만 실패했다고 알려주고
+a를 복구하면 cascade가 하위 b의 실패를 새로 발견하는 상황에서, b는 원래 `pending`에 없었기
+때문에 b가 PRODUCTION_FAILED이거나 UNKNOWN/제약없음(`left_stale`)이어도 `_apply_round_to_
+pending()`이 되돌릴 FAIL evidence가 없어 `pending`이 비게 되고 `stopped_reason="no_more_
+failures"`로 오판했다. **수정**: `_run_one_branch()`에 branch 전체에서 유지되는 `unresolved_ids`
+집합을 추가 — `_apply_round_to_pending()`이 PRODUCTION_FAILED/NO_PRODUCER/left_stale이 된
+artifact_id를 여기 추가하고 RESOLVED/reaffirm PASS가 되면 제거한다. 이 집합은 **`decide()`에
+절대 전달하지 않는다**(UNKNOWN을 FAIL로 조작하지 않는다는 사용자의 명시적 요구) — 오직
+`_finalize_stopped_reason()`이 "no_more_failures"/"*_policy_returned_nothing"을 그대로 쓸지
+`"unresolved_remaining"`으로 바꿔 쓸지 고르는 데만 쓰인다. (`test_a_newly_discovered_production_
+failure_is_not_read_as_no_more_failures`, `test_a_newly_discovered_left_stale_candidate_is_not_
+read_as_no_more_failures`)
+
+**3. `BlockPatchProducer`가 patch한 block 하나의 내용으로 section 전체를 반환.**
+`regenerate_blocks()`는 patch한 block과 그대로 보존된 다른 block을 모두 포함한
+`TextAgentOutput`을 반환하는데, `produce()`가 `self.last_output.model_dump_json()` 전체를
+이 **BLOCK 단위** artifact의 content로 저장해, block 하나만 바뀌어야 하는 경우에도 저장된
+내용에 다른 block까지 섞여 들어갔다. **수정**: 반환된 `blocks`에서 `block_id == artifact_id`인
+항목만 찾아 그 블록의 `model_dump_json()`을 저장한다. 일치하는 블록이 없으면(이론상 있을 수
+없지만) FAILED로 정직하게 보고한다. (`test_block_patch_producer_extracts_only_the_patched_
+block_not_the_whole_section`, `test_block_patch_producer_reports_failure_when_no_returned_
+block_matches`)
+
+**4. 검사기 실행 오류를 예산 소진으로 잘못 보고.** `RepairOperationExecutor._check()`와
+`BranchingRunner`의 `check_timing="final_only"` 최초 검사가 `ToolExecutor.execute(CheckCall(...))`
+의 `not observation.ok`를 전부 예산/행동수/suspend로 간주했다. 실제로는 `Validator.check()`
+자체가 예외를 던지는 경우(`ToolExecutor`가 `ToolErrorCode.EXECUTION_FAILED`로 정확히 보고)도
+같은 경로를 타는데, 예산이 10,000 남고 executor도 suspend되지 않은 상태에서 전체 cascade/branch
+가 "예산 소진"으로 중단됐다. **수정**: `schemas.py`에 공개 상수 `BUDGET_ERROR_CODES =
+{BUDGET_EXCEEDED, MAX_ACTIONS_EXCEEDED, SUSPENDED}`를 추가하고, `_check()`와 `final_only`의
+초기 검사 모두 이 집합에 속하는 코드만 "예산 소진"(또는 `final_only`의 경우
+`"initial_check_failed"`)으로 분류하게 했다. 그 외 오류(`EXECUTION_FAILED`/`TIMEOUT`)는 빈
+evidence로 돌아와 기존 UNKNOWN/`left_stale` 경로가 그대로 정직하게 처리한다 — 새 반환 상태를
+추가하지 않았다. (`test_a_validator_crash_is_not_misreported_as_budget_exhaustion`,
+`test_final_only_initial_check_crash_is_not_misreported_as_budget_exhaustion`)
+
+**검증**: `test/core/`에 8개 테스트 추가(`test_repair_operations.py` 29→32,
+`test_branching_runner.py` 16→19, `test_adapters.py` +2 — BlockPatchProducer 관련 기존 2개
+테스트는 실제 `TextAgentOutput`/`ContentBlock`을 쓰도록 수정만 하고 새로 세지 않음). 210→218.
+각 새 테스트는 수정 전 코드에 그대로 돌려 실제로 깨지는 것까지 확인했다. 전체 저장소 테스트도
+기존과 동일한 57건 외 회귀 없음 — 756→764 passed.
 
 ---
 

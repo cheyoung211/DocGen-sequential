@@ -5,8 +5,9 @@ and termination (budget/round-cap/stalled-without-evidence) -- all with
 Protocol-conforming fakes, per this stage's scope decision.
 
 Revised after a user review found 3 real bugs affecting this module (see
-memory docgen_stage_review_rigor, points 5/6/7) -- every fix below has at
-least one regression test named after the repro that caught it."""
+memory docgen_stage_review_rigor, points 5/6/7), and a second review found
+2 more (points 8/9) -- every fix below has at least one regression test
+named after the repro that caught it."""
 
 from __future__ import annotations
 
@@ -152,6 +153,32 @@ class _CountingActOnAllFailures(_ActOnAllFailures):
 class _NothingPolicy:
     def decide(self, evidence, dependency_edges, budget) -> List[RepairAction]:
         return []
+
+
+class _RaisingValidator:
+    """Always raises instead of returning Evidence -- models a real
+    ``Validator.check()`` crash, which ``ToolExecutor`` reports as
+    ``ToolErrorCode.EXECUTION_FAILED``, never any budget code."""
+
+    def check(self, artifact, constraints, context=None) -> List[Evidence]:
+        raise RuntimeError("validator exploded")
+
+
+def _checkpoint_with_a_dependency_chain(*artifact_ids: str):
+    """Like `_checkpoint_with_sections`, but each id reads the previous one
+    as its only input -- needed for the issue-8 repros, where a repair's own
+    cascade must actually reach a downstream artifact the initial trigger
+    never named."""
+    store = ArtifactGraphStore()
+    refs = {}
+    previous_ref = None
+    for artifact_id in artifact_ids:
+        inputs = [previous_ref] if previous_ref is not None else []
+        store.add_version(artifact_id, ArtifactKind.SECTION, content=None, read_input_versions=inputs)
+        previous_ref = store.latest(artifact_id).ref
+        refs[artifact_id] = previous_ref
+    checkpoint = store.save_checkpoint(label="pre-repair")
+    return checkpoint, refs
 
 
 def _runner(
@@ -413,6 +440,101 @@ def test_context_factory_default_still_gives_each_branch_an_independent_dict() -
         budget_factory=lambda: Budget(cap=1000),
     )
     assert len(result.branches) == 2
+
+
+# ---------------------------------------------------------------------------
+# Second review round, issue 8: a sub-failure discovered only by a round's
+# own cascade (never part of that round's starting `pending`) must not
+# vanish into a false "no_more_failures".
+# ---------------------------------------------------------------------------
+
+
+def test_a_newly_discovered_production_failure_is_not_read_as_no_more_failures() -> None:
+    """Review repro: only 'secA' is reported failing; repairing it cascades
+    into a downstream 'secB' (never named in the original trigger) whose
+    production then always fails. secB has no FAIL Evidence of its own to
+    re-enter `pending` with, so the round's `pending` went empty and
+    stopped_reason="no_more_failures" even though secB was left broken."""
+    checkpoint, refs = _checkpoint_with_a_dependency_chain("secA", "secB")
+    producer = _FakeProducer(fail_ids={"secB"})  # secA's production succeeds, secB's never does
+    validator = _FakeValidator(fail_ids={"secB"})  # secB also fails its own content check
+    runner = _runner(producer, lambda store: validator)
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]  # secB is never named here at all
+
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+    )
+
+    branch = result.branches[0]
+    assert branch.stopped_reason == "unresolved_remaining"
+    b_outcomes = [
+        e.outcome for ex in _all_executions(branch) for e in ex.regenerated if e.pre_repair_ref.artifact_id == "secB"
+    ]
+    assert RepairOutcome.PRODUCTION_FAILED in b_outcomes
+
+
+def test_a_newly_discovered_left_stale_candidate_is_not_read_as_no_more_failures() -> None:
+    """Same repro shape, but secB has no constraints to check it against at
+    all (rather than a production failure) -- the review's own note that
+    this hits the identical false "no_more_failures" termination."""
+    checkpoint, refs = _checkpoint_with_a_dependency_chain("secA", "secB")
+    producer = _FakeProducer()  # everything that gets regenerated succeeds
+    validator = _FakeValidator(fail_ids=frozenset())  # secA resolves cleanly
+    runner = BranchingRunner(
+        producer_registry={ArtifactKind.SECTION: producer},
+        validator_factory=lambda store: validator,
+        constraint_provider=lambda ref: [] if ref.artifact_id == "secB" else _one_constraint_per_artifact(ref),
+        model_name="fake-model",
+    )
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]
+
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+    )
+
+    branch = result.branches[0]
+    assert branch.stopped_reason == "unresolved_remaining"
+    left_stale_ids = {ref.artifact_id for ex in _all_executions(branch) for ref in ex.left_stale}
+    assert "secB" in left_stale_ids
+
+
+# ---------------------------------------------------------------------------
+# Second review round, issue 9: check_timing="final_only"'s one-shot initial
+# check must not misreport a validator crash as budget exhaustion.
+# ---------------------------------------------------------------------------
+
+
+def test_final_only_initial_check_crash_is_not_misreported_as_budget_exhaustion() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA")
+    producer = _FakeProducer()
+    runner = _runner(producer, lambda store: _RaisingValidator())
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    constraint = _one_constraint_per_artifact(refs["secA"])
+
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=[],
+        budget_factory=lambda: Budget(cap=1000),
+        check_timing="final_only",
+        final_check_target=refs["secA"],
+        final_check_constraints=constraint,
+    )
+
+    branch = result.branches[0]
+    assert branch.stopped_reason == "initial_check_failed"
+    assert branch.rounds == []
 
 
 # ---------------------------------------------------------------------------
