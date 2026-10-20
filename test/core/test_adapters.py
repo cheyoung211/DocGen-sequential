@@ -240,14 +240,21 @@ def test_text_agent_producer_surfaces_a_raised_precondition_failure() -> None:
 
 def test_text_agent_producer_reports_success_with_a_real_artifact() -> None:
     graph = _graph_with_one_section()
-    stub_output = object()  # stand-in for a real TextAgentOutput
+    # Stand-in for a real TextAgentOutput -- needs .model_dump_json() since
+    # produce() now reports real content on success (Stage 4 review fix).
+    stub_output = MagicMock()
+    stub_output.model_dump_json.return_value = "stub-output-json"
     producer = TextAgentProducer(_StubTextAgent(stub_output))
 
-    result = producer.produce("sec_intro", {"graph": graph, "request_id": "req-1"})
+    result = producer.produce(
+        "sec_intro", {"graph": graph, "request_id": "req-1", "read_input_versions": []}
+    )
 
     assert result.status == ProductionStatus.SUCCESS
     assert result.artifact.artifact_id == "sec_intro"
     assert producer.last_output is stub_output
+    assert result.content == "stub-output-json"
+    assert result.read_input_versions == []
 
 
 def test_planner_agent_producer_surfaces_exhausted_retries_as_failure() -> None:
@@ -265,14 +272,19 @@ def test_planner_agent_producer_surfaces_exhausted_retries_as_failure() -> None:
 
 
 def test_planner_agent_producer_reports_success_with_a_real_artifact() -> None:
-    stub_plan = object()
+    stub_plan = MagicMock()
+    stub_plan.model_dump_json.return_value = "stub-plan-json"
     producer = PlannerAgentProducer(_StubPlannerAgent(stub_plan))
 
-    result = producer.produce("doc", {"planner_input": object()})
+    result = producer.produce(
+        "doc", {"planner_input": object(), "read_input_versions": []}
+    )
 
     assert result.status == ProductionStatus.SUCCESS
     assert result.artifact.artifact_id == "doc"
     assert producer.last_output is stub_plan
+    assert result.content == "stub-plan-json"
+    assert result.read_input_versions == []
 
 
 # ---------------------------------------------------------------------------
@@ -344,18 +356,27 @@ def test_block_patch_producer_surfaces_a_raised_precondition_failure() -> None:
 
 def test_block_patch_producer_reports_success_with_a_real_artifact() -> None:
     graph = _graph_with_one_section()
-    stub_output = object()
+    stub_output = MagicMock()
+    stub_output.model_dump_json.return_value = "stub-block-json"
     producer = BlockPatchProducer(_StubTextAgentForPatch(stub_output))
 
     result = producer.produce(
         "def1",
-        {"node_id": "sec_intro", "graph": graph, "request_id": "req-1", "error_message": "bad bracket"},
+        {
+            "node_id": "sec_intro",
+            "graph": graph,
+            "request_id": "req-1",
+            "error_message": "bad bracket",
+            "read_input_versions": [],
+        },
     )
 
     assert result.status == ProductionStatus.SUCCESS
     assert result.artifact.artifact_id == "def1"
     assert result.artifact.kind == ArtifactKind.BLOCK
     assert producer.last_output is stub_output
+    assert result.content == "stub-block-json"
+    assert result.read_input_versions == []
 
 
 def test_block_patch_producer_requires_error_message_in_context() -> None:
@@ -376,7 +397,9 @@ def test_block_patch_producer_forwards_node_id_and_block_id_separately() -> None
     needs both as separate parameters, unlike TextAgentProducer where
     artifact_id alone is the section."""
     graph = _graph_with_one_section()
-    stub_agent = _StubTextAgentForPatch(object())
+    stub_output = MagicMock()
+    stub_output.model_dump_json.return_value = "stub-block-json"
+    stub_agent = _StubTextAgentForPatch(stub_output)
     producer = BlockPatchProducer(stub_agent)
 
     producer.produce(

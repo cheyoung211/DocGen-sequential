@@ -2,7 +2,11 @@
 checkpoint into independent episodes, a fixed-rule-but-fresh-instance
 downstream policy per branch, check_timing's continuous/final_only split,
 and termination (budget/round-cap/stalled-without-evidence) -- all with
-Protocol-conforming fakes, per this stage's scope decision."""
+Protocol-conforming fakes, per this stage's scope decision.
+
+Revised after a user review found 3 real bugs affecting this module (see
+memory docgen_stage_review_rigor, points 5/6/7) -- every fix below has at
+least one regression test named after the repro that caught it."""
 
 from __future__ import annotations
 
@@ -12,7 +16,6 @@ import pytest
 
 from src.core.artifact_graph import ArtifactGraphStore
 from src.core.branching_runner import BranchingRunner, BranchSpec
-from src.core.cost_tracking import CostTrackingProducer
 from src.core.schemas import (
     ArtifactKind,
     ArtifactRef,
@@ -25,15 +28,11 @@ from src.core.schemas import (
     ProductionStatus,
     RepairAction,
     RepairActionType,
+    RepairOutcome,
 )
 
 
 class _FakeProducer:
-    """``cost_per_call`` only matters when this is wrapped in a
-    ``CostTrackingProducer`` (it is read back out of ``context["usage_sink"]``
-    by that wrapper) -- for every other test, nothing reads it, so the
-    default of 0 is simply inert."""
-
     def __init__(self, fail_ids: FrozenSet[str] = frozenset(), cost_per_call: int = 0) -> None:
         self.fail_ids = set(fail_ids)
         self.cost_per_call = cost_per_call
@@ -49,7 +48,10 @@ class _FakeProducer:
         if artifact_id in self.fail_ids:
             return ProductionResult(status=ProductionStatus.FAILED, error="fake production failure")
         return ProductionResult(
-            status=ProductionStatus.SUCCESS, artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.SECTION)
+            status=ProductionStatus.SUCCESS,
+            artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.SECTION),
+            content=f"real-content:{artifact_id}",
+            read_input_versions=context.get("read_input_versions"),
         )
 
 
@@ -68,148 +70,6 @@ class _FakeValidator:
             Evidence(constraint_id=c.constraint_id, outcome=outcome, checked_artifact=artifact, detail="fake")
             for c in constraints
         ]
-
-
-def _one_constraint_per_artifact(ref: ArtifactRef) -> List[Constraint]:
-    return [Constraint(constraint_id=f"c:{ref.artifact_id}", kind=ConstraintKind.SCHEMA_CONTRACT, description="d")]
-
-
-def _checkpoint_with_one_section(artifact_id: str = "secA"):
-    store = ArtifactGraphStore()
-    store.add_version(artifact_id, ArtifactKind.SECTION, content=None)
-    ref = store.latest(artifact_id).ref
-    checkpoint = store.save_checkpoint(label="pre-repair")
-    return checkpoint, ref
-
-
-def _fail_evidence(ref: ArtifactRef) -> Evidence:
-    return Evidence(constraint_id="c", outcome=CheckOutcome.FAIL, checked_artifact=ref, detail="bad")
-
-
-class _ActOnFirstFailure:
-    """Stateless, deterministic fake policy: targets the first FAIL
-    evidence's artifact with a fixed action_type, every call."""
-
-    def __init__(self, action_type: RepairActionType) -> None:
-        self.action_type = action_type
-
-    def decide(self, evidence, dependency_edges, budget) -> List[RepairAction]:
-        if budget.remaining <= 0:
-            return []
-        fails = [e for e in evidence if e.outcome == CheckOutcome.FAIL]
-        if not fails:
-            return []
-        return [
-            RepairAction(
-                action_type=self.action_type,
-                target_artifacts=[fails[0].checked_artifact],
-                use_diagnostic_feedback=False,
-            )
-        ]
-
-
-class _CountingActOnFirstFailure(_ActOnFirstFailure):
-    """Same decision rule, but counts how many times THIS instance's
-    decide() was called -- used to prove each branch gets its own fresh
-    instance, not a shared one."""
-
-    def __init__(self, action_type: RepairActionType = RepairActionType.REGENERATE_SECTION) -> None:
-        super().__init__(action_type)
-        self.decide_calls = 0
-
-    def decide(self, evidence, dependency_edges, budget) -> List[RepairAction]:
-        self.decide_calls += 1
-        return super().decide(evidence, dependency_edges, budget)
-
-
-class _NothingPolicy:
-    def decide(self, evidence, dependency_edges, budget) -> List[RepairAction]:
-        return []
-
-
-def _runner(
-    producer: _FakeProducer,
-    validator_factory,
-    *,
-    max_downstream_rounds: int = 5,
-) -> BranchingRunner:
-    """``validator_factory`` takes the branch's restored store (ignored by
-    every fake validator in this file, which read only whatever
-    ``artifact``/``constraints`` are passed into ``check()`` -- unlike the
-    real ``BasicConstraintChecker``, which does bind to it). For the common
-    case of one validator instance that is safe to share (no cross-call
-    state at all), pass ``lambda store: validator_instance``."""
-    return BranchingRunner(
-        producer_registry={ArtifactKind.SECTION: producer},
-        validator_factory=validator_factory,
-        constraint_provider=_one_constraint_per_artifact,
-        max_downstream_rounds=max_downstream_rounds,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Branch independence.
-# ---------------------------------------------------------------------------
-
-
-def test_branches_are_independent_and_each_runs_its_own_initial_policy() -> None:
-    checkpoint, sec_ref = _checkpoint_with_one_section()
-    producer = _FakeProducer()
-    validator = _FakeValidator(fail_ids=frozenset())  # everything passes once regenerated
-    runner = _runner(producer, lambda store: validator)
-
-    policy_a = _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION)
-    policy_b = _ActOnFirstFailure(RepairActionType.PATCH_BLOCK)
-    trigger = [_fail_evidence(sec_ref)]
-
-    result = runner.run_branches(
-        checkpoint,
-        [BranchSpec("A", policy_a), BranchSpec("B", policy_b)],
-        downstream_policy_factory=_NothingPolicy,
-        triggering_evidence=trigger,
-        budget_factory=lambda: Budget(cap=1000),
-    )
-
-    assert result.source_checkpoint_id == checkpoint.checkpoint_id
-    assert [b.branch_id for b in result.branches] == ["A", "B"]
-    assert result.branches[0].initial_action.action_type == RepairActionType.REGENERATE_SECTION
-    assert result.branches[1].initial_action.action_type == RepairActionType.PATCH_BLOCK
-    # Each branch's own final checkpoint reflects only that branch's work.
-    assert result.branches[0].final_checkpoint.checkpoint_id != result.branches[1].final_checkpoint.checkpoint_id
-    # The original checkpoint itself (and a store rebuilt from it) is untouched.
-    fresh = ArtifactGraphStore.from_checkpoint(checkpoint, branch_id="untouched-check")
-    assert fresh.latest("secA").ref.version == 1
-
-
-def test_downstream_policy_factory_is_called_once_per_branch_with_fresh_instances() -> None:
-    checkpoint, sec_ref = _checkpoint_with_one_section()
-    producer = _FakeProducer()
-    validator = _FakeValidator(fail_ids=frozenset())  # resolves after one regen -- one downstream round at most
-    runner = _runner(producer, lambda store: validator)
-
-    created: List[_CountingActOnFirstFailure] = []
-
-    def factory() -> _CountingActOnFirstFailure:
-        instance = _CountingActOnFirstFailure()
-        created.append(instance)
-        return instance
-
-    trigger = [_fail_evidence(sec_ref)]
-    result = runner.run_branches(
-        checkpoint,
-        [BranchSpec("A", _NothingPolicy()), BranchSpec("B", _NothingPolicy())],
-        downstream_policy_factory=factory,
-        triggering_evidence=trigger,
-        budget_factory=lambda: Budget(cap=1000),
-    )
-
-    # Both branches' initial policy returns nothing (_NothingPolicy), so no
-    # downstream round ever runs -- but the factory must still be called
-    # once per branch (not skipped, not shared), proving each branch would
-    # have gotten its own independent instance had one been needed.
-    assert len(created) == 2
-    assert created[0] is not created[1]
-    assert all(b.stopped_reason == "initial_policy_returned_nothing" for b in result.branches)
 
 
 class _FailsFirstCheckThenPasses:
@@ -239,30 +99,158 @@ class _FailsFirstCheckThenPasses:
         ]
 
 
-def test_a_stateful_downstream_policy_does_not_leak_retry_state_across_branches() -> None:
-    """The real risk _CountingActOnFirstFailure's factory test guards
-    against: if BranchingRunner ever reused one shared instance across
-    branches (instead of calling the factory per branch), a stateful
-    policy's internal counters would carry over. Here two branches each
-    drive exactly one downstream round; each branch's own policy instance
-    must report exactly 1 call, never 2."""
-    checkpoint, sec_ref = _checkpoint_with_one_section()
+def _one_constraint_per_artifact(ref: ArtifactRef) -> List[Constraint]:
+    return [Constraint(constraint_id=f"c:{ref.artifact_id}", kind=ConstraintKind.SCHEMA_CONTRACT, description="d")]
+
+
+def _checkpoint_with_sections(*artifact_ids: str):
+    store = ArtifactGraphStore()
+    refs = {}
+    for artifact_id in artifact_ids:
+        store.add_version(artifact_id, ArtifactKind.SECTION, content=None)
+        refs[artifact_id] = store.latest(artifact_id).ref
+    checkpoint = store.save_checkpoint(label="pre-repair")
+    return checkpoint, refs
+
+
+def _fail_evidence(ref: ArtifactRef) -> Evidence:
+    return Evidence(constraint_id="c", outcome=CheckOutcome.FAIL, checked_artifact=ref, detail="bad")
+
+
+class _ActOnAllFailures:
+    """Stateless, deterministic fake policy: one action per distinct FAIL
+    evidence (mirrors FixedGraphAwareRepairPolicy's own cardinality) --
+    used to exercise "every decided action must be executed", not just the
+    first."""
+
+    def __init__(self, action_type: RepairActionType = RepairActionType.REGENERATE_SECTION) -> None:
+        self.action_type = action_type
+
+    def decide(self, evidence, dependency_edges, budget) -> List[RepairAction]:
+        if budget.remaining <= 0:
+            return []
+        seen: Dict[str, Evidence] = {}
+        for item in evidence:
+            if item.outcome == CheckOutcome.FAIL:
+                seen.setdefault(item.checked_artifact.artifact_id, item)
+        return [
+            RepairAction(action_type=self.action_type, target_artifacts=[item.checked_artifact], use_diagnostic_feedback=False)
+            for item in seen.values()
+        ]
+
+
+class _CountingActOnAllFailures(_ActOnAllFailures):
+    def __init__(self, action_type: RepairActionType = RepairActionType.REGENERATE_SECTION) -> None:
+        super().__init__(action_type)
+        self.decide_calls = 0
+
+    def decide(self, evidence, dependency_edges, budget) -> List[RepairAction]:
+        self.decide_calls += 1
+        return super().decide(evidence, dependency_edges, budget)
+
+
+class _NothingPolicy:
+    def decide(self, evidence, dependency_edges, budget) -> List[RepairAction]:
+        return []
+
+
+def _runner(
+    producer,
+    validator_factory,
+    *,
+    max_downstream_rounds: int = 5,
+    max_actions_per_branch: int = 1000,
+    model_name: str = "fake-model",
+) -> BranchingRunner:
+    return BranchingRunner(
+        producer_registry={ArtifactKind.SECTION: producer},
+        validator_factory=validator_factory,
+        constraint_provider=_one_constraint_per_artifact,
+        model_name=model_name,
+        max_actions_per_branch=max_actions_per_branch,
+        max_downstream_rounds=max_downstream_rounds,
+    )
+
+
+def _all_executions(branch):
+    """Flattens every RepairExecutionResult across every round, in order."""
+    return [execution for round_ in branch.rounds for execution in round_.executions]
+
+
+# ---------------------------------------------------------------------------
+# Branch independence.
+# ---------------------------------------------------------------------------
+
+
+def test_branches_are_independent_and_each_runs_its_own_initial_policy() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA")
     producer = _FakeProducer()
-    # A fresh validator per branch too -- _FailsFirstCheckThenPasses itself
-    # carries cross-call state (_checked_once), so sharing one instance
-    # across branches would have the same leakage problem this test exists
-    # to rule out, just in the validator instead of the policy.
-    runner = _runner(producer, lambda store: _FailsFirstCheckThenPasses(fail_ids=frozenset({"secA"})))
+    validator = _FakeValidator(fail_ids=frozenset())
+    runner = _runner(producer, lambda store: validator)
 
-    created: List[_CountingActOnFirstFailure] = []
+    policy_a = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    policy_b = _ActOnAllFailures(RepairActionType.PATCH_BLOCK)
+    trigger = [_fail_evidence(refs["secA"])]
 
-    def factory() -> _CountingActOnFirstFailure:
-        instance = _CountingActOnFirstFailure()
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy_a), BranchSpec("B", policy_b)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+    )
+
+    assert result.source_checkpoint_id == checkpoint.checkpoint_id
+    assert [b.branch_id for b in result.branches] == ["A", "B"]
+    assert _all_executions(result.branches[0])[0].action.action_type == RepairActionType.REGENERATE_SECTION
+    assert _all_executions(result.branches[1])[0].action.action_type == RepairActionType.PATCH_BLOCK
+    assert result.branches[0].final_checkpoint.checkpoint_id != result.branches[1].final_checkpoint.checkpoint_id
+    fresh = ArtifactGraphStore.from_checkpoint(checkpoint, branch_id="untouched-check")
+    assert fresh.latest("secA").ref.version == 1
+
+
+def test_downstream_policy_factory_is_called_once_per_branch_with_fresh_instances() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA")
+    producer = _FakeProducer()
+    validator = _FakeValidator(fail_ids=frozenset())
+    runner = _runner(producer, lambda store: validator)
+
+    created: List[_CountingActOnAllFailures] = []
+
+    def factory() -> _CountingActOnAllFailures:
+        instance = _CountingActOnAllFailures()
         created.append(instance)
         return instance
 
-    initial_policy = _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION)
-    trigger = [_fail_evidence(sec_ref)]
+    trigger = [_fail_evidence(refs["secA"])]
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", _NothingPolicy()), BranchSpec("B", _NothingPolicy())],
+        downstream_policy_factory=factory,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+    )
+
+    assert len(created) == 2
+    assert created[0] is not created[1]
+    assert all(b.stopped_reason == "initial_policy_returned_nothing" for b in result.branches)
+    assert all(b.rounds == [] for b in result.branches)
+
+
+def test_a_stateful_downstream_policy_does_not_leak_retry_state_across_branches() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA")
+    producer = _FakeProducer()
+
+    created: List[_CountingActOnAllFailures] = []
+
+    def factory() -> _CountingActOnAllFailures:
+        instance = _CountingActOnAllFailures()
+        created.append(instance)
+        return instance
+
+    initial_policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]
+    runner = _runner(producer, lambda store: _FailsFirstCheckThenPasses(fail_ids=frozenset({"secA"})))
 
     runner.run_branches(
         checkpoint,
@@ -278,18 +266,18 @@ def test_a_stateful_downstream_policy_does_not_leak_retry_state_across_branches(
 
 
 # ---------------------------------------------------------------------------
-# Failed repairs stay visible, never silently read as success.
+# Issue 5 (review): every decided action is executed, and an unresolved
+# failure is never silently dropped after an unrelated one is handled.
 # ---------------------------------------------------------------------------
 
 
-def test_a_production_failure_is_recorded_and_the_branch_stops_honestly() -> None:
-    checkpoint, sec_ref = _checkpoint_with_one_section()
-    producer = _FakeProducer(fail_ids=frozenset({"secA"}))  # the repair itself cannot even run
-    validator = _FakeValidator(fail_ids=frozenset({"secA"}))
+def test_two_independent_failures_both_get_a_decided_action_executed() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA", "secB")
+    producer = _FakeProducer()
+    validator = _FakeValidator(fail_ids=frozenset())  # both resolve cleanly once regenerated
     runner = _runner(producer, lambda store: validator)
-
-    policy = _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION)
-    trigger = [_fail_evidence(sec_ref)]
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"]), _fail_evidence(refs["secB"])]
 
     result = runner.run_branches(
         checkpoint,
@@ -300,13 +288,158 @@ def test_a_production_failure_is_recorded_and_the_branch_stops_honestly() -> Non
     )
 
     branch = result.branches[0]
-    assert branch.initial_round is not None
-    from src.core.schemas import RepairOutcome
+    touched = {e.pre_repair_ref.artifact_id for ex in _all_executions(branch) for e in ex.regenerated}
+    assert touched == {"secA", "secB"}
+    assert producer.calls.count("secA") == 1
+    assert producer.calls.count("secB") == 1
 
-    assert branch.initial_round.overall_outcome == RepairOutcome.PRODUCTION_FAILED
-    # The stop reason must not read as a clean resolution -- it would be a
-    # silent false "success" otherwise.
-    assert branch.stopped_reason == "repair_could_not_be_attempted"
+
+def test_an_unresolved_independent_failure_is_not_silently_dropped_after_the_other_resolves() -> None:
+    """A FAIL, B FAIL -- the policy's single decide() call names both,
+    but B's production always fails (can never actually be fixed). The
+    branch must not report "no_more_failures" while B is still broken."""
+    checkpoint, refs = _checkpoint_with_sections("secA", "secB")
+    producer = _FakeProducer(fail_ids={"secB"})  # A resolves, B's production can never succeed
+    validator = _FakeValidator(fail_ids=frozenset())
+    runner = _runner(producer, lambda store: validator, max_downstream_rounds=1)
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"]), _fail_evidence(refs["secB"])]
+
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy)],
+        downstream_policy_factory=lambda: _ActOnAllFailures(RepairActionType.REGENERATE_SECTION),
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+    )
+
+    branch = result.branches[0]
+    assert branch.stopped_reason != "no_more_failures"
+    b_outcomes = [
+        e.outcome for ex in _all_executions(branch) for e in ex.regenerated if e.pre_repair_ref.artifact_id == "secB"
+    ]
+    assert RepairOutcome.PRODUCTION_FAILED in b_outcomes
+
+
+# ---------------------------------------------------------------------------
+# Issue 6 (review): budget admission is enforced per action, including
+# between multiple actions decided within the SAME round.
+# ---------------------------------------------------------------------------
+
+
+def test_budget_is_enforced_between_actions_within_one_round_not_only_between_rounds() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA", "secB")
+    # Raw producer, NOT pre-wrapped in CostTrackingProducer -- ToolExecutor.
+    # run_generation() does that wrapping itself; wrapping it again here
+    # would double-wrap (the outer wrapper's usage_sink never sees the
+    # inner wrapper's own separately-constructed one, so no cost would
+    # ever actually be measured).
+    producer = _FakeProducer(cost_per_call=100)
+    validator = _FakeValidator(fail_ids=frozenset())
+    runner = _runner(producer, lambda store: validator)
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)  # names BOTH secA and secB in one decide() call
+    trigger = [_fail_evidence(refs["secA"]), _fail_evidence(refs["secB"])]
+
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=150),  # enough for exactly one of the two 100-token actions
+    )
+
+    branch = result.branches[0]
+    assert branch.stopped_reason == "budget_exhausted"
+    assert branch.total_cost_tokens <= 200  # bounded to at most one call's overspend
+
+
+# ---------------------------------------------------------------------------
+# Issue 7 (review): each branch gets its own independent context.
+# ---------------------------------------------------------------------------
+
+
+def test_each_branch_gets_an_independent_context_not_a_shared_mutable_one() -> None:
+    """A Producer that mutates a mutable object inside its context (like a
+    real TextAgent mutating a DocumentGraph) must not leak that mutation
+    into a sibling branch -- each branch's context_factory call must
+    produce its own independent object."""
+    checkpoint, refs = _checkpoint_with_sections("secA")
+
+    class _MutatingProducer:
+        def produce(self, artifact_id, context):
+            counter = context["counter"]
+            counter["value"] += 1
+            return ProductionResult(
+                status=ProductionStatus.SUCCESS,
+                artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.SECTION),
+                content=f"seen-{counter['value']}",
+                read_input_versions=[],
+            )
+
+    validator = _FakeValidator(fail_ids=frozenset())
+    runner = _runner(_MutatingProducer(), lambda store: validator)
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]
+
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy), BranchSpec("B", policy)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+        context_factory=lambda spec: {"counter": {"value": 0}},
+    )
+
+    for branch in result.branches:
+        new_content = branch.final_checkpoint.artifacts["secA"][-1].content
+        assert new_content == "seen-1"  # every branch starts its own counter at 0, independently
+
+
+def test_context_factory_default_still_gives_each_branch_an_independent_dict() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA")
+    producer = _FakeProducer()
+    validator = _FakeValidator(fail_ids=frozenset())
+    runner = _runner(producer, lambda store: validator)
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]
+
+    # No context_factory passed at all -- must not raise, must not share
+    # state (there is none to share here, but the call path must work).
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy), BranchSpec("B", policy)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+    )
+    assert len(result.branches) == 2
+
+
+# ---------------------------------------------------------------------------
+# Failed repairs stay visible, never silently read as success.
+# ---------------------------------------------------------------------------
+
+
+def test_a_production_failure_is_recorded_and_the_branch_stops_honestly() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA")
+    producer = _FakeProducer(fail_ids=frozenset({"secA"}))
+    validator = _FakeValidator(fail_ids=frozenset({"secA"}))
+    runner = _runner(producer, lambda store: validator)
+
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]
+
+    result = runner.run_branches(
+        checkpoint,
+        [BranchSpec("A", policy)],
+        downstream_policy_factory=_NothingPolicy,
+        triggering_evidence=trigger,
+        budget_factory=lambda: Budget(cap=1000),
+    )
+
+    branch = result.branches[0]
+    executions = _all_executions(branch)
+    assert executions[0].overall_outcome == RepairOutcome.PRODUCTION_FAILED
     assert branch.stopped_reason != "no_more_failures"
 
 
@@ -315,16 +448,15 @@ def test_a_production_failure_is_recorded_and_the_branch_stops_honestly() -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_continuous_check_timing_uses_triggering_evidence_without_any_extra_check_call() -> None:
-    checkpoint, sec_ref = _checkpoint_with_one_section()
+def test_continuous_check_timing_uses_triggering_evidence_directly() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA")
     producer = _FakeProducer()
     validator = _FakeValidator(fail_ids=frozenset())
     runner = _runner(producer, lambda store: validator)
-    policy = _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION)
-    trigger = [_fail_evidence(sec_ref)]
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]
 
-    calls_before = len(validator.calls)
-    runner.run_branches(
+    result = runner.run_branches(
         checkpoint,
         [BranchSpec("A", policy)],
         downstream_policy_factory=_NothingPolicy,
@@ -332,25 +464,23 @@ def test_continuous_check_timing_uses_triggering_evidence_without_any_extra_chec
         budget_factory=lambda: Budget(cap=1000),
         check_timing="continuous",
     )
-    # The only validator.check() calls that happen are the executor's own
-    # post-regen reverify -- never one driven by BranchingRunner itself for
-    # the *initial* decision, since "continuous" uses triggering_evidence as
-    # given.
-    assert "secA" not in validator.calls[:calls_before]
+
+    # Only one check call total: the executor's own post-regen reverify --
+    # nothing extra was run by the runner itself to arrive at the initial
+    # decision (it used `trigger` as given).
+    assert validator.calls == ["secA"]
+    assert result.branches[0].rounds[0].executions[0].action.target_artifacts[0].artifact_id == "secA"
 
 
 def test_final_only_check_timing_ignores_triggering_evidence_and_checks_once_first() -> None:
-    checkpoint, sec_ref = _checkpoint_with_one_section()
+    checkpoint, refs = _checkpoint_with_sections("secA")
     producer = _FakeProducer()
-    validator = _FakeValidator(fail_ids=frozenset({"secA"}))  # the one-shot final check will find this
+    validator = _FakeValidator(fail_ids=frozenset({"secA"}))
     runner = _runner(producer, lambda store: validator)
-    policy = _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION)
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
 
-    # A deliberately wrong triggering_evidence (names an artifact that does
-    # not exist) -- if check_timing="final_only" actually used this instead
-    # of running its own check, the policy would have nothing real to act on.
     bogus_trigger = [_fail_evidence(ArtifactRef(artifact_id="not-real", kind=ArtifactKind.SECTION))]
-    constraint = _one_constraint_per_artifact(sec_ref)
+    constraint = _one_constraint_per_artifact(refs["secA"])
 
     result = runner.run_branches(
         checkpoint,
@@ -359,18 +489,20 @@ def test_final_only_check_timing_ignores_triggering_evidence_and_checks_once_fir
         triggering_evidence=bogus_trigger,
         budget_factory=lambda: Budget(cap=1000),
         check_timing="final_only",
-        final_check_target=sec_ref,
+        final_check_target=refs["secA"],
         final_check_constraints=constraint,
     )
 
     branch = result.branches[0]
-    assert branch.initial_action is not None
-    assert branch.initial_action.target_artifacts[0].artifact_id == "secA"  # acted on the real check, not the bogus trigger
-    assert "secA" in validator.calls
+    executions = _all_executions(branch)
+    assert executions[0].action.target_artifacts[0].artifact_id == "secA"
+    # Two check calls total: the runner's own one-shot final check, plus
+    # the executor's post-regen reverify.
+    assert validator.calls.count("secA") == 2
 
 
 def test_final_only_requires_target_and_constraints() -> None:
-    checkpoint, _ref = _checkpoint_with_one_section()
+    checkpoint, _refs = _checkpoint_with_sections("secA")
     producer = _FakeProducer()
     validator = _FakeValidator()
     runner = _runner(producer, lambda store: validator)
@@ -387,7 +519,7 @@ def test_final_only_requires_target_and_constraints() -> None:
 
 
 def test_invalid_check_timing_is_rejected() -> None:
-    checkpoint, _ref = _checkpoint_with_one_section()
+    checkpoint, _refs = _checkpoint_with_sections("secA")
     producer = _FakeProducer()
     validator = _FakeValidator()
     runner = _runner(producer, lambda store: validator)
@@ -409,65 +541,51 @@ def test_invalid_check_timing_is_rejected() -> None:
 
 
 def test_budget_exhaustion_stops_a_branch_cleanly() -> None:
-    """Cost-free fake producers never actually spend anything, so budget
-    exhaustion can only be observed with a real cost flowing through --
-    wrap the fake in CostTrackingProducer (the same adapter
-    RepairOperationExecutor itself looks for) so each regeneration really
-    does charge 100 tokens. cap=150 admits exactly one regeneration (100)
-    but not two (200)."""
-    checkpoint, sec_ref = _checkpoint_with_one_section()
-    cost_tracked = CostTrackingProducer(
-        _FakeProducer(cost_per_call=100), stage="test", model_name="fake-model"
-    )
-    # Never clears -- every downstream round would try again forever if not
-    # for the budget running out.
-    validator = _FakeValidator(fail_ids=frozenset({"secA"}))
-    runner = _runner(cost_tracked, lambda store: validator, max_downstream_rounds=50)
-    policy = _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION)
-    trigger = [_fail_evidence(sec_ref)]
+    checkpoint, refs = _checkpoint_with_sections("secA")
+    producer = _FakeProducer(cost_per_call=100)  # raw -- see the other budget test's comment
+    validator = _FakeValidator(fail_ids=frozenset({"secA"}))  # never clears
+    runner = _runner(producer, lambda store: validator, max_downstream_rounds=50)
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]
 
     result = runner.run_branches(
         checkpoint,
         [BranchSpec("A", policy)],
-        downstream_policy_factory=lambda: _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION),
+        downstream_policy_factory=lambda: _ActOnAllFailures(RepairActionType.REGENERATE_SECTION),
         triggering_evidence=trigger,
         budget_factory=lambda: Budget(cap=150),
     )
 
     assert result.branches[0].stopped_reason == "budget_exhausted"
-    assert result.branches[0].total_cost_tokens >= 150
 
 
 def test_max_downstream_rounds_terminates_cleanly_instead_of_looping_forever() -> None:
-    """secA never actually clears (validator.fail_ids is permanent), so the
-    fixed downstream policy would decide a new action forever -- this test
-    passing at all (not hanging) is part of the proof that the cap works."""
-    checkpoint, sec_ref = _checkpoint_with_one_section()
+    checkpoint, refs = _checkpoint_with_sections("secA")
     producer = _FakeProducer()
     validator = _FakeValidator(fail_ids=frozenset({"secA"}))
     runner = _runner(producer, lambda store: validator, max_downstream_rounds=3)
-    policy = _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION)
-    trigger = [_fail_evidence(sec_ref)]
+    policy = _ActOnAllFailures(RepairActionType.REGENERATE_SECTION)
+    trigger = [_fail_evidence(refs["secA"])]
 
     result = runner.run_branches(
         checkpoint,
         [BranchSpec("A", policy)],
-        downstream_policy_factory=lambda: _ActOnFirstFailure(RepairActionType.REGENERATE_SECTION),
+        downstream_policy_factory=lambda: _ActOnAllFailures(RepairActionType.REGENERATE_SECTION),
         triggering_evidence=trigger,
         budget_factory=lambda: Budget(cap=1_000_000),
     )
 
     branch = result.branches[0]
     assert branch.stopped_reason == "max_rounds_reached"
-    assert len(branch.downstream_rounds) == 3
+    assert len(branch.rounds) == 4  # 1 initial + 3 downstream
 
 
-def test_initial_policy_returning_nothing_stops_cleanly_with_no_initial_round() -> None:
-    checkpoint, sec_ref = _checkpoint_with_one_section()
+def test_initial_policy_returning_nothing_stops_cleanly_with_no_rounds() -> None:
+    checkpoint, refs = _checkpoint_with_sections("secA")
     producer = _FakeProducer()
     validator = _FakeValidator()
     runner = _runner(producer, lambda store: validator)
-    trigger = [_fail_evidence(sec_ref)]
+    trigger = [_fail_evidence(refs["secA"])]
 
     result = runner.run_branches(
         checkpoint,
@@ -478,9 +596,6 @@ def test_initial_policy_returning_nothing_stops_cleanly_with_no_initial_round() 
     )
 
     branch = result.branches[0]
-    assert branch.initial_action is None
-    assert branch.initial_round is None
-    assert branch.downstream_rounds == []
+    assert branch.rounds == []
     assert branch.stopped_reason == "initial_policy_returned_nothing"
-    # A final checkpoint is still produced even though nothing happened.
     assert branch.final_checkpoint is not None

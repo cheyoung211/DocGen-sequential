@@ -2,40 +2,70 @@
 2026.10.15" plan: "4단계. 고정 복구 정책과 분기 재실행").
 
 Builds on Stage 1's ``Producer``/``RepairPolicy`` Protocols, Stage 2's
-``ArtifactGraphStore`` (versioning, ``impact_candidates``, staleness), and
-Stage 3's ``Constraint``/``Validator`` machinery. Nothing here is wired into
-``scripts/run_full_pipeline.py`` or any agent -- per the user's explicit
-scope decision for this stage, this module is proven correct with
-Protocol-conforming fakes/stubs (``test/core/test_repair_operations.py``),
-the same discipline Stages 1-3 already used for anything that would
-otherwise require a real, expensive LLM call in a test. Actually running
-this against the real pipeline with the local Qwen3.6 model (producing a
-genuine small natural-failure/injected-failure pilot) is an explicitly
-deferred follow-up, not part of this stage's own code.
+``ArtifactGraphStore`` (versioning, ``impact_candidates``, staleness,
+INFERRED edges), and Stage 3's ``ToolExecutor``/``Constraint``/``Validator``
+machinery. Nothing here is wired into ``scripts/run_full_pipeline.py`` or
+any agent -- per the user's explicit scope decision for this stage, this
+module is proven correct with Protocol-conforming fakes/stubs
+(``test/core/test_repair_operations.py``), the same discipline Stages 1-3
+already used for anything that would otherwise require a real, expensive
+LLM call in a test. Actually running this against the real pipeline with
+the local Qwen3.6 model (producing a genuine small natural-failure/
+injected-failure pilot) is an explicitly deferred follow-up, not part of
+this stage's own code.
+
+**Revised after a user review found 8 real bugs in the first pass** (full
+detail in memory ``docgen_stage_review_rigor``) -- this revision:
+
+1. Persists the Producer's *real* output and *real* used inputs
+   (``ProductionResult.content``/``.read_input_versions``) instead of
+   ``content=None`` and a guessed re-pin of stale bookkeeping.
+2. Re-checks staleness fresh on every sweep of the cascade (a fixed-point
+   loop, not a single visit-once pass) so a candidate resolved before its
+   own upstream settles gets revisited once that upstream actually changes.
+3. Classifies a fresh check's evidence into FAIL / PASS / UNKNOWN three
+   ways (``_classify_evidence``) -- UNKNOWN-only (or no evidence at all)
+   is ``RepairOutcome.INCONCLUSIVE``, never silently read as resolved.
+4. Carries forward INFERRED edges onto a new version
+   (``_carry_forward_inferred_edges``) and re-binds reaffirmed evidence to
+   the new version it now actually describes, so neither the dependency
+   graph nor ``live_evidence()`` goes blind the moment a reaffirmed
+   artifact's version number moves.
+5. (fixed in ``branching_runner.py``, not here) executes every action a
+   policy's ``decide()`` returns, not just the first.
+6. Routes every real generation/check call through Stage 3's
+   ``ToolExecutor`` (``run_generation()``/``execute(CheckCall(...))``)
+   instead of calling ``Producer``/``Validator`` directly -- budget
+   admission and cost logging are enforced exactly once, in the place
+   Stage 3 already built and reviewed for it, not re-implemented here.
+7. (fixed in ``branching_runner.py``, not here) gives each branch its own
+   independent context/graph rather than sharing one mutable object.
+8. Gives "whole-document regeneration" its own unconditional execution
+   path (``_execute_unconditional``) that force-regenerates every artifact
+   in the document's impact set with no selective skip -- the earlier
+   version routed REGENERATE_DOCUMENT through the same selective cascade
+   as every other action type, which made it behave identically to
+   "fixed graph-aware"'s rare fallback case instead of the deliberately
+   blind baseline ``docs/stage1_experiment_design.md`` defines.
 
 Two components:
 
 - ``RepairOperationExecutor`` carries out one ``RepairAction`` -- the
   Stage 4 checklist's "block patch, section regeneration, subgraph replan,
-  whole-document regeneration 연산을 구현한다" -- and, in the same pass,
-  cascades through everything the repair could plausibly affect, re-
-  verifying each one fresh and regenerating only what still fails
-  ("수정 이후 영향받는 artifact를 재검사하고, 필요한 항목만 재생성하는 고정
-  graph-aware 정책을 구현한다"). Both checklist bullets are one mechanism
-  here, not two: the *scope* of what gets directly targeted is a
-  ``RepairPolicy``'s decision (below); *how far re-verification/selective
-  regeneration then propagates from that scope* is this executor's job,
-  uniformly, regardless of which of the four action types was chosen.
+  whole-document regeneration 연산을 구현한다" -- and, for the first three
+  action types, cascades through everything the repair could plausibly
+  affect, re-verifying each one fresh and regenerating only what still
+  fails ("수정 이후 영향받는 artifact를 재검사하고, 필요한 항목만 재생성하는
+  고정 graph-aware 정책을 구현한다"). REGENERATE_DOCUMENT instead forces
+  every reachable artifact unconditionally -- see point 8 above.
 
 - Two concrete ``RepairPolicy`` implementations fill in named rows from
-  ``docs/stage1_experiment_design.md``'s 7-comparison-group table that were
-  explicitly assigned to this stage: ``FixedGraphAwareRepairPolicy``
-  ("fixed graph-aware") and ``AlwaysRegenerateDocumentPolicy``
-  ("whole-document regeneration" -- and, combined with
-  ``branching_runner.BranchingRunner``'s ``check_timing`` option, also
-  "final-only verification", which that table defines as the *same* scope
-  rule under a different trigger-timing condition, not a different
-  policy).
+  ``docs/stage1_experiment_design.md``'s 7-comparison-group table:
+  ``FixedGraphAwareRepairPolicy`` ("fixed graph-aware") and
+  ``AlwaysRegenerateDocumentPolicy`` ("whole-document regeneration" -- and,
+  combined with ``branching_runner.BranchingRunner``'s ``check_timing``
+  option, also "final-only verification", the same scope rule under a
+  different trigger-timing condition, not a different policy).
 
 **Deliberate scope boundary: no producer for direction 1's finer-grained
 artifact kinds.** The Notion plan's artifact vocabulary includes
@@ -53,19 +83,19 @@ silently skipped. See ``RepairOutcome``'s own docstring in ``schemas.py``.
 
 from __future__ import annotations
 
-from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from src.core.artifact_graph import ArtifactGraphStore
-from src.core.cost_tracking import CostTrackingProducer
-from src.core.interfaces import Producer, Validator
+from src.core.interfaces import Producer
 from src.core.schemas import (
     ArtifactKind,
     ArtifactRef,
     Budget,
+    CheckCall,
     CheckOutcome,
     Constraint,
     CostRecord,
+    DependencyRelationKind,
     Evidence,
     ProductionResult,
     ProductionStatus,
@@ -74,13 +104,18 @@ from src.core.schemas import (
     RepairActionType,
     RepairExecutionResult,
     RepairOutcome,
+    ToolErrorCode,
 )
+from src.core.tool_executor import ToolExecutor
 
 ProducerRegistry = Dict[ArtifactKind, Producer]
 """Which real (or fake, in tests) ``Producer`` regenerates an artifact of a
 given kind. Deliberately a plain dict, not a class -- a missing entry *is*
 the ``RepairOutcome.NO_PRODUCER`` signal, so there is nothing for a wrapper
-class to add beyond what ``dict.get`` already gives for free."""
+class to add beyond what ``dict.get`` already gives for free. Holds *raw*
+producers, never pre-wrapped in ``cost_tracking.CostTrackingProducer`` --
+``ToolExecutor.run_generation()`` does that wrapping itself; wrapping here
+too would double-wrap and double-measure."""
 
 ConstraintProvider = Callable[[ArtifactRef], List[Constraint]]
 """Given a live artifact ref, which ``Constraint``s should be checked
@@ -89,182 +124,329 @@ against it right now. A plain callable, supplied by the caller -- neither
 which artifact" as its own state (consistent with Stage 3's
 ``CheckCall.constraints`` always being caller-supplied, never looked up
 internally). Returning an empty list means "nothing to check this artifact
-against": ``RepairOperationExecutor`` leaves such an artifact untouched --
-neither regenerated nor reaffirmed -- rather than fabricating a verdict for
-it either way."""
+against": a cascade candidate in that state is left exactly as-is
+(reported via ``RepairExecutionResult.left_stale``, never fabricated a
+verdict either way)."""
+
+_BUDGET_ERROR_CODES = frozenset(
+    {ToolErrorCode.BUDGET_EXCEEDED, ToolErrorCode.MAX_ACTIONS_EXCEEDED, ToolErrorCode.SUSPENDED}
+)
+
+
+def _classify_evidence(evidence: List[Evidence]) -> str:
+    """One of ``"FAIL"``/``"PASS"``/``"UNKNOWN"`` -- the three-way split a
+    review found missing (point 3 above). ``"PASS"`` requires at least one
+    PASS and zero FAIL; empty evidence or any UNKNOWN-with-no-FAIL both
+    fall through to ``"UNKNOWN"`` -- "nothing failed" is not the same claim
+    as "something passed", and a caller must never treat them as
+    interchangeable (``RepairOutcome.INCONCLUSIVE`` is exactly this
+    distinction made explicit downstream)."""
+    if any(item.outcome == CheckOutcome.FAIL for item in evidence):
+        return "FAIL"
+    if evidence and all(item.outcome == CheckOutcome.PASS for item in evidence):
+        return "PASS"
+    return "UNKNOWN"
 
 
 class RepairOperationExecutor:
-    """Carries out one ``RepairAction`` against a live ``ArtifactGraphStore``.
+    """Carries out one ``RepairAction`` against a live ``ArtifactGraphStore``,
+    through a ``ToolExecutor`` bound to that same store (one instance, one
+    store, one budget -- matching ``ToolExecutor``'s own "one instance
+    targets exactly one store" design, and the reason ``BranchingRunner``
+    builds a fresh pair of both per branch).
 
-    All four ``RepairActionType`` values go through exactly the same
-    mechanism; they differ only in which artifact(s)
-    ``action.target_artifacts`` names up front (one block, one section, an
-    explicit multi-artifact subgraph seed, or the document). This executor
-    does not know or care which policy produced ``action`` -- see
-    ``FixedGraphAwareRepairPolicy``/``AlwaysRegenerateDocumentPolicy`` for
-    where that choice is actually made.
+    PATCH_BLOCK/REGENERATE_SECTION/REPLAN_SUBGRAPH share one selective
+    cascade (``_execute_selective``): every directly-named target is
+    regenerated; from each one actually written, ``impact_candidates`` is
+    swept **repeatedly, re-checking staleness fresh each sweep**, until a
+    full sweep makes no further progress (bounded by
+    ``len(affected_ids) + 1`` sweeps) -- not a single visit-once pass,
+    which a review found could permanently miss a candidate re-invalidated
+    by a sibling processed *later* in the same pass (point 2 above).
+    REGENERATE_DOCUMENT instead force-regenerates everything in the
+    document's impact set unconditionally (``_execute_unconditional``,
+    point 8 above) -- deliberately a different, blunter operation, not a
+    wider instance of the same selective cascade.
 
-    **The cascade.** Every directly-named target is regenerated (its real
-    ``Producer`` is called; on success, ``ArtifactGraphStore.add_version``
-    persists the result). From each artifact actually written (regenerated
-    *or* reaffirmed, see below), ``ArtifactGraphStore.impact_candidates`` is
-    consulted for the conservative ``I(R) = R ∪ Desc_G(R)`` candidate set
-    Stage 2 already computes. Each candidate is **freshly re-checked**
-    (``Validator.check()`` -- never a stale/cached verdict): a FAIL queues
-    it for regeneration exactly like a directly-named target (expanding
-    further in turn); a clean check instead **reaffirms** it, content
-    unchanged (see ``_reaffirm``). Every artifact_id is resolved at most
-    once per ``execute()`` call (``processed``), so this always terminates
-    on a finite graph regardless of cycles.
-
-    **Why reaffirm, not just invalidate-or-skip.** Direction 1's own worked
-    example ("무관한 비교 표는 그대로 유지한다") implies a *stable* preserved
-    state, not "not touched this round, but still flagged dirty forever."
-    ``ArtifactGraphStore`` as built in Stage 2 only ever *sets*
-    ``_stale_ids`` (``add_version``'s forward propagation,
-    ``add_inferred_edge``'s retroactive invalidation) -- it has no
-    operation that *clears* staleness without writing a new version.
-    Rather than adding a new staleness-clearing primitive to already
-    multiply-reviewed Stage 2 code (which would need its own full round of
-    the same invariant scrutiny every other mechanism in that module has
-    already been through -- see memory ``docgen_stage_review_rigor``),
-    ``_reaffirm`` reuses ``add_version`` exactly as built: a new version
-    with the *same* content, but with every originally-declared input
-    **re-pinned to that input's current latest version** (``_repin``). Fed
-    through ``add_version``'s existing outdated/stale-input logic, a
-    candidate whose real inputs have now all caught up correctly comes back
-    ``born_stale=False`` -- genuinely fresh, not merely asserted so -- while
-    one whose *own* upstream is itself still unresolved correctly stays
-    stale, exactly mirroring what a real regeneration's own ``add_version``
-    call would conclude. No new store method, no second mechanism for the
-    same fact.
-
-    ``execute()`` performs at most one regeneration attempt per artifact --
-    it never retries internally. A ``RegeneratedArtifactRecord`` whose fresh
-    re-check still shows FAIL is reported as ``RepairOutcome.STILL_FAILING``,
-    not silently retried; another attempt is a later round's business,
-    driven by a caller re-invoking a ``RepairPolicy`` with fresh evidence
-    (``branching_runner.BranchingRunner``), the same layering every earlier
-    stage already uses (``RepairPolicy.decide()`` itself never loops either).
+    Every real generation/check call goes through ``ToolExecutor`` (point 6
+    above): a rejection due to budget/max-actions/suspension stops the
+    cascade -- whatever was not yet reached is reported via
+    ``RepairExecutionResult.left_stale``/``.budget_exhausted``, never
+    silently treated as resolved.
     """
 
     def __init__(
         self,
+        store: ArtifactGraphStore,
+        tool_executor: ToolExecutor,
         producer_registry: ProducerRegistry,
-        validator: Validator,
         constraint_provider: ConstraintProvider,
         base_context: Dict[str, Any],
+        *,
+        model_name: str = "unknown",
     ) -> None:
+        self._store = store
+        self._tool_executor = tool_executor
         self._producers = producer_registry
-        self._validator = validator
         self._constraints_for = constraint_provider
         self._base_context = base_context
+        self._model_name = model_name
+
+    @property
+    def tool_executor(self) -> ToolExecutor:
+        """Exposed so a caller (``BranchingRunner``) can read
+        ``.budget``/``.is_suspended`` after the fact without this class
+        needing its own parallel bookkeeping of the same facts."""
+        return self._tool_executor
 
     def execute(
-        self,
-        action: RepairAction,
-        store: ArtifactGraphStore,
-        *,
-        triggering_evidence: Optional[List[Evidence]] = None,
+        self, action: RepairAction, *, triggering_evidence: Optional[List[Evidence]] = None
     ) -> RepairExecutionResult:
-        """Carry out ``action`` against ``store`` and return exactly what
-        happened -- see this class's and ``RepairExecutionResult``'s
-        docstrings. Logs the action itself via
-        ``ArtifactGraphStore.record_action`` exactly once, at the start,
-        regardless of how many artifacts its cascade goes on to touch: the
-        thing that "began executing" is the one ``RepairAction``, not each
-        individual regeneration inside its cascade.
+        """Carry out ``action`` and return exactly what happened. Logs the
+        action itself via ``ArtifactGraphStore.record_action`` exactly once,
+        at the start, regardless of how many artifacts its cascade goes on
+        to touch -- the thing that "began executing" is the one
+        ``RepairAction``, not each individual regeneration inside it.
         """
-        store.record_action(action, triggering_evidence)
+        self._store.record_action(action, triggering_evidence)
+        if action.action_type == RepairActionType.REGENERATE_DOCUMENT:
+            return self._execute_unconditional(action)
+        return self._execute_selective(action)
 
+    # -- selective cascade (PATCH_BLOCK / REGENERATE_SECTION / REPLAN_SUBGRAPH) --
+
+    def _execute_selective(self, action: RepairAction) -> RepairExecutionResult:
         regenerated: List[RegeneratedArtifactRecord] = []
         reverified_untouched: List[ArtifactRef] = []
+        left_stale: List[ArtifactRef] = []
         costs: List[CostRecord] = []
-        processed: Set[str] = set()
-        # (ref, already_known_failing) -- directly-named targets are
-        # already known failing (the policy that produced `action` saw
-        # FAIL evidence for them); anything discovered via cascade starts
-        # unknown and must be freshly checked before either branch below.
-        queue: Deque[Tuple[ArtifactRef, bool]] = deque(
-            (ref, True) for ref in action.target_artifacts
-        )
+        budget_exhausted = False
+        blocked_ids: Set[str] = set()
 
-        while queue:
-            seed_ref, known_failing = queue.popleft()
-            if seed_ref.artifact_id in processed:
+        seed_refs: List[ArtifactRef] = []
+        seen_ids: Set[str] = set()
+        for ref in action.target_artifacts:
+            current = self._store.latest(ref.artifact_id)
+            if current is None or current.ref.artifact_id in seen_ids:
                 continue
-            current = store.latest(seed_ref.artifact_id)
-            if current is None:
-                continue  # defensive: a ref naming an artifact never stored
-            live_ref = current.ref
-            processed.add(live_ref.artifact_id)
+            seen_ids.add(current.ref.artifact_id)
+            seed_refs.append(current.ref)
 
-            if known_failing:
-                failing = True
+        affected_ids: Set[str] = set()
+        remaining_seeds = list(seed_refs)
+        while remaining_seeds:
+            live_ref = remaining_seeds.pop(0)
+            record, cost, exhausted = self._regenerate(live_ref, action)
+            regenerated.append(record)
+            if cost is not None:
+                costs.append(cost)
+            if exhausted:
+                budget_exhausted = True
+                break
+            if record.outcome in (RepairOutcome.PRODUCTION_FAILED, RepairOutcome.NO_PRODUCER):
+                blocked_ids.add(live_ref.artifact_id)
             else:
-                constraints = self._constraints_for(live_ref)
-                if not constraints:
-                    # Nothing asserts this candidate is broken, and nothing
-                    # confirms it either -- leave it exactly as-is. This
-                    # does not cut off reachability past it: impact_candidates
-                    # below already returns the *full* transitive descendant
-                    # set from each resolved artifact, not just one hop, so
-                    # skipping this one node loses no downstream coverage.
-                    continue
-                fresh_evidence = self._validator.check(live_ref, constraints, self._base_context)
-                for item in fresh_evidence:
-                    store.record_evidence(item)
-                failing = any(item.outcome == CheckOutcome.FAIL for item in fresh_evidence)
+                affected_ids |= self._store.impact_candidates(live_ref.artifact_id)
+        for ref in remaining_seeds:  # never reached -- budget ran out first
+            left_stale.append(ref)
 
-            if failing:
-                record, cost = self._regenerate(live_ref, action, store)
-                regenerated.append(record)
-                if cost is not None:
-                    costs.append(cost)
-                if record.outcome in (RepairOutcome.PRODUCTION_FAILED, RepairOutcome.NO_PRODUCER):
-                    continue  # nothing new was written -- nothing propagates from here
-                resolved_ref = record.new_ref
-                assert resolved_ref is not None  # guaranteed by RegeneratedArtifactRecord's own validation
-            else:
-                resolved_ref = self._reaffirm(live_ref, store)
-                reverified_untouched.append(resolved_ref)
+        affected_ids -= seen_ids
 
-            for candidate_id in sorted(
-                store.impact_candidates(resolved_ref.artifact_id) - {resolved_ref.artifact_id}
-            ):
-                if candidate_id in processed:
-                    continue
-                candidate_current = store.latest(candidate_id)
-                if candidate_current is not None:
-                    queue.append((candidate_current.ref, False))
+        if not budget_exhausted:
+            max_sweeps = len(affected_ids) + 1
+            for _ in range(max_sweeps):
+                if budget_exhausted:
+                    break
+                made_progress = False
+                for candidate_id in sorted(affected_ids):
+                    if budget_exhausted:
+                        break
+                    if candidate_id in blocked_ids:
+                        continue
+                    if not self._store.is_stale(candidate_id):
+                        continue  # settled (or never affected) -- nothing to do
+                    current = self._store.latest(candidate_id)
+                    if current is None:
+                        continue
+                    live_ref = current.ref
+                    constraints = self._constraints_for(live_ref)
+                    if not constraints:
+                        continue  # nothing to check -- left_stale, collected below
+                    evidence, rejected = self._check(live_ref, constraints)
+                    if rejected:
+                        budget_exhausted = True
+                        break
+                    made_progress = True
+                    classification = _classify_evidence(evidence)
+                    if classification == "FAIL":
+                        record, cost, exhausted = self._regenerate(live_ref, action)
+                        regenerated.append(record)
+                        if cost is not None:
+                            costs.append(cost)
+                        if exhausted:
+                            budget_exhausted = True
+                            break
+                        if record.outcome in (RepairOutcome.PRODUCTION_FAILED, RepairOutcome.NO_PRODUCER):
+                            blocked_ids.add(candidate_id)
+                        else:
+                            assert record.new_ref is not None
+                            affected_ids |= self._store.impact_candidates(
+                                record.new_ref.artifact_id
+                            ) - {candidate_id}
+                    elif classification == "PASS":
+                        new_ref = self._reaffirm(live_ref, evidence)
+                        reverified_untouched.append(new_ref)
+                        affected_ids |= self._store.impact_candidates(new_ref.artifact_id) - {candidate_id}
+                    # "UNKNOWN": leave exactly as-is (still stale) -- collected
+                    # into left_stale below if it remains so at the end.
+                if not made_progress:
+                    break
+
+        # Only artifact_ids that received NEITHER a RegeneratedArtifactRecord
+        # (any outcome) NOR a reaffirmation belong in left_stale -- those two
+        # already report their own final state in full; this list is
+        # reserved for candidates that were never actually resolved one way
+        # or the other at all (no constraints, or classified UNKNOWN).
+        touched_ids = {r.pre_repair_ref.artifact_id for r in regenerated} | {
+            r.artifact_id for r in reverified_untouched
+        }
+        for candidate_id in sorted(affected_ids):
+            if candidate_id in touched_ids:
+                continue
+            if self._store.is_stale(candidate_id):
+                current = self._store.latest(candidate_id)
+                if current is not None:
+                    left_stale.append(current.ref)
 
         return RepairExecutionResult(
             action=action,
             regenerated=regenerated,
             reverified_untouched=reverified_untouched,
-            overall_outcome=self._combine_outcomes(regenerated),
+            left_stale=left_stale,
+            overall_outcome=self._combine_outcomes(regenerated, left_stale, budget_exhausted),
             cost=costs,
+            budget_exhausted=budget_exhausted,
         )
 
+    # -- unconditional whole-document regeneration (REGENERATE_DOCUMENT) --
+
+    def _execute_unconditional(self, action: RepairAction) -> RepairExecutionResult:
+        """"whole-document regeneration" baseline's own execution semantic:
+        force-regenerate the document and *every* artifact in its impact
+        set, unconditionally -- no check-first, no skip-if-still-passing.
+        That selectivity is exactly what distinguishes "fixed graph-aware"
+        from this deliberately blind baseline (``docs/
+        stage1_experiment_design.md`` §3); routing REGENERATE_DOCUMENT
+        through the same selective cascade as the other three action types
+        (the first-pass bug) made the two baselines behave identically
+        once either one escalated to document scope."""
+        regenerated: List[RegeneratedArtifactRecord] = []
+        left_stale: List[ArtifactRef] = []
+        costs: List[CostRecord] = []
+        budget_exhausted = False
+
+        document_refs = [ref for ref in action.target_artifacts if ref.kind == ArtifactKind.DOCUMENT]
+        if not document_refs:
+            for ref in action.target_artifacts:
+                current = self._store.latest(ref.artifact_id)
+                if current is not None:
+                    left_stale.append(current.ref)
+            return RepairExecutionResult(
+                action=action,
+                regenerated=[],
+                reverified_untouched=[],
+                left_stale=left_stale,
+                overall_outcome=RepairOutcome.NO_PRODUCER,
+                cost=[],
+            )
+
+        current = self._store.latest(document_refs[0].artifact_id)
+        document_ref = current.ref if current is not None else document_refs[0]
+        rest = sorted(self._store.impact_candidates(document_ref.artifact_id) - {document_ref.artifact_id})
+        order = [document_ref.artifact_id] + rest
+
+        processed_ids: Set[str] = set()
+        for artifact_id in order:
+            if budget_exhausted:
+                break
+            current = self._store.latest(artifact_id)
+            if current is None:
+                continue
+            live_ref = current.ref
+            record, cost, exhausted = self._regenerate(live_ref, action)
+            regenerated.append(record)
+            processed_ids.add(artifact_id)
+            if cost is not None:
+                costs.append(cost)
+            if exhausted:
+                budget_exhausted = True
+
+        if budget_exhausted:
+            for artifact_id in order:
+                if artifact_id in processed_ids:
+                    continue
+                current = self._store.latest(artifact_id)
+                if current is not None:
+                    left_stale.append(current.ref)
+
+        return RepairExecutionResult(
+            action=action,
+            regenerated=regenerated,
+            reverified_untouched=[],
+            left_stale=left_stale,
+            overall_outcome=self._combine_outcomes(regenerated, left_stale, budget_exhausted),
+            cost=costs,
+            budget_exhausted=budget_exhausted,
+        )
+
+    # -- ToolExecutor-routed primitives --
+
+    def _call_producer(
+        self, producer: Producer, artifact_id: str, context: Dict[str, Any], *, stage: str
+    ) -> Tuple[ProductionResult, Optional[CostRecord], bool]:
+        """Returns ``(production, cost, admission_rejected)``. Routes
+        through ``ToolExecutor.run_generation()`` -- admission checked
+        before the call, cost charged against this executor's own budget
+        either way (point 6 above). ``admission_rejected=True`` means the
+        call was never dispatched at all (budget/max-actions/suspended);
+        the ``ProductionResult`` is a synthetic FAILED placeholder in that
+        case, not a real attempt by the wrapped Producer."""
+        observation = self._tool_executor.run_generation(
+            producer, artifact_id, context, model_name=self._model_name, stage=stage
+        )
+        if not observation.ok:
+            assert observation.error is not None
+            rejected = observation.error.code in _BUDGET_ERROR_CODES
+            return (
+                ProductionResult(status=ProductionStatus.FAILED, error=observation.error.message),
+                observation.cost,
+                rejected,
+            )
+        assert observation.output is not None
+        return observation.output.production, observation.cost, False
+
+    def _check(self, ref: ArtifactRef, constraints: List[Constraint]) -> Tuple[List[Evidence], bool]:
+        """Returns ``(evidence, admission_rejected)``. Routes through
+        ``ToolExecutor.execute(CheckCall(...))`` -- which already records
+        the resulting ``Evidence`` to the store itself
+        (``ToolExecutor._dispatch_check``), so this method must not record
+        it again. A rejected ``CheckCall`` can only mean budget/max-actions/
+        suspension (CHECK has no other rejection path), so
+        ``admission_rejected`` is unconditionally the whole story for a
+        ``not observation.ok`` result here."""
+        call = CheckCall(artifact=ref, constraints=constraints, context=dict(self._base_context))
+        observation = self._tool_executor.execute(call)
+        if not observation.ok:
+            return [], True
+        assert observation.output is not None
+        return observation.output.evidence, False
+
+    # -- regeneration / reaffirmation --
+
     def _regenerate(
-        self, ref: ArtifactRef, action: RepairAction, store: ArtifactGraphStore
-    ) -> Tuple[RegeneratedArtifactRecord, Optional[CostRecord]]:
-        """Returns the regeneration record plus the ``CostRecord`` actually
-        incurred, if any -- populated only when ``producer_registry[ref.kind]``
-        happens to be a ``CostTrackingProducer`` (the "common local/API
-        model adapter" Stage 3 already built). A plain, untracked
-        ``Producer`` (e.g. a test fake) simply yields no cost, exactly like
-        calling an untracked ``Producer`` anywhere else in this codebase.
-        Any cost found here is also persisted via
-        ``ArtifactGraphStore.record_cost`` immediately -- mirroring
-        ``ToolExecutor._charge``'s "every dispatched call is logged, here
-        and nowhere else" discipline -- and handed back to the caller so
-        ``branching_runner.BranchingRunner`` can actually charge its own
-        ``Budget`` (a *measurement* that nothing charges against a budget
-        is not an *enforcement* -- the exact Stage 3 review finding this
-        mirrors, see ``docgen_stage_review_rigor`` pattern #15).
-        """
+        self, ref: ArtifactRef, action: RepairAction
+    ) -> Tuple[RegeneratedArtifactRecord, Optional[CostRecord], bool]:
+        """Returns ``(record, cost, budget_exhausted)``."""
         producer = self._producers.get(ref.kind)
         if producer is None:
             return (
@@ -277,91 +459,175 @@ class RepairOperationExecutor:
                     outcome=RepairOutcome.NO_PRODUCER,
                 ),
                 None,
+                False,
             )
+
+        stored = self._store.get_version(ref.artifact_id, ref.version)
+        previous_inputs = stored.ref.read_input_versions if stored is not None else []
+        intended_inputs = [self._repin(i) for i in previous_inputs]
 
         context = dict(self._base_context)
+        # What this call is being ASKED to use -- a conforming Producer with
+        # no finer-grained tracking of its own may honestly echo this back
+        # on its ProductionResult (see that schema's docstring); this
+        # executor never fabricates `read_input_versions` on the Producer's
+        # behalf beyond handing it this explicit intention.
+        context["read_input_versions"] = intended_inputs
         if action.use_diagnostic_feedback and action.feedback_text:
             context["error_message"] = action.feedback_text
+        else:
+            # Explicitly clear/neutralize -- a stale error_message left over
+            # in base_context from an earlier round must never leak into a
+            # "no diagnostic feedback" comparison condition. PATCH_BLOCK's
+            # real producer (BlockPatchProducer) has no way to omit this
+            # parameter at all (regenerate_blocks requires it) -- a neutral,
+            # content-free placeholder is used instead of silently keeping
+            # whatever text happened to already be in context.
+            context.pop("error_message", None)
+            if ref.kind == ArtifactKind.BLOCK:
+                context["error_message"] = "retry"
 
-        production = producer.produce(ref.artifact_id, context)
-        cost = producer.last_cost if isinstance(producer, CostTrackingProducer) else None
-        if cost is not None:
-            store.record_cost(cost)
-
+        production, cost, rejected = self._call_producer(
+            producer, ref.artifact_id, context, stage=f"repair:{action.action_type.value}"
+        )
+        if rejected:
+            return (
+                RegeneratedArtifactRecord(pre_repair_ref=ref, production=production, outcome=RepairOutcome.PRODUCTION_FAILED),
+                cost,
+                True,
+            )
         if production.status == ProductionStatus.FAILED:
             return (
-                RegeneratedArtifactRecord(
-                    pre_repair_ref=ref, production=production, outcome=RepairOutcome.PRODUCTION_FAILED
-                ),
+                RegeneratedArtifactRecord(pre_repair_ref=ref, production=production, outcome=RepairOutcome.PRODUCTION_FAILED),
                 cost,
+                False,
             )
 
-        stored = store.get_version(ref.artifact_id, ref.version)
-        previous_inputs = stored.ref.read_input_versions if stored is not None else []
-        repinned_inputs = [self._repin(i, store) for i in previous_inputs]
-        add_result = store.add_version(
+        # The real inputs this call actually used, per the Producer itself
+        # -- falling back to our own stated intention only when the
+        # Producer did not report anything at all (``None``, not ``[]``;
+        # see ProductionResult's docstring for why those two are distinct).
+        real_inputs = production.read_input_versions if production.read_input_versions is not None else intended_inputs
+        add_result = self._store.add_version(
             ref.artifact_id,
             ref.kind,
-            content=None,
-            read_input_versions=repinned_inputs,
+            content=production.content,
+            read_input_versions=real_inputs,
             produced_by=f"repair:{action.action_type.value}",
         )
+        self._carry_forward_inferred_edges(ref, add_result.ref)
 
         reverify_evidence: List[Evidence] = []
+        budget_exhausted = False
         constraints = self._constraints_for(add_result.ref)
         if constraints:
-            reverify_evidence = self._validator.check(add_result.ref, constraints, self._base_context)
-            for item in reverify_evidence:
-                store.record_evidence(item)
-        still_failing = any(item.outcome == CheckOutcome.FAIL for item in reverify_evidence)
+            reverify_evidence, rejected = self._check(add_result.ref, constraints)
+            budget_exhausted = rejected
+
+        classification = _classify_evidence(reverify_evidence)
+        outcome = {
+            "FAIL": RepairOutcome.STILL_FAILING,
+            "PASS": RepairOutcome.RESOLVED,
+            "UNKNOWN": RepairOutcome.INCONCLUSIVE,
+        }[classification]
 
         return (
             RegeneratedArtifactRecord(
                 pre_repair_ref=ref,
                 production=production,
-                outcome=RepairOutcome.STILL_FAILING if still_failing else RepairOutcome.RESOLVED,
+                outcome=outcome,
                 new_ref=add_result.ref,
                 reverify_evidence=reverify_evidence,
             ),
             cost,
+            budget_exhausted,
         )
 
-    def _reaffirm(self, ref: ArtifactRef, store: ArtifactGraphStore) -> ArtifactRef:
+    def _reaffirm(self, ref: ArtifactRef, evidence: List[Evidence]) -> ArtifactRef:
         """Re-confirm ``ref`` is still valid without changing its content --
-        see this class's own docstring, "why reaffirm" paragraph."""
-        stored = store.get_version(ref.artifact_id, ref.version)
+        a same-content ``add_version`` call with every originally-declared
+        input re-pinned to its current latest version, which Stage 2's
+        existing outdated/stale-input logic then correctly reads as
+        genuinely fresh (or correctly still-stale, if some upstream is
+        itself unresolved) -- no new store primitive needed.
+
+        Two things a review found missing from the first pass, both fixed
+        here: (a) any INFERRED edge that pointed at the OLD version is
+        carried forward onto the new one (``_carry_forward_inferred_edges``)
+        -- otherwise the dependency graph silently forgets a relationship
+        the moment a reaffirmed artifact's version number moves; (b) the
+        PASS evidence that justified this reaffirmation is re-recorded
+        bound to the NEW ref, not left attached only to the old, now-
+        superseded version -- otherwise ``live_evidence()`` on the new
+        version comes back empty even though the (unchanged) content was
+        just confirmed valid.
+        """
+        stored = self._store.get_version(ref.artifact_id, ref.version)
         previous_inputs = stored.ref.read_input_versions if stored is not None else []
-        repinned_inputs = [self._repin(i, store) for i in previous_inputs]
-        add_result = store.add_version(
+        repinned_inputs = [self._repin(i) for i in previous_inputs]
+        add_result = self._store.add_version(
             ref.artifact_id,
             ref.kind,
             content=stored.content if stored is not None else None,
             read_input_versions=repinned_inputs,
             produced_by="reaffirmed_after_reverify",
         )
+        self._carry_forward_inferred_edges(ref, add_result.ref)
+        for item in evidence:
+            rebound = item.model_copy(update={"checked_artifact": add_result.ref})
+            self._store.record_evidence(rebound)
         return add_result.ref
 
-    def _repin(self, ref: ArtifactRef, store: ArtifactGraphStore) -> ArtifactRef:
-        """``ref``'s artifact_id, re-pointed at its CURRENT latest version --
-        the mechanism that lets a reaffirmation ``add_version`` call
-        correctly come back fresh once its own inputs have caught up."""
-        current = store.latest(ref.artifact_id)
+    def _carry_forward_inferred_edges(self, old_ref: ArtifactRef, new_ref: ArtifactRef) -> None:
+        """Every INFERRED edge whose ``to_artifact`` named exactly
+        ``old_ref`` is re-declared pointing at ``new_ref`` instead --
+        ``add_version`` only ever auto-creates EXPLICIT edges from
+        ``read_input_versions``, so an INFERRED relationship (added
+        out-of-band via ``add_inferred_edge``) would otherwise simply stop
+        applying the moment the artifact it points at gets superseded by a
+        new version, for *any* reason (reaffirm here, or a real
+        regeneration). ``from_artifact`` is re-pinned to its own current
+        version first, matching ``add_inferred_edge``'s own validation
+        (a real, current ref) and its retroactive-invalidation semantics
+        (if that upstream is itself outdated/stale, carrying the edge
+        forward correctly re-flags the new version too -- the same
+        behavior a fresh declaration of this relationship would have)."""
+        for edge in self._store.edges:
+            if edge.relation != DependencyRelationKind.INFERRED:
+                continue
+            if edge.to_artifact.artifact_id != old_ref.artifact_id or edge.to_artifact.version != old_ref.version:
+                continue
+            from_current = self._store.latest(edge.from_artifact.artifact_id)
+            from_ref = from_current.ref if from_current is not None else edge.from_artifact
+            self._store.add_inferred_edge(
+                from_ref, new_ref, reason=f"carried forward from v{old_ref.version}: {edge.reason}"
+            )
+
+    def _repin(self, ref: ArtifactRef) -> ArtifactRef:
+        """``ref``'s artifact_id, re-pointed at its CURRENT latest version."""
+        current = self._store.latest(ref.artifact_id)
         return current.ref if current is not None else ref
 
     @staticmethod
-    def _combine_outcomes(records: List[RegeneratedArtifactRecord]) -> RepairOutcome:
-        """Worst-first: any artifact this action touched that is still
-        failing (or could not even be attempted) makes the whole action's
-        outcome something other than a clean ``RESOLVED`` -- a caller
-        reading only ``overall_outcome`` must never see RESOLVED if any
-        individual regeneration inside the cascade did not actually
-        resolve."""
+    def _combine_outcomes(
+        records: List[RegeneratedArtifactRecord], left_stale: List[ArtifactRef], budget_exhausted: bool
+    ) -> RepairOutcome:
+        """Worst-first. ``budget_exhausted``/non-empty ``left_stale`` both
+        mean "this execution did not reach a clean final state" and
+        outrank everything else -- a caller reading only
+        ``overall_outcome`` must never see RESOLVED when something affected
+        was left unresolved for any reason, including simply running out of
+        room to look at it."""
+        if budget_exhausted or left_stale:
+            return RepairOutcome.INCONCLUSIVE
         if any(r.outcome == RepairOutcome.STILL_FAILING for r in records):
             return RepairOutcome.STILL_FAILING
         if any(r.outcome == RepairOutcome.PRODUCTION_FAILED for r in records):
             return RepairOutcome.PRODUCTION_FAILED
         if any(r.outcome == RepairOutcome.NO_PRODUCER for r in records):
             return RepairOutcome.NO_PRODUCER
+        if any(r.outcome == RepairOutcome.INCONCLUSIVE for r in records):
+            return RepairOutcome.INCONCLUSIVE
         return RepairOutcome.RESOLVED
 
 
@@ -379,7 +645,10 @@ class FixedGraphAwareRepairPolicy:
     call, not capped at one total. (Unlike ``TodayFixedRepairPolicyAdapter``,
     which deliberately mirrors a real pipeline method that only ever acts on
     one location per round; this policy has no such real method to mirror,
-    so nothing requires it to artificially under-batch.)
+    so nothing requires it to artificially under-batch. A caller must
+    execute *every* returned action -- see ``branching_runner.py``'s own
+    review-fixed history for why executing only the first silently drops
+    independent failures.)
 
     1. ``kind == BLOCK`` -> ``PATCH_BLOCK``, target = the failing block
        alone.
@@ -397,11 +666,12 @@ class FixedGraphAwareRepairPolicy:
     4. Anything else, with at most one direct dependent -> ``REGENERATE_
        DOCUMENT`` targeting ``document_ref``, as the bounded fallback for a
        failing artifact with no narrower scope this policy can structurally
-       justify (no per-kind producer, no useful local fan-out signal). The
-       executor's own cascade still re-verifies before regenerating
-       anything further out from there -- this fallback is not a return to
-       "blindly rebuild everything", the way ``AlwaysRegenerateDocumentPolicy``
-       is by design.
+       justify (no per-kind producer, no useful local fan-out signal). Note
+       that once chosen, this scope is carried out by the executor's
+       *unconditional* document-regeneration path, same as
+       ``AlwaysRegenerateDocumentPolicy``'s own choice -- the two baselines
+       differ in how *often* they reach for this scope, not in what
+       choosing it does once chosen.
 
     ``use_diagnostic_feedback`` is always ``True`` (``feedback_text`` set to
     the triggering ``Evidence.detail``) -- this policy's comparison purpose
@@ -472,7 +742,9 @@ class AlwaysRegenerateDocumentPolicy:
     (``docs/stage1_experiment_design.md`` §3): any FAIL at all, anywhere,
     always escalates to ``REGENERATE_DOCUMENT`` targeting ``document_ref`` --
     deliberately blind to kind, fan-out, or how many distinct artifacts
-    actually failed.
+    actually failed. Carried out by
+    ``RepairOperationExecutor._execute_unconditional`` -- every artifact in
+    the document's impact set, force-regenerated, no selective skip.
 
     This is also the scope half of "final-only verification"
     (``branching_runner.BranchingRunner``'s ``check_timing`` parameter

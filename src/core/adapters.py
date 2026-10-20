@@ -73,6 +73,16 @@ class PlannerAgentProducer:
         return ProductionResult(
             status=ProductionStatus.SUCCESS,
             artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.DOCUMENT),
+            # The real output, serialized -- a Stage 4 review found a caller
+            # (RepairOperationExecutor) was persisting content=None instead
+            # of what was actually produced; ProductionResult.content exists
+            # so this adapter can report it honestly. read_input_versions
+            # simply echoes back what the caller told this call to use
+            # (context["read_input_versions"]) -- PlannerAgent has no
+            # finer-grained tracking of its own ArtifactRef-level inputs to
+            # report instead.
+            content=self.last_output.model_dump_json(),
+            read_input_versions=context.get("read_input_versions"),
         )
 
 
@@ -141,6 +151,10 @@ class TextAgentProducer:
         return ProductionResult(
             status=ProductionStatus.SUCCESS,
             artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.SECTION),
+            # See PlannerAgentProducer's identical comment -- same Stage 4
+            # review finding, same fix.
+            content=self.last_output.model_dump_json(),
+            read_input_versions=context.get("read_input_versions"),
         )
 
 
@@ -223,6 +237,10 @@ class BlockPatchProducer:
         return ProductionResult(
             status=ProductionStatus.SUCCESS,
             artifact=ArtifactRef(artifact_id=artifact_id, kind=ArtifactKind.BLOCK),
+            # See PlannerAgentProducer's identical comment -- same Stage 4
+            # review finding, same fix.
+            content=self.last_output.model_dump_json(),
+            read_input_versions=context.get("read_input_versions"),
         )
 
 

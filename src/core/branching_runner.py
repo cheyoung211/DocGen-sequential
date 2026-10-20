@@ -15,22 +15,38 @@ design, fixed back in Stage 1 and executed here for the first time:
      branch's store.
   3. 각 분기의 후속 실행은 동일한 후속 정책으로 고정한다 -- every branch gets its
      own fresh instance of the *same rule* (``downstream_policy_factory()``,
-     called once per branch), used identically from round 2 onward, so only
-     round 1 (what each ``BranchSpec`` actually varies) differs between
-     branches. A factory, not one shared instance: a stateful policy (e.g.
-     ``adapters.BlindRetryRepairPolicy``, which tracks a per-artifact retry
-     count across calls) would otherwise leak state across branches that
-     are supposed to be completely independent -- round 2 of branch A
-     incrementing a retry counter that round 2 of branch B then
-     unexpectedly inherits. ``ArtifactGraphStore.from_checkpoint`` already
-     guarantees this independence for store state; the policy and the
-     budget (see ``budget_factory`` below) need the same guarantee
-     explicitly, since neither lives inside the checkpoint.
+     called once per branch), used identically from round 2 onward.
   4. 효과는 해당 checkpoint·행동·후속 정책 조건에만 한정해서 해석한다 -- a
      ``BranchExecutionResult`` keeps its own ``source_checkpoint_id`` and
-     every round it actually ran, so a reader is never tempted to read a
-     result past the specific (checkpoint, initial action, downstream
-     policy) combination it came from.
+     every round it actually ran.
+
+**Revised after a user review found 3 real bugs affecting this module**
+(full detail in memory ``docgen_stage_review_rigor``):
+
+5. **Every action a round's ``decide()`` call returns is now executed, not
+   just the first.** The original version took ``decisions[0]`` and
+   silently discarded the rest -- two independent failures named by the
+   same ``decide()`` call (A and B, no dependency between them) collapsed
+   into "only A was ever attempted, B's failure vanished from the record,"
+   and a round where one action's cascade hit PRODUCTION_FAILED while
+   another's passed could misreport ``stopped_reason="no_more_failures"``.
+   Fixed with an explicit ``pending`` map of still-failing artifact_ids,
+   updated (never wholesale-replaced) after every executed action.
+6. **Every real generation/check call is now routed through one
+   ``ToolExecutor`` per branch**, including the ``check_timing="final_only"``
+   one-shot check this class itself performs -- admission is checked
+   before each call and cost is charged against the branch's own budget
+   exactly once, in Stage 3's already-reviewed enforcement point, instead
+   of this module summing costs after the fact (which let a whole round's
+   worth of generation calls run uncapped between budget checks).
+7. **Each branch gets its own independent context**
+   (``context_factory(spec)``, called once per branch, mirroring
+   ``budget_factory``/``downstream_policy_factory``) -- the original
+   version handed every branch the *same* ``context`` dict (and
+   ``RepairOperationExecutor`` only ever shallow-copied it), so a mutable
+   object inside it (e.g. a real ``DocumentGraph`` a ``Producer`` mutates
+   as a side effect) was silently shared across branches, breaking the
+   "same initial state" guarantee the whole point of branching depends on.
 
 Nothing here is wired into ``scripts/run_full_pipeline.py`` -- same scope
 decision as ``repair_operations.py`` (proven with Protocol-conforming
@@ -50,22 +66,23 @@ from src.core.schemas import (
     Budget,
     BranchComparisonResult,
     BranchExecutionResult,
+    CheckCall,
     CheckOutcome,
     Checkpoint,
     Constraint,
     Evidence,
-    RepairAction,
     RepairExecutionResult,
     RepairOutcome,
+    RepairRound,
 )
+from src.core.tool_executor import ToolExecutor
 
 
 class BranchSpec(NamedTuple):
     """One branch's distinguishing choice: a label (becomes the restored
     store's ``branch_id`` and the result's ``policy_label``) and the
     ``RepairPolicy`` that decides *only* this branch's initial round --
-    every round after that uses the one shared ``downstream_policy`` passed
-    to ``BranchingRunner.run_branches``, not this policy again."""
+    every round after that uses the one shared downstream policy."""
 
     label: str
     policy: RepairPolicy
@@ -75,51 +92,27 @@ class BranchingRunner:
     """Branches one shared checkpoint into several independent episodes,
     one per initial ``RepairPolicy`` (``BranchSpec``), each then continuing
     under one shared fixed downstream policy. See this module's docstring
-    for the §5 design points this operationalizes.
+    for the §5 design points this operationalizes and the 3 bugs a review
+    found and fixed.
 
     ``check_timing`` controls only how each branch's **initial** round is
-    decided -- the one axis with a Stage-4-representable "when" distinction
-    absent a real controller/orchestration loop (Stage 5):
+    decided:
 
     - ``"continuous"``: the initial ``decide()`` call for every branch uses
-      ``triggering_evidence`` exactly as given -- whatever was already
-      discovered and is sitting on the checkpoint, acted on as soon as it
-      is available (``docs/stage1_experiment_design.md``'s "whole-document
-      regeneration" row: trigger=on).
-    - ``"final_only"``: ``triggering_evidence`` is ignored for the initial
-      decision; instead this runner performs exactly one fresh
-      ``Validator.check()`` against ``final_check_target``/
-      ``final_check_constraints`` and decides from *that* instead (the
-      "final-only verification" row: trigger=off mid-generation, on only at
-      a one-shot final check).
+      ``triggering_evidence`` exactly as given.
+    - ``"final_only"``: ``triggering_evidence`` is ignored; this runner
+      performs exactly one fresh check (routed through that branch's own
+      ``ToolExecutor``, same as every other check -- point 6 above) against
+      ``final_check_target``/``final_check_constraints`` and decides from
+      that instead.
 
-      Downstream rounds are unaffected by ``check_timing`` either way --
-      each one is driven by the fresh evidence
-      ``RepairOperationExecutor``'s own cascade already produces while
-      executing the previous round (``RegeneratedArtifactRecord.
-      reverify_evidence``), which has no real analogue of "defer checking"
-      without inventing one; operationalizing *that* needs a real
-      controller deciding when to look, which is explicitly Stage 5's job,
-      not this harness's.
-
-    **Why ``validator_factory``, not a single ``Validator`` instance.**
-    ``Validator`` implementations are not all "pure" with respect to which
-    store they read: ``constraint_checks.BasicConstraintChecker`` binds to
-    one specific ``ArtifactGraphStore`` *at construction time*
-    (``self._store = store``), mirroring ``tool_executor.ToolExecutor``'s
-    own documented "one instance targets exactly one store" design. If
-    ``BranchingRunner`` shared one such validator across every branch, it
-    would keep reading/writing against whichever single store it was
-    originally bound to -- silently ignoring each branch's own
-    independently-restored store entirely, even though
-    ``RepairOperationExecutor.execute()``'s *other* operations
-    (``store.add_version``, ``store.latest``, ...) would correctly operate
-    on the right branch. Building both the validator and the executor fresh
-    per branch, from this branch's own restored store, is what keeps every
-    part of one branch's execution looking at the same, correct store.
-    ``producer_registry``/``constraint_provider`` do not have this problem
-    (today's real producers bind to an agent, not a store; a constraint
-    provider is a pure callable) and so stay shared across branches.
+    Both a fresh ``Validator`` (``validator_factory(store)``) and a fresh
+    ``ToolExecutor``/``RepairOperationExecutor`` pair are built per branch,
+    bound to that branch's own restored store -- a ``Validator`` like
+    ``constraint_checks.BasicConstraintChecker`` binds to one specific
+    store at construction time, so sharing one across branches would read/
+    write the *original* store regardless of which branch's restored store
+    everything else was correctly operating on.
     """
 
     def __init__(
@@ -128,11 +121,15 @@ class BranchingRunner:
         validator_factory: Callable[[ArtifactGraphStore], Validator],
         constraint_provider: ConstraintProvider,
         *,
+        model_name: str = "unknown",
+        max_actions_per_branch: int = 1000,
         max_downstream_rounds: int = 5,
     ) -> None:
         self._producers = producer_registry
         self._validator_factory = validator_factory
         self._constraints_for = constraint_provider
+        self._model_name = model_name
+        self._max_actions_per_branch = max_actions_per_branch
         self._max_downstream_rounds = max_downstream_rounds
 
     def run_branches(
@@ -143,18 +140,18 @@ class BranchingRunner:
         *,
         triggering_evidence: List[Evidence],
         budget_factory: Callable[[], Budget],
+        context_factory: Callable[[BranchSpec], Dict[str, Any]] = lambda spec: {},
         check_timing: str = "continuous",
         final_check_target: Optional[ArtifactRef] = None,
         final_check_constraints: Optional[List[Constraint]] = None,
-        context: Optional[Dict[str, Any]] = None,
     ) -> BranchComparisonResult:
         """Run every ``BranchSpec`` from the same ``checkpoint`` and return
         all of their results together.
 
-        ``downstream_policy_factory``/``budget_factory`` are each called
-        once *per branch* (never once total, never reused across branches)
-        -- see this class's own docstring, point 3, for why a shared
-        instance of either would let one branch's state leak into
+        ``downstream_policy_factory``/``budget_factory``/``context_factory``
+        are each called once *per branch*, never reused across branches --
+        see this class's own docstring, points 3 and 7, for why a shared
+        instance of any of them would let one branch's state leak into
         another's.
         """
         if check_timing not in ("continuous", "final_only"):
@@ -164,7 +161,6 @@ class BranchingRunner:
                 "check_timing='final_only' requires both final_check_target and final_check_constraints"
             )
 
-        resolved_context = context or {}
         branches = [
             self._run_one_branch(
                 checkpoint,
@@ -172,10 +168,10 @@ class BranchingRunner:
                 downstream_policy_factory(),
                 triggering_evidence=triggering_evidence,
                 budget=budget_factory(),
+                context=context_factory(spec),
                 check_timing=check_timing,
                 final_check_target=final_check_target,
                 final_check_constraints=final_check_constraints,
-                context=resolved_context,
             )
             for spec in branch_specs
         ]
@@ -189,126 +185,139 @@ class BranchingRunner:
         *,
         triggering_evidence: List[Evidence],
         budget: Budget,
+        context: Dict[str, Any],
         check_timing: str,
         final_check_target: Optional[ArtifactRef],
         final_check_constraints: Optional[List[Constraint]],
-        context: Dict[str, Any],
     ) -> BranchExecutionResult:
         store = ArtifactGraphStore.from_checkpoint(checkpoint, branch_id=spec.label)
-        # Both built fresh, bound to THIS branch's own store -- see this
-        # class's docstring, "why validator_factory" paragraph.
         validator = self._validator_factory(store)
-        executor = RepairOperationExecutor(self._producers, validator, self._constraints_for, context)
+        tool_executor = ToolExecutor(store, validator, budget=budget, max_actions=self._max_actions_per_branch)
+        executor = RepairOperationExecutor(
+            store, tool_executor, self._producers, self._constraints_for, context, model_name=self._model_name
+        )
+
+        rounds: List[RepairRound] = []
+        stopped_reason = "no_more_failures"
 
         if check_timing == "continuous":
-            initial_evidence = list(triggering_evidence)
+            current_evidence = list(triggering_evidence)
         else:
             assert final_check_target is not None and final_check_constraints is not None
             current = store.latest(final_check_target.artifact_id)
             live_ref = current.ref if current is not None else final_check_target
-            initial_evidence = validator.check(live_ref, final_check_constraints, context)
-            for item in initial_evidence:
-                store.record_evidence(item)
-
-        initial_action: Optional[RepairAction] = None
-        initial_round: Optional[RepairExecutionResult] = None
-        stopped_reason = "no_more_failures"
-
-        initial_decisions = spec.policy.decide(initial_evidence, store.edges, budget)
-        if not initial_decisions:
-            stopped_reason = "initial_policy_returned_nothing"
-        else:
-            initial_action = initial_decisions[0]
-            initial_round = executor.execute(
-                initial_action, store, triggering_evidence=initial_evidence
+            observation = tool_executor.execute(
+                CheckCall(artifact=live_ref, constraints=final_check_constraints, context=dict(context))
             )
-            for cost in initial_round.cost:
-                budget = budget.charge(cost)
-
-        downstream_rounds: List[RepairExecutionResult] = []
-        if initial_round is not None:
-            current_evidence = self._collect_round_evidence(initial_round)
-            if not current_evidence and self._stalled_without_evidence(initial_round):
-                # Empty evidence here does NOT mean "resolved" -- the
-                # initial round could not even be attempted (every target
-                # came back PRODUCTION_FAILED/NO_PRODUCER, so no fresh
-                # Validator.check() ever ran to produce reverify_evidence
-                # either way). Reporting this as "no_more_failures" would
-                # misread a failed repair as a clean one -- exactly the
-                # "실패한 복구도 남는다" completion criterion this guards.
-                # The failure itself is never lost either way: it is
-                # already visible on `initial_round.overall_outcome`.
-                stopped_reason = "repair_could_not_be_attempted"
+            if observation.ok:
+                assert observation.output is not None
+                current_evidence = observation.output.evidence
             else:
-                rounds_run = 0
-                while rounds_run < self._max_downstream_rounds:
-                    if budget.remaining <= 0:
-                        stopped_reason = "budget_exhausted"
-                        break
-                    if not any(item.outcome == CheckOutcome.FAIL for item in current_evidence):
-                        stopped_reason = "no_more_failures"
-                        break
-                    decisions = downstream_policy.decide(current_evidence, store.edges, budget)
-                    if not decisions:
-                        stopped_reason = "downstream_policy_returned_nothing"
-                        break
-                    round_result = executor.execute(
-                        decisions[0], store, triggering_evidence=current_evidence
-                    )
-                    downstream_rounds.append(round_result)
-                    for cost in round_result.cost:
-                        budget = budget.charge(cost)
-                    current_evidence = self._collect_round_evidence(round_result)
-                    if not current_evidence and self._stalled_without_evidence(round_result):
-                        stopped_reason = "repair_could_not_be_attempted"
-                        break
-                    rounds_run += 1
-                else:
-                    # Loop exited by exhausting `_max_downstream_rounds`
-                    # without ever `break`-ing -- a real cap being hit, not
-                    # one of the explicit stop conditions above.
-                    stopped_reason = "max_rounds_reached"
+                # Budget/max-actions/suspended before the very first check
+                # could even run -- nothing to decide from, and no round
+                # ever starts.
+                return BranchExecutionResult(
+                    branch_id=spec.label,
+                    source_checkpoint_id=checkpoint.checkpoint_id,
+                    policy_label=spec.label,
+                    rounds=[],
+                    stopped_reason="budget_exhausted",
+                    final_checkpoint=store.save_checkpoint(label=f"{spec.label}-final"),
+                    total_cost_tokens=tool_executor.budget.spent,
+                )
+
+        for round_index in range(self._max_downstream_rounds + 1):
+            if tool_executor.is_suspended or tool_executor.budget.remaining <= 0:
+                stopped_reason = "budget_exhausted"
+                break
+
+            policy = spec.policy if round_index == 0 else downstream_policy
+            decisions = policy.decide(current_evidence, store.edges, tool_executor.budget)
+            if not decisions:
+                stopped_reason = (
+                    "initial_policy_returned_nothing" if round_index == 0 else "downstream_policy_returned_nothing"
+                )
+                break
+
+            executions: List[RepairExecutionResult] = []
+            pending: Dict[str, Evidence] = {
+                item.checked_artifact.artifact_id: item
+                for item in current_evidence
+                if item.outcome == CheckOutcome.FAIL
+            }
+            round_budget_exhausted = False
+            for action in decisions:
+                if tool_executor.is_suspended or tool_executor.budget.remaining <= 0:
+                    round_budget_exhausted = True
+                    break
+                result = executor.execute(action, triggering_evidence=current_evidence)
+                executions.append(result)
+                self._apply_round_to_pending(pending, result)
+                if result.budget_exhausted:
+                    round_budget_exhausted = True
+                    break
+
+            rounds.append(
+                RepairRound(
+                    round_index=round_index,
+                    policy_label=spec.label if round_index == 0 else "downstream",
+                    executions=executions,
+                )
+            )
+
+            if round_budget_exhausted or tool_executor.is_suspended or tool_executor.budget.remaining <= 0:
+                stopped_reason = "budget_exhausted"
+                break
+
+            current_evidence = list(pending.values())
+            if not any(item.outcome == CheckOutcome.FAIL for item in current_evidence):
+                stopped_reason = "no_more_failures"
+                break
+        else:
+            stopped_reason = "max_rounds_reached"
 
         return BranchExecutionResult(
             branch_id=spec.label,
             source_checkpoint_id=checkpoint.checkpoint_id,
             policy_label=spec.label,
-            initial_action=initial_action,
-            initial_round=initial_round,
-            downstream_rounds=downstream_rounds,
+            rounds=rounds,
             stopped_reason=stopped_reason,
             final_checkpoint=store.save_checkpoint(label=f"{spec.label}-final"),
-            total_cost_tokens=budget.spent,
+            total_cost_tokens=tool_executor.budget.spent,
         )
 
     @staticmethod
-    def _stalled_without_evidence(round_result: RepairExecutionResult) -> bool:
-        """True if this round produced no reverify evidence specifically
-        *because* it could not even be attempted (every regenerated target
-        came back ``PRODUCTION_FAILED``/``NO_PRODUCER``) -- as opposed to
-        every target genuinely passing its fresh re-check, which also
-        yields no FAIL evidence but means the opposite thing. Only
-        meaningful together with an already-empty
-        ``_collect_round_evidence`` result -- see the two call sites."""
-        return any(
-            record.outcome in (RepairOutcome.PRODUCTION_FAILED, RepairOutcome.NO_PRODUCER)
-            for record in round_result.regenerated
-        )
-
-    @staticmethod
-    def _collect_round_evidence(round_result: RepairExecutionResult) -> List[Evidence]:
-        """The fresh evidence a round's own cascade already produced while
-        re-verifying regenerated artifacts -- fed into the *next* round's
-        ``decide()`` call as its input. Deliberately excludes
-        ``reverified_untouched`` (nothing failed for those, so there is
-        nothing for the next round to act on) and excludes whatever
-        evidence an un-regenerated candidate's skip-for-no-constraints path
-        might have produced (there is none -- see
-        ``RepairOperationExecutor.execute()``'s own docstring)."""
-        collected: List[Evidence] = []
-        for record in round_result.regenerated:
-            collected.extend(record.reverify_evidence)
-        return collected
+    def _apply_round_to_pending(pending: Dict[str, Evidence], result: RepairExecutionResult) -> None:
+        """Updates ``pending`` (artifact_id -> its current FAIL Evidence) in
+        place from one executed action's result -- never wholesale-replaces
+        it. This is the point 5 fix: an artifact nobody's executed action
+        touched this round simply stays in ``pending`` unchanged, so it is
+        never silently dropped just because some *other* action in the same
+        round was the one that got executed.
+        """
+        for record in result.regenerated:
+            artifact_id = record.pre_repair_ref.artifact_id
+            if record.outcome == RepairOutcome.RESOLVED:
+                pending.pop(artifact_id, None)
+            elif record.outcome in (RepairOutcome.STILL_FAILING, RepairOutcome.INCONCLUSIVE):
+                fail_evidence = next(
+                    (item for item in record.reverify_evidence if item.outcome == CheckOutcome.FAIL), None
+                )
+                if fail_evidence is not None:
+                    pending[artifact_id] = fail_evidence
+                # else: INCONCLUSIVE with no FAIL evidence at all -- leave
+                # whatever was already pending for it (if anything)
+                # unchanged; there is nothing new, honest to replace it with.
+            # PRODUCTION_FAILED / NO_PRODUCER: deliberately left untouched --
+            # the underlying problem was never actually re-examined, so
+            # whatever was already pending for it (the original trigger)
+            # remains exactly as it was.
+        for ref in result.reverified_untouched:
+            pending.pop(ref.artifact_id, None)
+        # result.left_stale entries have no Evidence to add to `pending` --
+        # they remain visible via RepairExecutionResult.left_stale itself,
+        # which every round's `executions` keeps, rather than being
+        # fabricated into a FAIL this method never actually observed.
 
 
 __all__ = ["BranchSpec", "BranchingRunner"]

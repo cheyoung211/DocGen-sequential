@@ -77,11 +77,33 @@ class ProductionResult(BaseModel):
     """``Producer.produce()``'s return shape. ``artifact`` is set if and
     only if ``status`` is ``SUCCESS`` -- enforced below, so a controller
     reading this can never mistake a failed generation for a real artifact
-    reference."""
+    reference.
+
+    ``content``/``read_input_versions`` are the real output and the real
+    inputs this production call actually used -- added in Stage 4 after a
+    review found that a caller (``repair_operations.RepairOperationExecutor``)
+    was persisting ``content=None`` and a *guessed* input set instead of
+    what was actually produced, making every repaired artifact's stored
+    content and provenance fabricated rather than real. Both are
+    best-effort: ``content`` stays ``None`` when a ``Producer`` has no
+    practical way to serialize its real output (not a lie -- an honest "not
+    reported", the same discipline ``ContentPreservationScore.
+    not_implemented_reason`` already uses elsewhere). ``read_input_versions``
+    stays ``None`` (not ``[]`` -- the two mean different things: "not
+    reported" vs. "really used zero inputs") when the ``Producer`` has no
+    way to know which ``ArtifactRef``s it actually read; a conforming
+    ``Producer`` that was told via ``context["read_input_versions"]`` what
+    it was asked to use, and has no finer-grained tracking of its own, may
+    honestly echo that list back here (it is reporting its own caller's
+    instruction, not inventing one) -- see ``adapters.py``'s producers for
+    the concrete pattern.
+    """
 
     status: ProductionStatus
     artifact: Optional[ArtifactRef] = None
     error: Optional[str] = None
+    content: Optional[str] = None
+    read_input_versions: Optional[List[ArtifactRef]] = None
 
     def model_post_init(self, __context: object) -> None:
         if self.status == ProductionStatus.SUCCESS and self.artifact is None:
@@ -911,7 +933,12 @@ class RepairOutcome(str, Enum):
     """
 
     RESOLVED = "resolved"
-    """Regenerated, and a fresh re-check right afterward found no FAIL."""
+    """Regenerated, and a fresh re-check right afterward found at least one
+    PASS and no FAIL -- not merely "no FAIL": a check round that came back
+    UNKNOWN-only (or produced no evidence at all) is ``INCONCLUSIVE``, never
+    this. A first-pass implementation conflated "no FAIL" with "resolved",
+    which silently counted an unchecked or unverifiable artifact as fixed --
+    see ``INCONCLUSIVE``."""
 
     STILL_FAILING = "still_failing"
     """Regenerated, but a fresh re-check right afterward still found a
@@ -919,6 +946,15 @@ class RepairOutcome(str, Enum):
     see its docstring for why another attempt is a later round's, driven by
     the caller re-calling a ``RepairPolicy``, not something buried inside
     one execution."""
+
+    INCONCLUSIVE = "inconclusive"
+    """Regenerated (or reaffirmed), but the fresh re-check came back with no
+    FAIL and no clean PASS either -- every constraint resolved UNKNOWN, or
+    the check produced no evidence at all despite being asked. Mirrors the
+    Notion plan's own ``recovery_outcome`` vocabulary
+    ("not_attempted/success/failure/inconclusive", stage 0's terminology
+    doc) -- an artifact in this state must stay flagged stale and must
+    never be read as resolved just because nothing explicitly failed."""
 
     PRODUCTION_FAILED = "production_failed"
     """The ``Producer.produce()`` call itself returned
@@ -952,10 +988,12 @@ class RegeneratedArtifactRecord(BaseModel):
     reverify_evidence: List[Evidence] = Field(default_factory=list)
 
     def model_post_init(self, __context: object) -> None:
-        if self.outcome == RepairOutcome.RESOLVED and self.new_ref is None:
-            raise ValueError("RegeneratedArtifactRecord with outcome=RESOLVED requires new_ref.")
-        if self.outcome == RepairOutcome.STILL_FAILING and self.new_ref is None:
-            raise ValueError("RegeneratedArtifactRecord with outcome=STILL_FAILING requires new_ref.")
+        if self.outcome in (RepairOutcome.RESOLVED, RepairOutcome.STILL_FAILING, RepairOutcome.INCONCLUSIVE):
+            if self.new_ref is None:
+                raise ValueError(
+                    f"RegeneratedArtifactRecord with outcome={self.outcome!r} requires new_ref -- "
+                    "something was actually written in all three cases, only the re-check's verdict differs."
+                )
         if self.outcome in (RepairOutcome.PRODUCTION_FAILED, RepairOutcome.NO_PRODUCER):
             if self.new_ref is not None:
                 raise ValueError(
@@ -975,13 +1013,44 @@ class RepairExecutionResult(BaseModel):
     behind the Stage 4 checklist line "필요한 항목만 재생성한다": a reader can
     see exactly which artifacts were spared, not just trust a claim that
     some were.
+
+    ``left_stale`` is the third, previously-missing bucket a review found:
+    a candidate that is currently stale but was never resolved one way or
+    the other this round -- either because no ``Constraint`` was ever
+    registered for it (nothing to check it against), or because its fresh
+    check came back ``INCONCLUSIVE`` (UNKNOWN-only / no evidence). Neither
+    case belongs in ``reverified_untouched`` (which means "checked and
+    genuinely confirmed still good") -- conflating "confirmed fine" with
+    "we simply don't know" was the bug this field exists to stop.
+
+    ``budget_exhausted`` is set when this execution stopped partway through
+    its own cascade because the underlying ``ToolExecutor`` ran out of
+    budget/actions -- whatever is left in ``left_stale``/unprocessed is
+    *not* a resolved state, it is simply where the cascade had to stop.
     """
 
     action: RepairAction
     regenerated: List[RegeneratedArtifactRecord] = Field(default_factory=list)
     reverified_untouched: List[ArtifactRef] = Field(default_factory=list)
+    left_stale: List[ArtifactRef] = Field(default_factory=list)
     overall_outcome: RepairOutcome
     cost: List[CostRecord] = Field(default_factory=list)
+    budget_exhausted: bool = False
+
+
+class RepairRound(BaseModel):
+    """Every ``RepairExecutionResult`` produced by actually carrying out
+    **every** action one ``RepairPolicy.decide()`` call returned -- never
+    just the first one. A review found the original design executed only
+    ``decisions[0]`` and silently discarded the rest, which made two
+    independent failures named by the same ``decide()`` call (e.g. A and B,
+    both FAIL, with no dependency between them) collapse into "only A was
+    ever attempted, B's failure vanished from the record."
+    """
+
+    round_index: int
+    policy_label: str
+    executions: List[RepairExecutionResult] = Field(default_factory=list)
 
 
 class BranchExecutionResult(BaseModel):
@@ -990,22 +1059,19 @@ class BranchExecutionResult(BaseModel):
     상태에서 서로 다른 repair action으로 분기"/"효과를 ... checkpoint·행동·후속
     정책 조건에 한정해서 해석한다".
 
-    ``initial_action``/``initial_round`` (``None`` if the branch's own
-    initial policy decided there was nothing to do) are kept separate from
-    ``downstream_rounds`` precisely so a reader can isolate "what this
-    branch's own distinguishing choice was" from "what every branch did
-    afterward under the same shared policy" -- conflating the two would
-    make the checkpoint-branch comparison meaningless (``docs/
-    stage1_experiment_design.md`` §5, point 3: "그렇지 않으면 1단계 선택 효과와
-    이후 정책 효과가 혼재된다").
+    ``rounds[0]`` is always this branch's own distinguishing initial round
+    (decided by this branch's own ``BranchSpec.policy``); every round after
+    that is decided by the one shared downstream policy. Keeping all rounds
+    in one ordered list (rather than a separate ``initial_round`` field)
+    is what makes "execute every action a round's decide() call returned"
+    representable at all -- a single ``Optional[RepairExecutionResult]``
+    field cannot hold more than one execution per round.
     """
 
     branch_id: str
     source_checkpoint_id: str
     policy_label: str
-    initial_action: Optional[RepairAction] = None
-    initial_round: Optional[RepairExecutionResult] = None
-    downstream_rounds: List[RepairExecutionResult] = Field(default_factory=list)
+    rounds: List[RepairRound] = Field(default_factory=list)
     stopped_reason: str
     final_checkpoint: Checkpoint
     total_cost_tokens: float = 0.0
