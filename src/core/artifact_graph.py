@@ -595,6 +595,25 @@ class ArtifactGraphStore:
             self._still_missing(ref) for ref in item.missing_inputs
         )
 
+    def is_evidence_still_valid(self, item: Evidence) -> bool:
+        """Public wrapper over ``_evidence_is_live`` -- whether every input
+        ``item`` actually depended on (``input_versions``/``missing_inputs``)
+        still holds, *without* the additional "``checked_artifact`` itself
+        is not stale" gate ``live_evidence()`` applies on top (added in
+        Stage 5: a caller tracking its own evidence across time needs to
+        tell "this verdict's own inputs moved" apart from "the artifact
+        this verdict is ABOUT is, unsurprisingly, still stale because the
+        repair that produced it never actually succeeded" -- the latter is
+        not a reason to discard a genuinely fresh verdict about that
+        artifact's current, stale content; ``live_evidence()``'s stricter
+        reading is correct for *its* purpose ("is there a trustworthy
+        verdict about this artifact's current settled state", which a
+        still-stale artifact definitionally does not have) but wrong for a
+        caller that specifically wants to know "did my last check of this
+        (possibly still-stale) target's content get invalidated by
+        something ELSE changing under it"."""
+        return self._evidence_is_live(item)
+
     def live_evidence(self, artifact_id: str) -> List[Evidence]:
         """The single currently-valid verdict per ``constraint_id`` checked
         against ``artifact_id`` -- distinct from the full history (see

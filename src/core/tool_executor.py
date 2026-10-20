@@ -146,14 +146,24 @@ class ToolExecutor:
         constraint_provider: Optional["ConstraintProvider"] = None,
         repair_context: Optional[Dict[str, Any]] = None,
         model_name: str = "unknown",
+        actions_taken: int = 0,
+        suspended: bool = False,
+        suspend_reason: Optional[str] = None,
     ) -> None:
+        """``actions_taken``/``suspended``/``suspend_reason`` let a caller
+        seed this executor's admission state to something other than
+        fresh (Stage 5: resuming a controller episode from a durable
+        checkpoint must restore the *same* action-count/suspension state
+        it had before the interruption, not silently reopen a full fresh
+        allowance -- every pre-Stage-5 call site omits these three and
+        gets exactly the old fresh-start behavior)."""
         self._store = store
         self._checker = checker
         self._budget = budget
         self._max_actions = max_actions
-        self._actions_taken = 0
-        self._suspended = False
-        self._suspend_reason: Optional[str] = None
+        self._actions_taken = actions_taken
+        self._suspended = suspended
+        self._suspend_reason = suspend_reason
 
         # Stage 5: PATCH/REPLAN become real only when both of these are
         # given. ``RepairOperationExecutor`` is imported locally (not at

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 from pydantic import BaseModel, Field
 
@@ -1215,13 +1215,24 @@ class ControllerStepRecord(BaseModel):
     dispatched call (e.g. ``"check:doc@3"``, ``"patch:block_2@1"``) -- used
     both for the human-readable trace and, by equality, as this stage's
     "동일 수정 반복" (repeated-fix) detector; see
-    ``controller._repeated_action``."""
+    ``controller._repeated_action``.
+
+    ``detail`` is the full observation this step actually produced --
+    added after a user review found that without it, an ``LLMController``
+    asked to decide the *next* action could only see "ok"/an error code
+    for what INSPECT/QUERY/CHECK/COMPILE just returned, never the real
+    payload (inspected content, queried dependencies, a compile's actual
+    diagnostic). ``call_summary`` stays a short identity key (used for
+    repeat-detection); ``detail`` is the separate, free-text field for
+    "what did this step actually observe" -- see
+    ``controller._describe_observation``."""
 
     step_index: int
     action: ToolActionKind
     call_summary: str
     ok: bool
     error_code: Optional[ToolErrorCode] = None
+    detail: str = ""
 
 
 class ControllerState(BaseModel):
@@ -1248,18 +1259,59 @@ class ControllerState(BaseModel):
     the ``tool`` node in the very next step -- deciding and executing never
     happen in the same node, mirroring this project's existing
     decide-then-separately-execute discipline (``interfaces.RepairPolicy``'s
-    docstring)."""
+    docstring).
+
+    Fields added after a user review of the first Stage 5 pass (full
+    detail in ``docs/stage5_langgraph_controller.md``):
+
+    - ``tracked_artifact_ids``: every artifact_id this episode has ever
+      dispatched a call against, or that a PATCH/REPLAN's cascade touched
+      or discovered broken -- the set a controller checks ``store.
+      is_stale()`` against to find unresolved work that has no *fresh*
+      Evidence of its own (anything a cascade ran out of budget before
+      re-examining stays ``is_stale()``-true without ever producing a
+      fresh FAIL to react to -- see ``controller.RuleBasedController.
+      decide()``).
+    - ``blocked_artifact_ids``: artifacts whose most recent repair attempt
+      could not even produce new content (``RepairOutcome.
+      PRODUCTION_FAILED``/``NO_PRODUCER``) -- added after a user review
+      found ``tracked_artifact_ids``/``is_stale()`` alone insufficient for
+      exactly this case: an artifact failing its own *content* check (not
+      a dependency that moved) is never marked stale in the first place,
+      so a production failure against it leaves no trace in
+      ``is_stale()`` at all. Cleared the moment a later attempt actually
+      produces something, regardless of whether that content then
+      passes, fails, or is unknown (those outcomes DO get a fresh
+      Evidence entry to react to).
+    - ``actions_taken``/``suspended``/``suspend_reason``: mirror
+      ``tool_executor.ToolExecutor``'s own admission state exactly, so a
+      durable resume (``controller.ControllerRuntime.resume_from_checkpoint``)
+      can reconstruct that executor with the *same* action-count/
+      suspension state it had right before the interruption, instead of
+      silently reopening a full fresh allowance.
+    - ``last_compile_failed``: whether the most recent COMPILE dispatch
+      reported ``compile_success=False`` -- lets a rule-based policy stop
+      cleanly with an honest reason instead of blindly repeating an
+      identical COMPILE call until the repeated-action guard eventually
+      intervenes.
+    """
 
     document_ref: ArtifactRef
     checkpoint: Checkpoint
     budget: Budget
     current_evidence: List[Evidence] = Field(default_factory=list)
+    tracked_artifact_ids: Set[str] = Field(default_factory=set)
+    blocked_artifact_ids: Set[str] = Field(default_factory=set)
     compiled: bool = False
+    last_compile_failed: bool = False
     step_count: int = 0
     history: List[ControllerStepRecord] = Field(default_factory=list)
     pending_tool_call: Optional["ToolCall"] = Field(default=None, discriminator="action")
     done: bool = False
     stop_reason: Optional[ControllerStopReason] = None
+    actions_taken: int = 0
+    suspended: bool = False
+    suspend_reason: Optional[str] = None
 
 
 class LLMControllerDecision(BaseModel):
