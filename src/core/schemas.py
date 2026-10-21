@@ -1700,6 +1700,37 @@ class RepairGainScore(BaseModel):
     confirmed intact) still scored ``preserved_fraction=1.0`` -- see
     ``ContentPreservationScore.inconclusive_artifacts``'s own docstring for
     that fix.
+
+    A *sixth* review then caught two more real bugs, both still
+    overestimating gain. First: the "full required-constraint set" from
+    the previous paragraph was itself still wrong -- it was derived from
+    ``evidence_history`` (every ``constraint_id`` ever checked against the
+    artifact's CURRENT version), which shrinks the moment a new version
+    simply isn't fully re-checked, even though the evaluation SPEC never
+    stopped requiring the dropped constraint. Repro: ``b@1`` had
+    format+computation both PASS; ``b@2`` only got format re-checked --
+    the required set read as ``{format}`` alone, so a branch that left
+    ``b`` in exactly that state scored ``gain=1.0`` while a sibling that
+    honestly rechecked computation too (and got UNKNOWN) scored ``0.5`` --
+    the identical asymmetry one review ago, reopened one layer deeper.
+    Fixed by requiring the required set to come from
+    ``constraint_provider`` itself (the same
+    ``Callable[[ArtifactRef], List[Constraint]]`` spec
+    ``RepairOperationExecutor``/``BranchingRunner`` are already
+    constructed with), passed into every function in this chain, never
+    inferred from what has actually been logged as evidence. Second: a
+    ``RESOLVED`` verdict was only downgraded when the final state was
+    CONFIRMED broken (stale or a live FAIL) -- but a target whose required
+    PASS was later INVALIDATED (an input it depended on, via
+    ``Evidence.input_versions``, moved, with nothing re-checking it
+    afterward) is neither stale nor FAILing, it is INCONCLUSIVE -- and
+    ``gain`` kept counting it as ``RESOLVED`` while ``damage``, reading
+    the identical final state, correctly called it inconclusive: the same
+    function contradicting itself about the same artifact. Fixed by
+    downgrading ``RESOLVED`` whenever the final state is NOT confirmed
+    healthy, not only when it is confirmed broken -- a ``RESOLVED``
+    verdict is now trusted only once every required constraint has a
+    live, valid PASS, never merely because nothing currently FAILS.
     """
 
     outcome_counts: Dict[str, int] = Field(default_factory=dict)

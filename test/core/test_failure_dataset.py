@@ -609,7 +609,11 @@ def test_repair_gain_score_resolved_case_has_full_gain_and_no_damage() -> None:
     branch = _run_single_branch(checkpoint, refs, producer=_FakeProducer(), validator=_FakeValidator())
 
     score = compute_repair_gain_score(
-        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(refs["a"])]
+        checkpoint,
+        branch,
+        target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(refs["a"])],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert score.gain == 1.0
@@ -627,7 +631,11 @@ def test_repair_gain_score_still_failing_case_has_zero_gain() -> None:
     )
 
     score = compute_repair_gain_score(
-        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(refs["a"])]
+        checkpoint,
+        branch,
+        target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(refs["a"])],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert score.gain == 0.0
@@ -641,7 +649,13 @@ def test_repair_gain_score_empty_target_set_leaves_gain_none_with_reason() -> No
     checkpoint, refs = _checkpoint_with_sections("a", "b")
     branch = _run_single_branch(checkpoint, refs, producer=_FakeProducer(), validator=_FakeValidator())
 
-    score = compute_repair_gain_score(checkpoint, branch, target_artifact_ids=set(), triggering_evidence=[])
+    score = compute_repair_gain_score(
+        checkpoint,
+        branch,
+        target_artifact_ids=set(),
+        triggering_evidence=[],
+        constraint_provider=_one_constraint_per_artifact,
+    )
 
     assert score.gain is None
     assert score.not_implemented_reason is not None
@@ -660,7 +674,11 @@ def test_repair_gain_score_unresolved_target_is_a_real_zero_not_a_fabricated_non
     )
 
     score = compute_repair_gain_score(
-        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(refs["a"])]
+        checkpoint,
+        branch,
+        target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(refs["a"])],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert score.gain == 0.0
@@ -703,10 +721,18 @@ def test_repair_gain_score_orphaned_dependent_counts_against_a_branch_that_ignor
     assert target_ids == {"a", "b"}
 
     score_a = compute_repair_gain_score(
-        checkpoint, branch_a, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_a,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_one_constraint_per_artifact,
     )
     score_b = compute_repair_gain_score(
-        checkpoint, branch_b, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_b,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert score_a.gain == 0.5
@@ -759,10 +785,18 @@ def test_damage_of_a_branch_is_not_hidden_by_a_siblings_collateral_sweep() -> No
     assert target_ids == {"a", "b"}  # "b" is swept in purely via the wide branch's own history
 
     score_narrow = compute_repair_gain_score(
-        checkpoint, branch_narrow, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_narrow,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_one_constraint_per_artifact,
     )
     score_wide = compute_repair_gain_score(
-        checkpoint, branch_wide, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_wide,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     # Narrow never touched "b" -- it stayed healthy, and damage must say so.
@@ -826,7 +860,11 @@ def test_repair_gain_score_does_not_trust_a_resolved_verdict_the_final_state_has
     assert _merge_final_outcomes(branch)["b"] == RepairOutcome.RESOLVED
 
     score = compute_repair_gain_score(
-        before_checkpoint, branch, target_artifact_ids={"b"}, triggering_evidence=[_fail_evidence(b_ref)]
+        before_checkpoint,
+        branch,
+        target_artifact_ids={"b"},
+        triggering_evidence=[_fail_evidence(b_ref)],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert score.gain == 0.0
@@ -873,10 +911,18 @@ def test_repair_gain_score_already_healthy_untouched_counts_toward_gain() -> Non
     assert target_ids == {"a", "b"}  # "b" is swept in purely via the wide branch's own history
 
     score_narrow = compute_repair_gain_score(
-        checkpoint, branch_narrow, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_narrow,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_one_constraint_per_artifact,
     )
     score_wide = compute_repair_gain_score(
-        checkpoint, branch_wide, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_wide,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert score_narrow.outcome_counts == {RepairOutcome.RESOLVED.value: 1, ALREADY_HEALTHY_UNTOUCHED: 1}
@@ -894,17 +940,24 @@ def test_repair_gain_score_already_healthy_untouched_does_not_apply_to_a_genuine
     attempted."""
     checkpoint, refs = _checkpoint_with_dependency("a", "b")
     trigger = [refs["a"]]
+    def narrow_provider(ref: ArtifactRef) -> List[Constraint]:
+        return [] if ref.artifact_id == "b" else _one_constraint_per_artifact(ref)
+
     branch = _run_branch(
         checkpoint,
         trigger,
         producer=_FakeProducer(),
         validator=_FakeValidator(),
-        constraint_provider=lambda ref: [] if ref.artifact_id == "b" else _one_constraint_per_artifact(ref),
+        constraint_provider=narrow_provider,
     )
     assert "b" not in _merge_final_outcomes(branch)
 
     score = compute_repair_gain_score(
-        checkpoint, branch, target_artifact_ids={"a", "b"}, triggering_evidence=[_fail_evidence(refs["a"])]
+        checkpoint,
+        branch,
+        target_artifact_ids={"a", "b"},
+        triggering_evidence=[_fail_evidence(refs["a"])],
+        constraint_provider=narrow_provider,
     )
 
     assert score.outcome_counts == {RepairOutcome.RESOLVED.value: 1, LEFT_STALE_OR_UNRESOLVED: 1}
@@ -958,10 +1011,18 @@ def test_repair_gain_score_unknown_untouched_does_not_count_toward_gain() -> Non
     assert target_ids == {"a", "b"}
 
     score_narrow = compute_repair_gain_score(
-        checkpoint, branch_narrow, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_narrow,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_one_constraint_per_artifact,
     )
     score_wide = compute_repair_gain_score(
-        checkpoint, branch_wide, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_wide,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     # "b" must land in the same kind of non-success bucket for both --
@@ -997,7 +1058,11 @@ def test_damage_excludes_an_unconfirmed_artifact_from_the_healthy_before_baselin
 
     branch = _run_branch(checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
     score = compute_repair_gain_score(
-        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(a_ref)]
+        checkpoint,
+        branch,
+        target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(a_ref)],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert "b" not in score.damage.newly_broken_artifacts
@@ -1016,6 +1081,7 @@ def test_build_candidate_action_record_end_to_end() -> None:
         branch=branch,
         target_artifact_ids={"a"},
         triggering_evidence=[_fail_evidence(refs["a"])],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert record.failure_id == "f1"
@@ -1043,6 +1109,7 @@ def test_build_candidate_action_record_keeps_every_initiating_action_not_just_th
         branch=branch,
         target_artifact_ids={"a", "b"},
         triggering_evidence=[_fail_evidence(refs["a"]), _fail_evidence(refs["b"])],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert len(record.actions) == 2
@@ -1064,6 +1131,7 @@ def test_build_candidate_action_record_raises_when_branch_never_executed_anythin
             branch=branch,
             target_artifact_ids={"a"},
             triggering_evidence=[_fail_evidence(refs["a"])],
+            constraint_provider=_one_constraint_per_artifact,
         )
 
 
@@ -1096,7 +1164,9 @@ def test_damage_ignores_a_harmless_content_change_with_no_real_error() -> None:
     )
     after = branch_store.save_checkpoint()
 
-    damage = _compute_damage(before, after, healthy_before_artifact_ids={"b"})
+    damage = _compute_damage(
+        before, after, healthy_before_artifact_ids={"b"}, constraint_provider=_one_constraint_per_artifact
+    )
 
     assert damage.newly_broken_artifacts == []
     assert damage.preserved_fraction == 1.0
@@ -1120,7 +1190,9 @@ def test_damage_flags_a_confirmed_new_failure_even_with_unchanged_content() -> N
     )
     after = branch_store.save_checkpoint()
 
-    damage = _compute_damage(before, after, healthy_before_artifact_ids={"b"})
+    damage = _compute_damage(
+        before, after, healthy_before_artifact_ids={"b"}, constraint_provider=_one_constraint_per_artifact
+    )
 
     assert damage.newly_broken_artifacts == ["b"]
     assert damage.preserved_fraction == 0.0
@@ -1141,7 +1213,11 @@ def test_damage_considers_every_non_target_artifact_even_ones_the_branch_touched
     )
 
     score = compute_repair_gain_score(
-        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(refs["a"])]
+        checkpoint,
+        branch,
+        target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(refs["a"])],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert "b" in score.damage.newly_broken_artifacts
@@ -1174,7 +1250,11 @@ def test_damage_excludes_an_artifact_that_was_already_broken_before_the_repair()
     branch = _run_branch(before_checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
 
     score = compute_repair_gain_score(
-        before_checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(a_ref)]
+        before_checkpoint,
+        branch,
+        target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(a_ref)],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert score.damage.newly_broken_artifacts == []
@@ -1245,10 +1325,18 @@ def test_repair_gain_score_already_healthy_untouched_requires_every_required_con
     assert target_ids == {"a", "b"}
 
     score_narrow = compute_repair_gain_score(
-        checkpoint, branch_narrow, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_narrow,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_format_and_computation_constraints_for_b,
     )
     score_wide = compute_repair_gain_score(
-        checkpoint, branch_wide, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+        checkpoint,
+        branch_wide,
+        target_artifact_ids=target_ids,
+        triggering_evidence=trigger_evidence,
+        constraint_provider=_format_and_computation_constraints_for_b,
     )
 
     # "b" must land in the same kind of non-success bucket for both --
@@ -1303,7 +1391,11 @@ def test_repair_gain_score_already_healthy_untouched_does_not_apply_when_a_requi
     branch = _run_branch(checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
 
     score = compute_repair_gain_score(
-        checkpoint, branch, target_artifact_ids={"a", "b"}, triggering_evidence=[_fail_evidence(a_ref)]
+        checkpoint,
+        branch,
+        target_artifact_ids={"a", "b"},
+        triggering_evidence=[_fail_evidence(a_ref)],
+        constraint_provider=_format_and_computation_constraints_for_b,
     )
     assert score.outcome_counts == {RepairOutcome.RESOLVED.value: 1, LEFT_STALE_OR_UNRESOLVED: 1}
     assert score.gain == 0.5
@@ -1334,7 +1426,11 @@ def test_damage_excludes_a_target_whose_other_required_constraint_already_had_a_
 
     branch = _run_branch(before_checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
     score = compute_repair_gain_score(
-        before_checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(a_ref)]
+        before_checkpoint,
+        branch,
+        target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(a_ref)],
+        constraint_provider=_format_and_computation_constraints_for_b,
     )
 
     assert "b" not in score.damage.newly_broken_artifacts
@@ -1371,9 +1467,139 @@ def test_damage_does_not_count_a_post_repair_unknown_as_preserved() -> None:
         policy=_AlsoRegenerate(b_ref),
     )
     score = compute_repair_gain_score(
-        before_checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(a_ref)]
+        before_checkpoint,
+        branch,
+        target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(a_ref)],
+        constraint_provider=_one_constraint_per_artifact,
     )
 
     assert "b" not in score.damage.newly_broken_artifacts
     assert "b" in score.damage.inconclusive_artifacts
     assert score.damage.preserved_fraction is None
+
+
+def test_required_constraint_set_comes_from_the_spec_not_from_what_was_actually_checked() -> None:
+    """Main repro from a sixth review: "b" has a format+computation spec
+    (``_format_and_computation_constraints_for_b``). ``b@1`` had BOTH
+    format and computation PASS; ``b`` is then regenerated to ``b@2`` and
+    only format gets re-checked against it -- computation is simply never
+    re-verified against the new version, not because the evaluation spec
+    ever stopped requiring it.
+
+    The previous round's own fix derived the required set from
+    ``evidence_history`` filtered to the CURRENT version -- which reads as
+    ``{format}`` alone for ``b@2``, since computation was only ever
+    checked against the now-superseded ``b@1``. That silently let a
+    branch leaving ``b`` in exactly this half-checked state score as if
+    ``b`` were fully confirmed healthy. The required set must come from
+    the spec (``constraint_provider``) instead, which still says
+    ``{format, computation}`` regardless of what actually got
+    (re-)checked -- so ``b`` must land in ``LEFT_STALE_OR_UNRESOLVED``,
+    never ``ALREADY_HEALTHY_UNTOUCHED``."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.SECTION, content="b-v1")
+    b_ref_v1 = store.latest("b").ref
+    store.record_evidence(
+        Evidence(constraint_id="format:b", outcome=CheckOutcome.PASS, checked_artifact=b_ref_v1, detail="ok")
+    )
+    store.record_evidence(
+        Evidence(constraint_id="computation:b", outcome=CheckOutcome.PASS, checked_artifact=b_ref_v1, detail="ok")
+    )
+    # "b" moves to a new version, and only format gets re-checked against
+    # it -- computation is simply never re-verified, not de-scoped.
+    store.add_version("b", ArtifactKind.SECTION, content="b-v2", read_input_versions=[])
+    b_ref_v2 = store.latest("b").ref
+    store.record_evidence(
+        Evidence(constraint_id="format:b", outcome=CheckOutcome.PASS, checked_artifact=b_ref_v2, detail="ok")
+    )
+    checkpoint = store.save_checkpoint()
+
+    branch = _run_branch(
+        checkpoint,
+        [a_ref],
+        producer=_FakeProducer(),
+        validator=_FakeValidator(),
+        constraint_provider=_format_and_computation_constraints_for_b,
+    )
+    assert "b" not in _merge_final_outcomes(branch)  # sanity: "b" was never touched by this branch
+
+    score = compute_repair_gain_score(
+        checkpoint,
+        branch,
+        target_artifact_ids={"a", "b"},
+        triggering_evidence=[_fail_evidence(a_ref)],
+        constraint_provider=_format_and_computation_constraints_for_b,
+    )
+
+    assert score.outcome_counts == {RepairOutcome.RESOLVED.value: 1, LEFT_STALE_OR_UNRESOLVED: 1}
+    assert score.gain == 0.5
+
+
+def test_resolved_verdict_is_downgraded_when_its_required_pass_is_invalidated_not_just_when_broken() -> None:
+    """Second repro from the same sixth review: "b" is resolved in round
+    1 (a fresh PASS, recorded with ``Evidence.input_versions=[x@1]`` --
+    not a structural dependency of "b" itself). "x" is later updated to
+    ``x@2``, which invalidates "b"'s PASS -- "b" is now neither stale nor
+    FAILing (``_is_broken_in_final_state`` is ``False``, since "x" is not
+    one of "b"'s structural dependencies), it is genuinely INCONCLUSIVE
+    (``_is_confirmed_healthy`` is also ``False`` -- the required PASS has
+    no live verdict at all). ``damage`` independently classifies "b" as
+    inconclusive for this exact final state; ``gain`` must not keep
+    trusting the stale ``RESOLVED`` ledger entry for the same artifact
+    just because nothing currently FAILS -- that would have ``gain`` and
+    ``damage`` contradicting each other about the identical artifact."""
+    store = ArtifactGraphStore()
+    store.add_version("x", ArtifactKind.SECTION, content="x-v1")
+    x_ref = store.latest("x").ref
+    store.add_version("b", ArtifactKind.CLAIM, content="b-orig")
+    b_ref = store.latest("b").ref
+    before_checkpoint = store.save_checkpoint(label="pre-repair")
+
+    branch_store = ArtifactGraphStore.from_checkpoint(before_checkpoint, branch_id="branch")
+    branch_store.add_version("b", ArtifactKind.CLAIM, content="b-fixed", read_input_versions=[])
+    fixed_b_ref = branch_store.latest("b").ref
+    branch_store.record_evidence(
+        Evidence(
+            constraint_id="c:b",
+            outcome=CheckOutcome.PASS,
+            checked_artifact=fixed_b_ref,
+            detail="computed against x",
+            input_versions=[x_ref],
+        )
+    )
+    round_1 = RepairRound(
+        round_index=0, policy_label="initial", executions=[_minimal_execution({"b": RepairOutcome.RESOLVED})]
+    )
+
+    # x moves on afterward -- this invalidates b's PASS (it depended on
+    # x@1), with nothing ever re-checking b afterward. b's own position
+    # in the dependency graph never moved, so it never becomes is_stale.
+    branch_store.add_version("x", ArtifactKind.SECTION, content="x-v2", read_input_versions=[])
+    assert branch_store.is_stale("b") is False  # sanity: not stale
+    assert branch_store.live_evidence("b") == []  # sanity: the PASS is gone, invalidated
+
+    final_checkpoint = branch_store.save_checkpoint(label="post-repair")
+    branch = BranchExecutionResult(
+        branch_id="A",
+        source_checkpoint_id=before_checkpoint.checkpoint_id,
+        policy_label="A",
+        rounds=[round_1],
+        stopped_reason="unresolved_remaining",
+        final_checkpoint=final_checkpoint,
+    )
+    # Sanity-check the premise: the raw merge still says RESOLVED.
+    assert _merge_final_outcomes(branch)["b"] == RepairOutcome.RESOLVED
+
+    score = compute_repair_gain_score(
+        before_checkpoint,
+        branch,
+        target_artifact_ids={"b"},
+        triggering_evidence=[_fail_evidence(b_ref)],
+        constraint_provider=_one_constraint_per_artifact,
+    )
+
+    assert score.gain == 0.0
+    assert score.outcome_counts == {LEFT_STALE_OR_UNRESOLVED: 1}

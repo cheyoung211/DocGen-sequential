@@ -632,3 +632,54 @@ damage가 `preserved_fraction=1.0`을 잘못 반환함)을 확인한 뒤에야 "
 `newly_broken_artifacts=["b"]` 오탐, `preserved_fraction=1.0` 오계산이 각각 재현됨.
 
 **아직 하지 않은 것**: §5/§6/§7/§8/§9와 동일, 이번 라운드로 바뀌지 않음.
+
+## 11. 사용자 6차 재검토 후 수정 (2026.10.22)
+
+10절의 수정을 반영한 뒤, 사용자가 다시 검토해 gain을 과대평가하는 경로 2건을 지적함 — 둘 다
+gain이 여전히 과대평가되는 근본 원인이었다.
+
+**[P1] 필수 제약 집합을 '현재 버전에서 검사한 항목'으로 추정함**: `_required_constraint_ids()`가
+명세상 필요한 제약이 아니라 `evidence_history`를 현재 버전으로 필터링한 결과(= 그동안 실제로
+검사된 항목)를 반환했다. 따라서 아직 검사하지 않은(또는 새 버전에서 재검사되지 않은) 필수
+제약은 평가 대상에서 조용히 빠진다.
+
+재현: B@1은 형식·계산 검사가 모두 PASS. B@2 생성 후 형식만 재검사됨(계산은 재검사 안 됨 —
+명세가 바뀐 게 아니라 단순히 누락). `_required_constraint_ids`가 반환한 집합은 {형식}뿐이라,
+B를 미처리한 좁은 분기는 gain=1.0, 계산까지 재검사해 UNKNOWN을 받은 넓은 분기는 0.5 —
+10절에서 고친 것과 동일한 역전이 한 단계 더 깊은 곳에서 재발.
+
+**수정**: 필수 제약 집합을 더 이상 `evidence_history`에서 추정하지 않고, 평가 명세
+`constraint_provider`(`RepairOperationExecutor`/`BranchingRunner`가 이미 생성자로 받는
+`Callable[[ArtifactRef], List[Constraint]]`)에서 직접 조회하도록 변경. `_required_constraint_ids`·
+`_is_confirmed_healthy`·`_pre_repair_healthy_artifact_ids`·`_compute_damage`·
+`compute_repair_gain_score`·`build_candidate_action_record` 전체 호출 체인에
+`constraint_provider`를 필수 매개변수로 추가(기본값 없음 — 검사 누락이나 버전 변경으로
+평가 대상 제약이 조용히 줄어드는 것을 막기 위해 항상 명세를 직접 받아야 함).
+
+**[P2] RESOLVED 이후 검사 근거가 무효화돼도 성공 점수가 유지됨**: `compute_repair_gain_score`의
+RESOLVED 재검증은 `_is_broken_in_final_state`(stale 또는 FAIL)만 확인했다. 최종적으로 필요한
+PASS가 모두 유효한지는 확인하지 않아, "stale도 아니고 FAIL도 아니지만 확정 정상도 아닌"
+inconclusive 상태의 RESOLVED가 그대로 성공으로 집계됐다.
+
+재현: B를 먼저 복구(RESOLVED). 계산 PASS는 `Evidence.input_versions`의 X@1에 의존. X가 X@2로
+갱신되자 B의 계산 evidence가 무효화됨(B 자체는 구조적 의존관계가 없어 stale은 아님). 최종
+상태: `_is_confirmed_healthy(B)=False`, 손상 평가는 B를 inconclusive로 정확히 분류하는데도,
+gain은 B를 여전히 RESOLVED로 세어 1.0 — 같은 함수의 두 절반(gain/damage)이 동일한 artifact에
+대해 서로 모순된 답을 냄.
+
+**수정**: RESOLVED 재검증 조건을 `_is_broken_in_final_state(...) OR NOT _is_confirmed_healthy(...)`로
+확장 — stale·FAIL뿐 아니라 "확정 손상은 아니지만 확정 정상도 아닌" inconclusive 상태도
+`LEFT_STALE_OR_UNRESOLVED`로 강등. RESOLVED는 이제 최종 필수 제약의 유효한 PASS가 모두
+확인될 때만 성공 분자에 포함됨.
+
+회귀 테스트 2개 추가:
+`test_required_constraint_set_comes_from_the_spec_not_from_what_was_actually_checked`(B@1→B@2
+부분 재검사 재현, 수정 전 코드로 직접 실행해 `already_healthy_untouched` 오분류 확인),
+`test_resolved_verdict_is_downgraded_when_its_required_pass_is_invalidated_not_just_when_broken`
+(X 갱신에 의한 evidence 무효화 재현, 수정 전 코드로 직접 실행해 `gain=1.0` 오계산 확인). 두
+테스트 모두 소스 코드 중 해당 로직만 일시적으로 되돌려 실제로 실패함을 확인한 뒤 복구.
+
+**검증**: `test/core/test_failure_dataset.py` 38→40개(`test/core/` 349→351개). 전체
+저장소 기준 895→897 passed / 57 failed(기존과 동일한, 무관한 실패).
+
+**아직 하지 않은 것**: §5/§6/§7/§8/§9/§10과 동일, 이번 라운드로 바뀌지 않음.

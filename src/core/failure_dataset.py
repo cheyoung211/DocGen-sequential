@@ -134,6 +134,39 @@ three buckets (confirmed broken / confirmed healthy / inconclusive) and
 excluding the new ``inconclusive_artifacts`` from both sides of
 ``preserved_fraction`` -- see ``ContentPreservationScore``'s own
 (rewritten) docstring in ``schemas.py``.
+
+**Revised a sixth time after a sixth review found 2 more real bugs, both
+still overestimating gain**: (1) ``_required_constraint_ids`` (the
+previous round's own fix) derived "required" from ``evidence_history`` --
+every ``constraint_id`` ever checked against the artifact's CURRENT
+version -- which is a WEAKER proxy than what is actually required: a
+constraint silently drops out of that set the moment a new version simply
+isn't re-checked against it, with nothing about the evaluation SPEC ever
+having changed. Repro: ``b@1`` had format+computation both PASS; ``b@2``
+was produced and only format got re-checked -- the required set for
+``b@2`` read as ``{format}`` alone, so computation silently stopped being
+"required" purely because of a missed recheck, with the result that a
+branch leaving ``b`` in exactly that state scored ``gain=1.0`` while a
+sibling that honestly rechecked computation too (and got UNKNOWN) scored
+``0.5`` -- the identical asymmetry two reviews ago, reopened one layer
+deeper. Fixed by requiring
+every caller to supply ``constraint_provider`` (the
+``Callable[[ArtifactRef], List[Constraint]]`` spec already threaded
+through ``RepairOperationExecutor``/``BranchingRunner``) and reading the
+required set directly from it, never from what happened to get logged --
+see ``_required_constraint_ids``'s own, rewritten docstring. (2) a
+``RESOLVED`` verdict was only downgraded when ``_is_broken_in_final_state``
+was true (stale or a live FAIL) -- but a target whose required PASS later
+got INVALIDATED (an input it depended on via ``Evidence.input_versions``
+moved, with nothing re-checking it) is neither stale nor FAILing, it is
+INCONCLUSIVE -- and ``gain`` kept trusting ``RESOLVED`` for it while
+``damage``, on the very same final state, correctly called it
+inconclusive: one function, two contradictory answers about the same
+artifact. Fixed by downgrading ``RESOLVED`` whenever ``_is_confirmed_healthy``
+is false, not only when ``_is_broken_in_final_state`` is true -- a
+``RESOLVED`` verdict is now trusted only when the final state is
+CONFIRMED healthy, never merely "not confirmed broken" -- see
+``compute_repair_gain_score``'s own, rewritten docstring.
 """
 
 from __future__ import annotations
@@ -141,6 +174,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Set
 
 from src.core.artifact_graph import ArtifactGraphStore, UnknownArtifactError
+from src.core.repair_operations import ConstraintProvider
 from src.core.schemas import (
     ArtifactKind,
     BranchComparisonResult,
@@ -368,42 +402,53 @@ def _is_broken_in_final_state(store: ArtifactGraphStore, artifact_id: str) -> bo
     )
 
 
-def _required_constraint_ids(store: ArtifactGraphStore, artifact_id: str) -> Set[str]:
-    """Every distinct ``constraint_id`` that has EVER been checked against
-    ``artifact_id``'s CURRENT version -- the full required-evaluation set,
-    as opposed to ``live_evidence()``'s single survivor per id, which
-    silently DROPS a constraint the moment its verdict is invalidated
-    (e.g. an ``input_versions`` ref it depended on moved) rather than
-    keeping it present-but-invalid. A constraint that was checked and is
-    now missing from ``live_evidence()`` still needs a fresh verdict --
-    it must never read the same as "this constraint was never required to
-    begin with."
+def _required_constraint_ids(
+    store: ArtifactGraphStore, artifact_id: str, constraint_provider: ConstraintProvider
+) -> Set[str]:
+    """The FULL required-constraint set for ``artifact_id``, read directly
+    from the evaluation SPEC (``constraint_provider`` -- the same
+    ``Callable[[ArtifactRef], List[Constraint]]`` ``RepairOperationExecutor``/
+    ``BranchingRunner`` are constructed with) -- NEVER inferred from
+    whatever has actually been logged as ``Evidence`` so far.
 
-    Deliberately scoped to the artifact's CURRENT version only (filtering
-    ``evidence_history``, which spans every version ever stored, down to
-    entries whose ``checked_artifact.version`` matches ``store.latest(...)``)
-    -- a constraint checked only against an older, superseded version says
-    nothing about what the CURRENT content actually needs re-confirmed.
+    A review caught that an earlier version of this function derived
+    "required" from ``evidence_history`` (every ``constraint_id`` ever
+    checked against the artifact's CURRENT version) instead of from the
+    spec. That is a strictly WEAKER proxy: a constraint that is genuinely
+    still required can simply never have been (re-)checked against the
+    CURRENT version at all -- e.g. a new version that a validator only
+    partially re-verified (format rechecked, computation not) -- and
+    ``evidence_history``-scoped-to-current-version silently drops it from
+    "required" the moment that happens, which is exactly backwards: a
+    missed check must make a target LESS confirmed, never shrink what it
+    was supposed to be confirmed against. ``CheckOutcome``/``Validator``'s
+    own docstring already establishes this general principle one layer
+    down (``CheckCall.constraints`` is never guaranteed to equal the full
+    set a ``ConstraintProvider`` would return -- see ``controller.py``'s
+    own ``needs_recheck_keys`` fix for the identical lesson); this module
+    had simply not yet applied it to its own "is this artifact healthy"
+    predicate.
 
-    Returns the empty set for an artifact that has never been checked
-    against anything at all -- see ``_is_confirmed_healthy`` for why that
-    must never be read as "nothing required, therefore vacuously healthy."
+    Looks the required set up by the artifact's CURRENT ``ArtifactRef``
+    (``store.latest(artifact_id).ref``) -- a real ``ConstraintProvider`` is
+    expected to answer by artifact_id/kind, not by the exact version
+    number, the same way ``_one_constraint_per_artifact`` does in this
+    module's own tests. Returns the empty set only when ``artifact_id`` has
+    never been stored at all.
     """
     current = store.latest(artifact_id)
     if current is None:
         return set()
-    return {
-        item.constraint_id
-        for item in store.evidence_history(artifact_id)
-        if item.checked_artifact.version == current.ref.version
-    }
+    return {c.constraint_id for c in constraint_provider(current.ref)}
 
 
-def _is_confirmed_healthy(store: ArtifactGraphStore, artifact_id: str) -> bool:
-    """An artifact counts as CONFIRMED healthy iff EVERY constraint it has
-    ever been checked against (``_required_constraint_ids``) currently has
-    a live PASS ``Evidence`` -- deliberately NOT the negation of
-    ``_is_broken_in_final_state``, and deliberately NOT ``any(... PASS
+def _is_confirmed_healthy(
+    store: ArtifactGraphStore, artifact_id: str, constraint_provider: ConstraintProvider
+) -> bool:
+    """An artifact counts as CONFIRMED healthy iff EVERY constraint the
+    evaluation SPEC actually requires for it (``_required_constraint_ids``)
+    currently has a live PASS ``Evidence`` -- deliberately NOT the negation
+    of ``_is_broken_in_final_state``, and deliberately NOT ``any(... PASS
     ...)`` either.
 
     A review caught that treating "not stale and no live FAIL" as
@@ -428,22 +473,34 @@ def _is_confirmed_healthy(store: ArtifactGraphStore, artifact_id: str) -> bool:
     swapping ``any`` for ``all`` would have been a new, worse bug of the
     same family: ``all(...)`` over the EMPTY sequence ``live_evidence()``
     returns for a never-checked artifact is vacuously ``True`` in Python,
-    which would make total silence read as confirmed healthy. Fixed by
-    comparing against the full required set explicitly: every id in
-    ``_required_constraint_ids`` must have a live PASS, AND that required
-    set must be non-empty -- an artifact nothing has ever checked is
-    exactly as unconfirmed as one with only live UNKNOWN entries, not a
-    vacuous pass.
+    which would make total silence read as confirmed healthy. Fixed (at
+    the time) by comparing against a required set computed from
+    ``evidence_history`` instead of a bare ``any``.
+
+    A *third* review then caught that the required set itself, computed
+    from ``evidence_history`` filtered to the artifact's CURRENT version,
+    was still a WEAKER proxy than what was actually required: a
+    constraint can lose its place in that set simply by not being
+    (re-)checked against a new version, even though nothing about the
+    SPEC ever stopped requiring it. Repro: ``b@1`` had format+computation
+    both PASS; ``b@2`` was produced and only format got re-checked against
+    it. The evidence-history-based required set for ``b@2`` was
+    ``{format}`` alone -- computation silently stopped being "required"
+    purely because of a missed recheck, not because the spec changed.
+    Fixed by reading the required set directly from ``constraint_provider``
+    (see ``_required_constraint_ids``'s own, rewritten docstring) -- the
+    one source that cannot shrink just because an artifact went
+    unchecked or moved version.
 
     Used wherever this module needs to assert an artifact IS fine
     (``ALREADY_HEALTHY_UNTOUCHED``, ``_pre_repair_healthy_artifact_ids``,
-    and now ``_compute_damage``'s own after-repair classification) -- as
-    opposed to ``_is_broken_in_final_state``, used wherever it needs to
-    assert an artifact IS broken (damage's "newly broken" check, the
-    RESOLVED-verdict cross-check); an UNKNOWN/never-checked/partially-
-    invalidated artifact correctly satisfies neither.
+    ``_compute_damage``'s own after-repair classification, and the
+    ``RESOLVED``-verdict cross-check in ``compute_repair_gain_score``) --
+    as opposed to ``_is_broken_in_final_state``, used wherever it needs to
+    assert an artifact IS broken; an UNKNOWN/never-checked/partially-
+    invalidated/partially-rechecked artifact correctly satisfies neither.
     """
-    required_ids = _required_constraint_ids(store, artifact_id)
+    required_ids = _required_constraint_ids(store, artifact_id, constraint_provider)
     if not required_ids:
         return False
     live_pass_ids = {
@@ -467,14 +524,17 @@ def _originally_failing_artifact_ids(triggering_evidence: List[Evidence]) -> Set
     return {item.checked_artifact.artifact_id for item in triggering_evidence if item.outcome == CheckOutcome.FAIL}
 
 
-def _pre_repair_healthy_artifact_ids(before: Checkpoint, triggering_evidence: List[Evidence]) -> Set[str]:
+def _pre_repair_healthy_artifact_ids(
+    before: Checkpoint, triggering_evidence: List[Evidence], constraint_provider: ConstraintProvider
+) -> Set[str]:
     """Every artifact_id in ``before`` that is NEITHER part of the original
     trigger (``_originally_failing_artifact_ids``) NOR anything less than
     CONFIRMED healthy in ``before``'s own ground truth
     (``_is_confirmed_healthy``, read from a store reconstructed from
-    ``before`` itself: every required constraint has a live PASS) -- the
-    only artifacts for which a repair starting from this checkpoint can
-    meaningfully be said to have caused *new* damage.
+    ``before`` itself: every constraint ``constraint_provider`` actually
+    requires has a live PASS) -- the only artifacts for which a repair
+    starting from this checkpoint can meaningfully be said to have caused
+    *new* damage.
 
     A review caught that the previous version of this logic (inlined in
     ``compute_repair_gain_score`` as ``set(before.artifacts) -
@@ -498,17 +558,31 @@ def _pre_repair_healthy_artifact_ids(before: Checkpoint, triggering_evidence: Li
     healthy-before -> broken-after TRANSITION is damage; a pre-existing
     problem, or a status this stage never verified either way, is neither
     this repair's achievement nor its fault.
+
+    A *third* review then caught that ``_is_confirmed_healthy`` was, at
+    the time, still deriving "required" from ``evidence_history`` rather
+    than from the evaluation spec -- fixed inside that function itself
+    (see its own, rewritten docstring); this function's own logic did not
+    need to change, since it already delegates entirely to that one
+    predicate, now passed ``constraint_provider`` so it can ask the spec
+    directly.
     """
     before_store = ArtifactGraphStore.from_checkpoint(before, branch_id="damage-baseline")
     originally_failing_ids = _originally_failing_artifact_ids(triggering_evidence)
     return {
         artifact_id
         for artifact_id in before.artifacts
-        if artifact_id not in originally_failing_ids and _is_confirmed_healthy(before_store, artifact_id)
+        if artifact_id not in originally_failing_ids
+        and _is_confirmed_healthy(before_store, artifact_id, constraint_provider)
     }
 
 
-def _compute_damage(before: Checkpoint, after: Checkpoint, healthy_before_artifact_ids: Set[str]) -> ContentPreservationScore:
+def _compute_damage(
+    before: Checkpoint,
+    after: Checkpoint,
+    healthy_before_artifact_ids: Set[str],
+    constraint_provider: ConstraintProvider,
+) -> ContentPreservationScore:
     """Compare ``before``/``after`` state for every artifact_id in
     ``healthy_before_artifact_ids`` -- i.e. every artifact that was never
     part of what this repair was trying to fix (revision directions 1/4's
@@ -570,6 +644,13 @@ def _compute_damage(before: Checkpoint, after: Checkpoint, healthy_before_artifa
     ``inconclusive_artifacts``), with ``not_implemented_reason`` set,
     exactly like the pre-existing "no healthy-before candidate at all"
     case.
+
+    A *fifth* review then caught that ``_is_confirmed_healthy`` was, at
+    the time, still deriving "required" from ``evidence_history`` rather
+    than from the evaluation spec -- fixed inside that function itself
+    (see its own, rewritten docstring); this function now takes
+    ``constraint_provider`` so it can pass it straight through, with no
+    other change to its own classification logic.
     """
     after_store = ArtifactGraphStore.from_checkpoint(after, branch_id="damage-check")
     newly_broken: List[str] = []
@@ -582,7 +663,7 @@ def _compute_damage(before: Checkpoint, after: Checkpoint, healthy_before_artifa
         checked += 1
         if _is_broken_in_final_state(after_store, artifact_id):
             newly_broken.append(artifact_id)
-        elif _is_confirmed_healthy(after_store, artifact_id):
+        elif _is_confirmed_healthy(after_store, artifact_id, constraint_provider):
             preserved_count += 1
         else:
             inconclusive.append(artifact_id)
@@ -652,6 +733,7 @@ def compute_repair_gain_score(
     *,
     target_artifact_ids: Set[str],
     triggering_evidence: List[Evidence],
+    constraint_provider: ConstraintProvider,
 ) -> RepairGainScore:
     """Revision direction 4's "repair gain, 손상, 총비용" for one branch.
 
@@ -749,6 +831,37 @@ def compute_repair_gain_score(
     function's own, rewritten docstring) -- nothing in this function
     changed, since it already delegates "is this target confirmed
     healthy" entirely to that one predicate.
+
+    A *fourth* review then caught two more real bugs, both still inside
+    ``_is_confirmed_healthy``'s own "required set" and in how this
+    function trusts a ``RESOLVED`` verdict. First: the required set was,
+    at the time, derived from ``evidence_history`` (every constraint ever
+    checked against the CURRENT version) -- a WEAKER proxy than what was
+    actually required, since a constraint silently drops out the moment a
+    new version simply isn't re-checked against it, even though nothing
+    about the SPEC ever stopped requiring it (repro: ``b@1`` had
+    format+computation both PASS, ``b@2`` only got format re-checked --
+    computation was still required, but "required" shrank to ``{format}``
+    anyway). Fixed by requiring every caller to supply ``constraint_provider``
+    (the same ``Callable[[ArtifactRef], List[Constraint]]`` the real
+    pipeline is already constructed with) and reading the required set
+    directly from it -- see ``_required_constraint_ids``'s own, rewritten
+    docstring. Second: the ``RESOLVED`` cross-check (two reviews up) only
+    downgraded a contradicted verdict when ``_is_broken_in_final_state``
+    was true (stale or a live FAIL) -- but a ``RESOLVED`` target whose
+    required PASS later got INVALIDATED (e.g. an input the PASS depended
+    on, via ``Evidence.input_versions``, moved) is neither stale nor
+    FAILing -- it is INCONCLUSIVE, the identical third state this module
+    has had to name twice already. Repro: ``b`` resolved, its computation
+    PASS depended on ``x@1``; ``x`` was later updated to ``x@2``,
+    invalidating that PASS with nothing ever re-checking it -- ``damage``
+    correctly read ``b`` as inconclusive, but ``gain`` still counted it as
+    ``RESOLVED``, a direct contradiction between this function's own two
+    halves. Fixed by downgrading ``RESOLVED`` to ``LEFT_STALE_OR_UNRESOLVED``
+    whenever EITHER ``_is_broken_in_final_state`` is true OR
+    ``_is_confirmed_healthy`` is false -- a ``RESOLVED`` verdict is only
+    ever trusted when the final state is CONFIRMED healthy, never merely
+    "not confirmed broken."
     """
     final_outcomes = _merge_final_outcomes(branch)
     final_store = ArtifactGraphStore.from_checkpoint(branch.final_checkpoint, branch_id="gain-check")
@@ -760,14 +873,17 @@ def compute_repair_gain_score(
         if (
             outcome == RepairOutcome.RESOLVED
             and confirmed_in_final_checkpoint
-            and _is_broken_in_final_state(final_store, target_id)
+            and (
+                _is_broken_in_final_state(final_store, target_id)
+                or not _is_confirmed_healthy(final_store, target_id, constraint_provider)
+            )
         ):
             bucket = LEFT_STALE_OR_UNRESOLVED
         elif (
             outcome is None
             and target_id not in originally_failing_ids
             and confirmed_in_final_checkpoint
-            and _is_confirmed_healthy(final_store, target_id)
+            and _is_confirmed_healthy(final_store, target_id, constraint_provider)
             and not _is_broken_in_final_state(final_store, target_id)
         ):
             bucket = ALREADY_HEALTHY_UNTOUCHED
@@ -785,8 +901,12 @@ def compute_repair_gain_score(
         gain = None
         not_implemented_reason = "target_artifact_ids is empty -- nothing was being evaluated for repair"
 
-    healthy_before_artifact_ids = _pre_repair_healthy_artifact_ids(before_checkpoint, triggering_evidence)
-    damage = _compute_damage(before_checkpoint, branch.final_checkpoint, healthy_before_artifact_ids)
+    healthy_before_artifact_ids = _pre_repair_healthy_artifact_ids(
+        before_checkpoint, triggering_evidence, constraint_provider
+    )
+    damage = _compute_damage(
+        before_checkpoint, branch.final_checkpoint, healthy_before_artifact_ids, constraint_provider
+    )
     return RepairGainScore(
         outcome_counts=outcome_counts,
         gain=gain,
@@ -804,6 +924,7 @@ def build_candidate_action_record(
     branch: BranchExecutionResult,
     target_artifact_ids: Set[str],
     triggering_evidence: List[Evidence],
+    constraint_provider: ConstraintProvider,
 ) -> CandidateActionRecord:
     """One ``(checkpoint, candidate action(s), downstream result)`` triple
     -- revision direction 4's benchmark-storage unit. ``branch.rounds[0]``
@@ -819,9 +940,11 @@ def build_candidate_action_record(
     caught that recording just ``executions[0].action`` while ``outcome``
     reflected the combined effect of every action the round ran
     misattributed a multi-action round's full result to a single, partial
-    cause. ``triggering_evidence`` is forwarded as-is to
-    ``compute_repair_gain_score`` -- see that function's docstring for why
-    it must be the same list used to build ``target_artifact_ids``.
+    cause. ``triggering_evidence``/``constraint_provider`` are forwarded
+    as-is to ``compute_repair_gain_score`` -- see that function's
+    docstring for why ``triggering_evidence`` must be the same list used
+    to build ``target_artifact_ids``, and why ``constraint_provider`` must
+    be the same spec the branch's own execution was actually run against.
     """
     if not branch.rounds or not branch.rounds[0].executions:
         raise ValueError(
@@ -840,6 +963,7 @@ def build_candidate_action_record(
             branch,
             target_artifact_ids=target_artifact_ids,
             triggering_evidence=triggering_evidence,
+            constraint_provider=constraint_provider,
         ),
         rounds_executed=len(branch.rounds),
     )
