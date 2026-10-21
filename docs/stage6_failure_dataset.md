@@ -561,3 +561,74 @@ B=UNKNOWN을 실제 BranchingRunner로 재현 — 좁은 복구 gain=0.5, 넓은
 damage가 `preserved_fraction=1.0`을 잘못 반환함)을 확인한 뒤에야 "수정됨"으로 기록했다.
 
 **아직 하지 않은 것**: §5/§6/§7/§8과 동일, 이번 라운드로 바뀌지 않음.
+
+## 10. 사용자 5차 재검토 후 수정 (2026.10.22)
+
+9절의 수정을 반영한 뒤, 사용자가 다시 검토해 추가 버그 2개([P1]/[P2])를 지적함 — 둘 다
+`_is_confirmed_healthy` 자체의 한계에서 나온 문제다.
+
+**[P1] 여러 제약 중 하나만 PASS여도 artifact 전체를 정상으로 판정함**: `_is_confirmed_healthy`가
+`any(outcome == PASS for ... in live_evidence(...))`를 사용했는데, 이는 artifact가 여러
+제약(예: 형식·계산)으로 검사될 때 그중 "단 하나"만 PASS면 나머지가 어떤 상태든 전체를
+정상으로 판정했다. B에 형식(PASS)·계산(그 외) 두 제약을 둔 3가지 재현:
+
+- 계산=UNKNOWN: 좁은 복구(B 미처리) gain=1.0, 넓은 복구(B 재검사, 역시 UNKNOWN) gain=0.5 —
+  9절에서 고친 것과 동일한 역전이 한 artifact에 여러 제약이 있을 때 다시 나타남.
+- 계산 evidence 무효화(계산이 의존한 입력이 변경돼 `live_evidence()`에서 아예 빠짐, 재검사도
+  없음): 필수 계산 검사의 유효한 결과가 전혀 없는데도 B 미처리 분기가 gain=1.0.
+  `live_evidence()`가 무효화된 항목을 "빠뜨리는" 것과 "원래 그 제약이 필요 없었던 것"은 다른
+  뜻인데, `any(PASS)`는 이를 구별하지 못했다.
+- 계산=FAIL이 복구 시작 전부터 존재: B를 전혀 건드리지 않았는데 `newly_broken_artifacts=["b"]` —
+  `_pre_repair_healthy_artifact_ids`가 `any(PASS)`만 보고 B를 "복구 전 정상"으로 잘못 포함시킨
+  뒤, 원래부터 있던 FAIL을 "새로 발생한 손상"으로 집계한 것.
+
+단순히 `any`를 `all`로 바꾸는 것만으로는 부족함 — `live_evidence()`가 빈 리스트를 반환하는
+경우(전혀 검사되지 않은 artifact) `all([])`는 Python에서 공허하게 `True`가 되어, "아무 검사도
+없음"이 "확정 정상"으로 읽히는 더 심각한 버그가 된다.
+
+**[P2] 복구 후 UNKNOWN인 내용을 보존 성공으로 집계함**: `_compute_damage`가 "확정 손상이 아닌
+모든 것"을 보존된 것으로 계산했다. 복구 전 B=PASS였다가 재생성 후 B=UNKNOWN(판정 불가)이 된
+경우에도 `preserved_fraction=1.0`이 나왔다 — 9절에서 `_is_confirmed_healthy`를 만든 것과 같은
+"확정 손상의 부정 = 확정 정상"이라는 오류가 손상 평가 쪽에도 그대로 남아 있었던 것.
+
+**수정** (`failure_dataset.py`):
+
+1. 새 함수 `_required_constraint_ids(store, artifact_id)` 추가 — `evidence_history`를
+   artifact의 **현재 버전**으로 필터링해, 그 버전에 대해 지금까지 검사된 모든 `constraint_id`
+   집합을 반환한다(무효화 여부와 무관 — `live_evidence()`가 빠뜨린 것도 "원래 필요했던 제약"
+   목록에는 남는다).
+2. `_is_confirmed_healthy`를 재작성 — 필수 제약 집합이 비어 있지 않고, 그 집합의 모든
+   `constraint_id`가 `live_evidence()`에서 유효한 PASS를 갖고 있을 때만 `True`. 필수 집합이
+   비어 있으면(전혀 검사된 적 없음) 항상 `False` — `all([])`의 공허한 `True` 함정을 명시적으로
+   막았다.
+3. `_compute_damage`를 3-way 분류로 재작성 — 각 후보를 확정 손상(`_is_broken_in_final_state`)·
+   확정 보존(`_is_confirmed_healthy`)·판정 불가(둘 다 아님) 중 하나로 분류한다. 판정 불가는 새
+   필드 `ContentPreservationScore.inconclusive_artifacts`에 담기고, `preserved_fraction`의
+   분자·분모 모두에서 제외된다(평가 가능한 후보 = 확정 보존 + 확정 손상 중에서만 보존율을
+   계산). 평가 가능한 후보가 하나도 없으면 `preserved_fraction=None` + `not_implemented_reason`.
+
+`_is_confirmed_healthy`가 `_pre_repair_healthy_artifact_ids`·`compute_repair_gain_score`의
+`ALREADY_HEALTHY_UNTOUCHED` 분기·`_compute_damage`(새로 추가된 사용처) 세 곳 모두에서
+공유되므로, 이 한 번의 수정으로 [P1]의 세 재현과 [P2]가 모두 해결됨.
+
+**테스트 fixture 수정**: `_FakeValidator`에 `outcome_overrides`(artifact_id →
+{constraint_id: outcome}) 추가 — 기존에는 artifact 하나에 제약 하나의 outcome만 지정할 수
+있어 "형식 PASS + 계산 UNKNOWN" 같은 한 artifact-여러 제약 시나리오를 만들 수 없었다. 이
+수정 과정에서 기존 `unknown_ids` 분기가 `Evidence(outcome=UNKNOWN, ...)`을
+`unknown_reason` 없이 생성해 `pydantic.ValidationError`가 나는 잠재 버그를 발견함 — 이
+예외는 `ToolExecutor`가 `Validator.check()`의 예외를 삼키고 빈 evidence로 대체하는 경로를
+타면서 공교롭게도 `INCONCLUSIVE`로 귀결돼, 기존 테스트가 "틀린 이유로" 통과하고 있었다.
+`unknown_reason`을 항상 채우도록 함께 고쳤다.
+
+회귀 테스트 4개 추가:
+`test_repair_gain_score_already_healthy_untouched_requires_every_required_constraint_not_just_one`,
+`test_repair_gain_score_already_healthy_untouched_does_not_apply_when_a_required_constraints_evidence_is_invalidated`,
+`test_damage_excludes_a_target_whose_other_required_constraint_already_had_a_pre_existing_fail`,
+`test_damage_does_not_count_a_post_repair_unknown_as_preserved`.
+
+**검증**: `test/core/test_failure_dataset.py` 34→38개(`test/core/` 345→349개). 전체
+저장소 기준 895 passed / 57 failed(기존과 동일한, 무관한 실패). 4개 회귀 테스트 모두 수정 전
+코드(stash)에 대해 직접 실행해 실제로 실패함을 확인 — `already_healthy_untouched` 오분류,
+`newly_broken_artifacts=["b"]` 오탐, `preserved_fraction=1.0` 오계산이 각각 재현됨.
+
+**아직 하지 않은 것**: §5/§6/§7/§8/§9와 동일, 이번 라운드로 바뀌지 않음.

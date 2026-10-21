@@ -107,6 +107,33 @@ everywhere this module asserts an artifact IS healthy; the two predicates
 are allowed to both be ``False`` for the same artifact (unverified is
 neither), and nothing in this module may treat that as a tie-break in
 either direction.
+
+**Revised a fifth time after a fifth review found 2 more real bugs, both
+inside the previous round's own ``_is_confirmed_healthy``**: (1) it used
+``any(outcome == PASS for ... in live_evidence(...))``, so an artifact
+checked against SEVERAL constraints read as healthy the moment just ONE
+of them had a live PASS -- even while another REQUIRED constraint on the
+same artifact sat on live UNKNOWN, had its own evidence invalidated and
+dropped out of ``live_evidence()`` with nothing ever re-checking it, or
+was a live FAIL that predated the repair entirely. Three real repros, one
+artifact with format/computation constraints: format PASS + computation
+UNKNOWN, format PASS + computation invalidated, and format PASS +
+computation FAIL-from-before-the-repair all still read as confirmed
+healthy. Simply swapping ``any`` for ``all`` would have been its own new
+bug -- ``all(...)`` over the EMPTY sequence ``live_evidence()`` returns
+for a never-checked artifact is vacuously ``True`` in Python. Fixed by
+adding ``_required_constraint_ids`` (every ``constraint_id`` ever checked
+against the artifact's CURRENT version) and requiring the full required
+set, non-empty, to be a subset of the live-PASS ids -- never just one
+member of it. (2) ``_compute_damage`` counted every candidate NOT
+confirmed broken as preserved by default -- the identical any-vs-negation
+mistake one level up -- so a target that went from a confirmed PASS
+before the repair to live UNKNOWN after it still scored
+``preserved_fraction=1.0``. Fixed by classifying each candidate into
+three buckets (confirmed broken / confirmed healthy / inconclusive) and
+excluding the new ``inconclusive_artifacts`` from both sides of
+``preserved_fraction`` -- see ``ContentPreservationScore``'s own
+(rewritten) docstring in ``schemas.py``.
 """
 
 from __future__ import annotations
@@ -341,26 +368,88 @@ def _is_broken_in_final_state(store: ArtifactGraphStore, artifact_id: str) -> bo
     )
 
 
-def _is_confirmed_healthy(store: ArtifactGraphStore, artifact_id: str) -> bool:
-    """An artifact counts as CONFIRMED healthy iff it has at least one live
-    PASS ``Evidence`` -- deliberately NOT the negation of
-    ``_is_broken_in_final_state``. A review caught that treating "not
-    stale and no live FAIL" as "healthy" silently promotes a THIRD,
-    genuinely different state -- no evidence at all, or only live
-    ``CheckOutcome.UNKNOWN`` entries (a constraint that could not be
-    evaluated) -- into a confirmed-fine verdict it never earned. Those two
-    predicates are allowed to both be ``False`` for the same artifact at
-    the same time: unverified is not broken, but it is not healthy
-    either, and must never be silently counted as either one just because
-    it fails to match the other's definition. Used wherever this module
-    needs to assert an artifact IS fine (``ALREADY_HEALTHY_UNTOUCHED``,
-    ``_pre_repair_healthy_artifact_ids``) -- as opposed to
-    ``_is_broken_in_final_state``, used wherever it needs to assert an
-    artifact IS broken (damage's "newly broken" check, the RESOLVED-
-    verdict cross-check); an UNKNOWN/never-checked artifact correctly
-    satisfies neither.
+def _required_constraint_ids(store: ArtifactGraphStore, artifact_id: str) -> Set[str]:
+    """Every distinct ``constraint_id`` that has EVER been checked against
+    ``artifact_id``'s CURRENT version -- the full required-evaluation set,
+    as opposed to ``live_evidence()``'s single survivor per id, which
+    silently DROPS a constraint the moment its verdict is invalidated
+    (e.g. an ``input_versions`` ref it depended on moved) rather than
+    keeping it present-but-invalid. A constraint that was checked and is
+    now missing from ``live_evidence()`` still needs a fresh verdict --
+    it must never read the same as "this constraint was never required to
+    begin with."
+
+    Deliberately scoped to the artifact's CURRENT version only (filtering
+    ``evidence_history``, which spans every version ever stored, down to
+    entries whose ``checked_artifact.version`` matches ``store.latest(...)``)
+    -- a constraint checked only against an older, superseded version says
+    nothing about what the CURRENT content actually needs re-confirmed.
+
+    Returns the empty set for an artifact that has never been checked
+    against anything at all -- see ``_is_confirmed_healthy`` for why that
+    must never be read as "nothing required, therefore vacuously healthy."
     """
-    return any(item.outcome == CheckOutcome.PASS for item in store.live_evidence(artifact_id))
+    current = store.latest(artifact_id)
+    if current is None:
+        return set()
+    return {
+        item.constraint_id
+        for item in store.evidence_history(artifact_id)
+        if item.checked_artifact.version == current.ref.version
+    }
+
+
+def _is_confirmed_healthy(store: ArtifactGraphStore, artifact_id: str) -> bool:
+    """An artifact counts as CONFIRMED healthy iff EVERY constraint it has
+    ever been checked against (``_required_constraint_ids``) currently has
+    a live PASS ``Evidence`` -- deliberately NOT the negation of
+    ``_is_broken_in_final_state``, and deliberately NOT ``any(... PASS
+    ...)`` either.
+
+    A review caught that treating "not stale and no live FAIL" as
+    "healthy" silently promotes a THIRD, genuinely different state -- no
+    evidence at all, or only live ``CheckOutcome.UNKNOWN`` entries (a
+    constraint that could not be evaluated) -- into a confirmed-fine
+    verdict it never earned. Those two predicates are allowed to both be
+    ``False`` for the same artifact at the same time: unverified is not
+    broken, but it is not healthy either, and must never be silently
+    counted as either one just because it fails to match the other's
+    definition.
+
+    A *second* review then caught that the fix above, ``any(outcome ==
+    PASS for ... in live_evidence(...))``, has exactly the same shape of
+    bug one level down: an artifact checked against SEVERAL constraints
+    (e.g. a format check and a separate computation check) read as
+    healthy the moment just ONE of them had a live PASS, even while
+    another REQUIRED constraint on the very same artifact sat on live
+    UNKNOWN, had its own evidence invalidated and dropped out of
+    ``live_evidence()`` entirely with nothing ever re-checking it, or was
+    a live FAIL that existed before the repair even started. Simply
+    swapping ``any`` for ``all`` would have been a new, worse bug of the
+    same family: ``all(...)`` over the EMPTY sequence ``live_evidence()``
+    returns for a never-checked artifact is vacuously ``True`` in Python,
+    which would make total silence read as confirmed healthy. Fixed by
+    comparing against the full required set explicitly: every id in
+    ``_required_constraint_ids`` must have a live PASS, AND that required
+    set must be non-empty -- an artifact nothing has ever checked is
+    exactly as unconfirmed as one with only live UNKNOWN entries, not a
+    vacuous pass.
+
+    Used wherever this module needs to assert an artifact IS fine
+    (``ALREADY_HEALTHY_UNTOUCHED``, ``_pre_repair_healthy_artifact_ids``,
+    and now ``_compute_damage``'s own after-repair classification) -- as
+    opposed to ``_is_broken_in_final_state``, used wherever it needs to
+    assert an artifact IS broken (damage's "newly broken" check, the
+    RESOLVED-verdict cross-check); an UNKNOWN/never-checked/partially-
+    invalidated artifact correctly satisfies neither.
+    """
+    required_ids = _required_constraint_ids(store, artifact_id)
+    if not required_ids:
+        return False
+    live_pass_ids = {
+        item.constraint_id for item in store.live_evidence(artifact_id) if item.outcome == CheckOutcome.PASS
+    }
+    return required_ids <= live_pass_ids
 
 
 def _originally_failing_artifact_ids(triggering_evidence: List[Evidence]) -> Set[str]:
@@ -383,9 +472,9 @@ def _pre_repair_healthy_artifact_ids(before: Checkpoint, triggering_evidence: Li
     trigger (``_originally_failing_artifact_ids``) NOR anything less than
     CONFIRMED healthy in ``before``'s own ground truth
     (``_is_confirmed_healthy``, read from a store reconstructed from
-    ``before`` itself: at least one live PASS) -- the only artifacts for
-    which a repair starting from this checkpoint can meaningfully be said
-    to have caused *new* damage.
+    ``before`` itself: every required constraint has a live PASS) -- the
+    only artifacts for which a repair starting from this checkpoint can
+    meaningfully be said to have caused *new* damage.
 
     A review caught that the previous version of this logic (inlined in
     ``compute_repair_gain_score`` as ``set(before.artifacts) -
@@ -458,24 +547,64 @@ def _compute_damage(before: Checkpoint, after: Checkpoint, healthy_before_artifa
     never the raw ``set(before.artifacts) -
     _originally_failing_artifact_ids(...)`` this replaces -- see that
     function's own docstring.
+
+    A *fourth* review then caught that every candidate NOT reported in
+    ``newly_broken_artifacts`` was being counted as preserved BY DEFAULT
+    -- i.e. "preserved" was defined as the mere negation of
+    ``_is_broken_in_final_state``, the identical any-vs-negation mistake
+    ``_is_confirmed_healthy``'s own docstring already documents two
+    reviews of. A target that went from a confirmed live PASS in
+    ``before`` to live ``UNKNOWN`` (or no evidence at all) in ``after`` --
+    genuinely unverified, not confirmed intact -- still scored
+    ``preserved_fraction=1.0`` for every such id. Fixed by classifying
+    each candidate into exactly one of THREE buckets using
+    ``after_store``'s own ground truth: confirmed broken
+    (``_is_broken_in_final_state``) into ``newly_broken_artifacts``,
+    confirmed healthy (``_is_confirmed_healthy`` -- itself now requiring
+    every required constraint to have a live PASS, not just one) counted
+    as preserved, and everything else -- neither confirmed broken nor
+    confirmed healthy -- into the new ``inconclusive_artifacts``, excluded
+    from both the numerator and the denominator ``preserved_fraction`` is
+    computed from. ``preserved_fraction`` is ``None`` whenever nothing was
+    assessable either way (every candidate landed in
+    ``inconclusive_artifacts``), with ``not_implemented_reason`` set,
+    exactly like the pre-existing "no healthy-before candidate at all"
+    case.
     """
     after_store = ArtifactGraphStore.from_checkpoint(after, branch_id="damage-check")
     newly_broken: List[str] = []
+    inconclusive: List[str] = []
     checked = 0
+    preserved_count = 0
     for artifact_id in healthy_before_artifact_ids:
         if artifact_id not in before.artifacts or artifact_id not in after.artifacts:
             continue
         checked += 1
         if _is_broken_in_final_state(after_store, artifact_id):
             newly_broken.append(artifact_id)
+        elif _is_confirmed_healthy(after_store, artifact_id):
+            preserved_count += 1
+        else:
+            inconclusive.append(artifact_id)
 
-    preserved_fraction = (checked - len(newly_broken)) / checked if checked > 0 else None
+    assessable = preserved_count + len(newly_broken)
+    if checked == 0:
+        not_implemented_reason: Optional[str] = (
+            "no artifact was healthy-before-repair in the source checkpoint to compare against"
+        )
+    elif assessable == 0:
+        not_implemented_reason = (
+            "every healthy-before artifact's final state is inconclusive -- "
+            "none confirmed preserved or broken"
+        )
+    else:
+        not_implemented_reason = None
+
     return ContentPreservationScore(
-        preserved_fraction=preserved_fraction,
+        preserved_fraction=(preserved_count / assessable if assessable > 0 else None),
         newly_broken_artifacts=sorted(newly_broken),
-        not_implemented_reason=(
-            None if checked > 0 else "no artifact was healthy-before-repair in the source checkpoint to compare against"
-        ),
+        inconclusive_artifacts=sorted(inconclusive),
+        not_implemented_reason=not_implemented_reason,
     )
 
 
@@ -557,7 +686,8 @@ def compute_repair_gain_score(
     automatically ``LEFT_STALE_OR_UNRESOLVED`` either: if it is not part
     of the original trigger (``_originally_failing_artifact_ids``) AND is
     CONFIRMED healthy in this branch's own final state
-    (``_is_confirmed_healthy`` -- at least one live PASS, NOT merely "not
+    (``_is_confirmed_healthy`` -- EVERY constraint ever checked against it
+    has a live PASS, NOT merely one of several, and NOT merely "not
     confirmed broken"), it becomes ``ALREADY_HEALTHY_UNTOUCHED`` instead,
     and counts toward ``gain``'s numerator alongside ``RESOLVED``. A
     review's repro had A fail and B already sitting on a valid PASS; a
@@ -605,6 +735,20 @@ def compute_repair_gain_score(
     history later adds) let an artifact THIS branch itself swept into a
     wide action and broke escape damage-checking, simply because some
     other branch's history happened to also mention it.
+
+    A *third* review then caught that ``_is_confirmed_healthy`` itself,
+    even requiring an actual live PASS, was still wrong for an artifact
+    checked against more than one constraint -- it used ``any(... PASS
+    ...)``, so one passing constraint made the whole artifact read as
+    healthy while another REQUIRED constraint on it sat on live UNKNOWN,
+    had its evidence invalidated with nothing re-checking it, or was a
+    live FAIL predating this repair entirely. All three repros reproduced
+    the identical ``ALREADY_HEALTHY_UNTOUCHED``/damage-baseline false
+    positives the previous two paragraphs already fixed, just one layer
+    deeper. Fixed inside ``_is_confirmed_healthy`` itself (see that
+    function's own, rewritten docstring) -- nothing in this function
+    changed, since it already delegates "is this target confirmed
+    healthy" entirely to that one predicate.
     """
     final_outcomes = _merge_final_outcomes(branch)
     final_store = ArtifactGraphStore.from_checkpoint(branch.final_checkpoint, branch_id="gain-check")

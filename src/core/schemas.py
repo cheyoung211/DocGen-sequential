@@ -386,10 +386,29 @@ class ContentPreservationScore(BaseModel):
     a harmless, legitimate content refresh (e.g. a successful regeneration
     whose wording simply changed) with an actual new error; the two must
     stay distinguishable, and only the latter counts as damage.
+
+    A later review caught that every candidate NOT in
+    ``newly_broken_artifacts`` was being counted as preserved by default --
+    which silently promoted a THIRD, genuinely different final state into
+    "preserved": no evidence at all after the repair, or only live
+    ``CheckOutcome.UNKNOWN`` entries, i.e. a target this repair left
+    genuinely unverified rather than confirmed intact. ``inconclusive_artifacts``
+    holds exactly that set -- confirmed neither broken
+    (``failure_dataset._is_broken_in_final_state``) nor healthy
+    (``failure_dataset._is_confirmed_healthy``) in the final state --
+    excluded from BOTH ``newly_broken_artifacts`` and the numerator AND
+    denominator ``preserved_fraction`` is computed from: that fraction is
+    now ``preserved / (preserved + len(newly_broken_artifacts))`` among
+    only the ASSESSABLE candidates, never silently padded out by targets
+    nobody could actually confirm either way. ``preserved_fraction`` stays
+    ``None`` (with ``not_implemented_reason`` set) when every candidate
+    turned out inconclusive, exactly like the pre-existing "nothing was
+    healthy-before to compare against" case.
     """
 
     preserved_fraction: Optional[float] = None
     newly_broken_artifacts: List[str] = Field(default_factory=list)
+    inconclusive_artifacts: List[str] = Field(default_factory=list)
     not_implemented_reason: Optional[str] = None
 
 
@@ -1644,6 +1663,43 @@ class RepairGainScore(BaseModel):
     both this sentinel and the damage baseline -- "not confirmed broken"
     and "confirmed healthy" are different claims, and an unverified
     target satisfies neither.
+
+    A *fifth* review then caught that ``_is_confirmed_healthy`` itself,
+    even requiring "an actual live PASS", was still wrong for an artifact
+    checked against MORE THAN ONE constraint: it used ``any(... PASS ...)``,
+    so a single passing constraint made the WHOLE artifact read as
+    confirmed healthy even while another REQUIRED constraint on the same
+    artifact sat on live UNKNOWN, had its evidence invalidated by an
+    unrelated input moving, or was a live FAIL that existed before the
+    repair even started. Three real repros, all on one artifact with two
+    constraints (format/computation): (1) format PASS + computation
+    UNKNOWN still read as healthy, reproducing the exact
+    ``already_healthy_untouched`` asymmetry the previous paragraph's fix
+    was supposed to close; (2) format PASS + computation evidence
+    invalidated (dropped out of ``live_evidence()`` entirely, never
+    re-checked) also still read as healthy, even though a REQUIRED
+    constraint now has no live verdict at all; (3) format PASS +
+    computation FAIL predating the repair entirely still read as healthy,
+    so an artifact nobody ever touched was reported as newly broken by
+    damage purely because it was wrongly admitted into the healthy-before
+    baseline in the first place. Simply swapping ``any`` for ``all`` would
+    have been its own new bug -- ``all(...)`` over the EMPTY sequence
+    ``live_evidence()`` returns for a never-checked artifact is vacuously
+    ``True`` in Python, which would have made total silence read as
+    confirmed healthy, worse than the bug it replaced. Fixed by comparing
+    against the artifact's full required-constraint set instead
+    (``failure_dataset._required_constraint_ids`` -- every ``constraint_id``
+    ever checked against the artifact's CURRENT version, independent of
+    whether that verdict is still live): confirmed healthy now means every
+    id in that required set has a live PASS, and an empty required set
+    (nothing ever checked) is explicitly ``False``, never vacuously
+    ``True``. The same fix also closed a second, related damage-only bug:
+    ``_compute_damage`` previously counted anything not CONFIRMED broken as
+    preserved by default, so a target that went from a confirmed PASS
+    before the repair to live UNKNOWN after it (genuinely unverified, not
+    confirmed intact) still scored ``preserved_fraction=1.0`` -- see
+    ``ContentPreservationScore.inconclusive_artifacts``'s own docstring for
+    that fix.
     """
 
     outcome_counts: Dict[str, int] = Field(default_factory=dict)

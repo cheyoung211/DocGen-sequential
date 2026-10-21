@@ -405,24 +405,63 @@ class _FakeProducer:
 
 
 class _FakeValidator:
-    def __init__(self, fail_ids: FrozenSet[str] = frozenset(), unknown_ids: FrozenSet[str] = frozenset()) -> None:
+    """``outcome_overrides`` maps ``artifact_id -> {constraint_id:
+    outcome}`` for PER-CONSTRAINT control within a single artifact -- a
+    fifth review's repro needed one artifact checked against two
+    DIFFERENT constraints with two DIFFERENT outcomes at once (e.g.
+    format=PASS + computation=UNKNOWN on the same artifact), which
+    ``fail_ids``/``unknown_ids`` alone cannot express since they set one
+    outcome for every constraint on a given artifact_id. Falls back to
+    the fail_ids/unknown_ids/PASS default for any constraint not named in
+    ``outcome_overrides``.
+
+    Every UNKNOWN outcome -- default or overridden -- gets a real
+    ``unknown_reason``. A previous version of this fake built
+    ``Evidence(outcome=UNKNOWN, ...)`` with no ``unknown_reason`` at all,
+    which ``Evidence.model_post_init`` actually rejects
+    (``pydantic.ValidationError``) -- that exception was never visible in
+    a failing test because ``ToolExecutor``/``repair_operations`` already
+    catch a raising ``Validator.check()`` and fall back to empty
+    evidence, which happened to still classify as INCONCLUSIVE either
+    way. That made the old UNKNOWN path "pass" for the wrong reason (a
+    masked crash, not a real UNKNOWN verdict) -- fixed here so a fake
+    UNKNOWN verdict is a real, valid one, exactly like production
+    Validators must produce."""
+
+    def __init__(
+        self,
+        fail_ids: FrozenSet[str] = frozenset(),
+        unknown_ids: FrozenSet[str] = frozenset(),
+        outcome_overrides: Optional[Dict[str, Dict[str, CheckOutcome]]] = None,
+    ) -> None:
         self.fail_ids = set(fail_ids)
         self.unknown_ids = set(unknown_ids)
+        self.outcome_overrides = outcome_overrides or {}
         self.config: Dict[str, bool] = {}
 
     def check(
         self, artifact: ArtifactRef, constraints: List[Constraint], context: Optional[Dict[str, Any]] = None
     ) -> List[Evidence]:
         if artifact.artifact_id in self.fail_ids:
-            outcome = CheckOutcome.FAIL
+            default_outcome = CheckOutcome.FAIL
         elif artifact.artifact_id in self.unknown_ids:
-            outcome = CheckOutcome.UNKNOWN
+            default_outcome = CheckOutcome.UNKNOWN
         else:
-            outcome = CheckOutcome.PASS
-        return [
-            Evidence(constraint_id=c.constraint_id, outcome=outcome, checked_artifact=artifact, detail="fake")
-            for c in constraints
-        ]
+            default_outcome = CheckOutcome.PASS
+        per_constraint = self.outcome_overrides.get(artifact.artifact_id, {})
+        evidence: List[Evidence] = []
+        for c in constraints:
+            outcome = per_constraint.get(c.constraint_id, default_outcome)
+            evidence.append(
+                Evidence(
+                    constraint_id=c.constraint_id,
+                    outcome=outcome,
+                    checked_artifact=artifact,
+                    detail="fake",
+                    unknown_reason=(UnknownReason.NOT_REPRESENTABLE if outcome == CheckOutcome.UNKNOWN else None),
+                )
+            )
+        return evidence
 
 
 class _ActOnAllFailures:
@@ -450,6 +489,19 @@ class _NothingPolicy:
 
 def _one_constraint_per_artifact(ref: ArtifactRef) -> List[Constraint]:
     return [Constraint(constraint_id=f"c:{ref.artifact_id}", kind=ConstraintKind.SCHEMA_CONTRACT, description="d")]
+
+
+def _format_and_computation_constraints_for_b(ref: ArtifactRef) -> List[Constraint]:
+    """"b" gets TWO independent, REQUIRED constraints (format/computation)
+    instead of the default one-per-artifact -- the fixture a fifth
+    review's multi-constraint repro needs. Every other artifact still
+    gets the default single constraint."""
+    if ref.artifact_id != "b":
+        return _one_constraint_per_artifact(ref)
+    return [
+        Constraint(constraint_id="format:b", kind=ConstraintKind.SCHEMA_CONTRACT, description="format check"),
+        Constraint(constraint_id="computation:b", kind=ConstraintKind.RECOMPUTE, description="computation check"),
+    ]
 
 
 def _record_pass(store: ArtifactGraphStore, ref: ArtifactRef) -> None:
@@ -1127,3 +1179,201 @@ def test_damage_excludes_an_artifact_that_was_already_broken_before_the_repair()
 
     assert score.damage.newly_broken_artifacts == []
     assert score.damage.preserved_fraction == 1.0
+
+
+def test_repair_gain_score_already_healthy_untouched_requires_every_required_constraint_not_just_one() -> None:
+    """Main repro from a fifth review: "b" has TWO required constraints
+    (format/computation). format already has a valid PASS; computation
+    is live UNKNOWN -- never actually confirmed either way. A narrow
+    branch repairs only "a" and leaves "b" completely untouched (still
+    format=PASS, computation=UNKNOWN); a wide sibling branch re-checks
+    "b" too, and the recheck is ALSO UNKNOWN for computation --
+    genuinely never confirmed by either branch.
+
+    The old ``_is_confirmed_healthy``, ``any(outcome == PASS for ... in
+    live_evidence(...))``, let the single passing "format" constraint
+    stand in for the WHOLE artifact, so the narrow branch (which did
+    LESS -- never even looked at computation again) scored a perfect
+    gain=1.0 while the wide branch -- which re-checked and got an
+    equally honest "still can't confirm computation" -- scored only 0.5.
+    Neither branch ever confirmed ALL of "b"'s required constraints, so
+    neither should get full credit for it; both must land on gain=0.5."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.SECTION, content="orig-b")
+    b_ref = store.latest("b").ref
+    store.record_evidence(
+        Evidence(constraint_id="format:b", outcome=CheckOutcome.PASS, checked_artifact=b_ref, detail="format ok")
+    )
+    store.record_evidence(
+        Evidence(
+            constraint_id="computation:b",
+            outcome=CheckOutcome.UNKNOWN,
+            checked_artifact=b_ref,
+            detail="could not evaluate",
+            unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+        )
+    )
+    checkpoint = store.save_checkpoint()
+    trigger_evidence = [_fail_evidence(a_ref)]
+
+    branch_narrow = _run_branch(
+        checkpoint,
+        [a_ref],
+        producer=_FakeProducer(),
+        validator=_FakeValidator(),
+        constraint_provider=_format_and_computation_constraints_for_b,
+    )
+    branch_wide = _run_branch(
+        checkpoint,
+        [a_ref],
+        producer=_FakeProducer(),
+        validator=_FakeValidator(outcome_overrides={"b": {"computation:b": CheckOutcome.UNKNOWN}}),
+        constraint_provider=_format_and_computation_constraints_for_b,
+        policy=_AlsoRegenerate(b_ref),
+    )
+    # Sanity-check the premise: narrow truly never touched "b"; wide did,
+    # and the recheck itself came back inconclusive, not a confirmed pass.
+    assert "b" not in _merge_final_outcomes(branch_narrow)
+    assert _merge_final_outcomes(branch_wide)["b"] == RepairOutcome.INCONCLUSIVE
+
+    comparison = BranchComparisonResult(
+        source_checkpoint_id=checkpoint.checkpoint_id, branches=[branch_narrow, branch_wide]
+    )
+    target_ids = compute_common_target_artifact_ids(comparison, triggering_evidence=trigger_evidence)
+    assert target_ids == {"a", "b"}
+
+    score_narrow = compute_repair_gain_score(
+        checkpoint, branch_narrow, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+    score_wide = compute_repair_gain_score(
+        checkpoint, branch_wide, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+
+    # "b" must land in the same kind of non-success bucket for both --
+    # never ALREADY_HEALTHY_UNTOUCHED, since neither branch ever
+    # confirmed every one of its required constraints.
+    assert score_narrow.outcome_counts == {RepairOutcome.RESOLVED.value: 1, LEFT_STALE_OR_UNRESOLVED: 1}
+    assert score_narrow.gain == 0.5
+    assert score_wide.outcome_counts == {RepairOutcome.RESOLVED.value: 1, RepairOutcome.INCONCLUSIVE.value: 1}
+    assert score_wide.gain == 0.5
+
+
+def test_repair_gain_score_already_healthy_untouched_does_not_apply_when_a_required_constraints_evidence_is_invalidated() -> None:
+    """Second repro from the same fifth review: "b" has format=PASS (no
+    real inputs of its own) and a separate, REQUIRED computation=PASS
+    that depended on an unrelated "src" artifact's version
+    (``Evidence.input_versions`` -- not a structural dependency of "b"
+    itself via ``read_input_versions``). "src" later moves to a new
+    version, which invalidates ONLY the computation Evidence -- it drops
+    out of ``live_evidence()`` entirely, with nothing ever re-checking
+    computation against "b" again -- while "b" itself never becomes
+    ``is_stale`` (its own position in the dependency graph never moved).
+    "b" is left completely untouched by the repair.
+
+    ``_is_confirmed_healthy`` must not read "format is still a live PASS"
+    as "b is fine": a REQUIRED constraint now has no live verdict at
+    all, invalidated or simply never re-checked -- the same unconfirmed
+    state as the UNKNOWN repro above, reached a different way."""
+    store = ArtifactGraphStore()
+    store.add_version("src", ArtifactKind.SECTION, content="src-v1")
+    src_ref = store.latest("src").ref
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.SECTION, content="orig-b")
+    b_ref = store.latest("b").ref
+    store.record_evidence(
+        Evidence(constraint_id="format:b", outcome=CheckOutcome.PASS, checked_artifact=b_ref, detail="format ok")
+    )
+    store.record_evidence(
+        Evidence(
+            constraint_id="computation:b",
+            outcome=CheckOutcome.PASS,
+            checked_artifact=b_ref,
+            detail="computed against src",
+            input_versions=[src_ref],
+        )
+    )
+    store.add_version("src", ArtifactKind.SECTION, content="src-v2", read_input_versions=[])
+    assert store.is_stale("b") is False  # b's own graph position never moved
+    assert [item.constraint_id for item in store.live_evidence("b")] == ["format:b"]  # computation dropped
+
+    checkpoint = store.save_checkpoint()
+    branch = _run_branch(checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
+
+    score = compute_repair_gain_score(
+        checkpoint, branch, target_artifact_ids={"a", "b"}, triggering_evidence=[_fail_evidence(a_ref)]
+    )
+    assert score.outcome_counts == {RepairOutcome.RESOLVED.value: 1, LEFT_STALE_OR_UNRESOLVED: 1}
+    assert score.gain == 0.5
+
+
+def test_damage_excludes_a_target_whose_other_required_constraint_already_had_a_pre_existing_fail() -> None:
+    """Third repro from the same fifth review, this time on the damage
+    side: "b" has format=PASS and computation=FAIL, BOTH already live in
+    the before_checkpoint, before the repair even starts -- "b" was never
+    actually healthy, just partially passing. Repairing only "a" leaves
+    "b" completely untouched -- same content, same version, same FAIL
+    throughout. The old ``any(... PASS ...)`` still admitted "b" into the
+    healthy-before baseline purely because of its format PASS, so
+    leaving it exactly as broken as it always was got reported as this
+    repair's own NEW damage."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.SECTION, content="orig-b")
+    b_ref = store.latest("b").ref
+    store.record_evidence(
+        Evidence(constraint_id="format:b", outcome=CheckOutcome.PASS, checked_artifact=b_ref, detail="format ok")
+    )
+    store.record_evidence(
+        Evidence(constraint_id="computation:b", outcome=CheckOutcome.FAIL, checked_artifact=b_ref, detail="bad calc")
+    )
+    before_checkpoint = store.save_checkpoint()
+
+    branch = _run_branch(before_checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
+    score = compute_repair_gain_score(
+        before_checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(a_ref)]
+    )
+
+    assert "b" not in score.damage.newly_broken_artifacts
+    assert score.damage.preserved_fraction is None
+    assert score.damage.not_implemented_reason is not None
+
+
+def test_damage_does_not_count_a_post_repair_unknown_as_preserved() -> None:
+    """Fourth repro from the same fifth review: "b" starts CONFIRMED
+    healthy (a single live PASS) and gets swept into a wide repair
+    action alongside "a" -- but the recheck after regeneration comes
+    back UNKNOWN (could not be evaluated), not a fresh PASS.
+    ``_compute_damage`` previously counted everything NOT confirmed-
+    broken as preserved by default, so this honestly-unverified
+    post-repair state still scored ``preserved_fraction=1.0`` -- exactly
+    as misleading as calling a never-confirmed artifact "healthy"
+    elsewhere in this module. It must land in ``inconclusive_artifacts``
+    instead, excluded from the preserved/broken ratio entirely."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.SECTION, content="orig-b")
+    b_ref = store.latest("b").ref
+    store.record_evidence(
+        Evidence(constraint_id="c:b", outcome=CheckOutcome.PASS, checked_artifact=b_ref, detail="already fine")
+    )
+    before_checkpoint = store.save_checkpoint()
+
+    branch = _run_branch(
+        before_checkpoint,
+        [a_ref],
+        producer=_FakeProducer(),
+        validator=_FakeValidator(unknown_ids=frozenset({"b"})),
+        policy=_AlsoRegenerate(b_ref),
+    )
+    score = compute_repair_gain_score(
+        before_checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(a_ref)]
+    )
+
+    assert "b" not in score.damage.newly_broken_artifacts
+    assert "b" in score.damage.inconclusive_artifacts
+    assert score.damage.preserved_fraction is None
