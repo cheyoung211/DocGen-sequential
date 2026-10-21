@@ -491,6 +491,58 @@ class ArtifactGraphStore:
                     frontier.append(dependent)
         return visited
 
+    def direct_dependents(self, artifact_id: str) -> Set[str]:
+        """Every artifact that **currently** declares a one-hop dependency
+        on ``artifact_id`` -- i.e. ``artifact_id`` itself excluded, and only
+        the immediate neighbors, not the full transitive closure
+        ``impact_candidates`` returns. Added in Stage 6 (failure/action
+        dataset) to compute fan-out as a failure-difficulty axis
+        ("의존 깊이·fan-out ... 분류한다") without duplicating
+        ``_current_dependents``'s own "currently applicable edge" filtering
+        logic in a second module -- see that method's docstring for exactly
+        what "currently applicable" excludes (edges superseded by a later
+        regeneration). Same precedent as Stage 5's ``is_evidence_still_valid``:
+        exposing already-computed, already-reviewed private logic as a new
+        public read accessor, rather than re-deriving it elsewhere from
+        ``edges`` and risking drift from this class's own filtering rule.
+
+        Pure query, like ``impact_candidates``: never mutates ``self``.
+        """
+        return set(self._current_dependents().get(artifact_id, ()))
+
+    def direct_dependencies(self, artifact_id: str) -> Set[str]:
+        """The reverse of ``direct_dependents``: every artifact that
+        ``artifact_id``'s **current** version declares a one-hop dependency
+        on. Added alongside ``direct_dependents`` for Stage 6's
+        ``dependency_depth`` axis, which needs to walk *upstream* from a
+        failing artifact to find how deep it sits.
+
+        Filters the same way ``_current_dependents`` does, but on the
+        opposite endpoint: an edge counts only while ``artifact_id`` itself
+        is still at the exact version that edge was recorded against
+        (``edge.to_artifact``) -- an edge recorded against a since-
+        superseded version of ``artifact_id`` describes a relation that no
+        longer applies to its current content, exactly mirroring why
+        ``_current_dependents`` checks the same thing on its own ``to_id``.
+        Deliberately does not also require ``edge.from_artifact`` to be at
+        *its* current version -- the dependency existed as of when
+        ``artifact_id`` was produced, regardless of whether the upstream
+        artifact has since moved on; that is exactly the "outdated input"
+        case ``AddVersionResult.used_outdated_inputs`` already tracks
+        separately, not something this accessor needs to re-filter.
+
+        Returns an empty set (not an error) for an unknown ``artifact_id`` --
+        a pure query, with no side effect, like ``direct_dependents``.
+        """
+        latest = self.latest(artifact_id)
+        if latest is None:
+            return set()
+        return {
+            edge.from_artifact.artifact_id
+            for edge in self._edges
+            if edge.to_artifact.artifact_id == artifact_id and edge.to_artifact.version == latest.ref.version
+        }
+
     def _invalidate(
         self,
         artifact_id: str,

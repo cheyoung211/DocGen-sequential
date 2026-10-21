@@ -1350,3 +1350,370 @@ class LLMControllerDecision(BaseModel):
 
     call: "ToolCall" = Field(discriminator="action")
     rationale: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Stage 6 ("실패·행동 데이터셋과 human gold 구축") schemas. Behavior lives in
+# ``src/core/fault_injection.py`` (controlled perturbations),
+# ``src/core/failure_dataset.py`` (natural/injected-failure classification +
+# repair gain/damage/cost per checkpoint), ``src/core/annotation.py`` (human
+# annotation tooling + disagreement resolution), and
+# ``src/core/dataset_split.py`` (train/dev/test split) -- same schema/
+# behavior split every earlier stage follows.
+# ---------------------------------------------------------------------------
+
+
+class FaultInjectionKind(str, Enum):
+    """The four concrete injected-failure types revision direction 4 names
+    under "주입 예시": a theorem/proof missing a needed assumption, a table
+    whose denominator was altered, a symbol given a different meaning in
+    different sections, and a blueprint whose required components cannot
+    jointly be satisfied."""
+
+    MISSING_ASSUMPTION = "missing_assumption"
+    ALTERED_DENOMINATOR = "altered_denominator"
+    INCONSISTENT_SYMBOL_MEANING = "inconsistent_symbol_meaning"
+    UNSATISFIABLE_BLUEPRINT = "unsatisfiable_blueprint"
+
+
+class InjectedFault(BaseModel):
+    """One fault-injection event, as actually carried out against an
+    ``ArtifactGraphStore`` (every injector writes through ``add_version``,
+    never mutates stored content in place -- same discipline as every other
+    writer in this codebase).
+
+    ``pre_injection_refs``/``injected_refs`` are parallel, same-length lists
+    -- one ``(old version, new corrupted version)`` pair per artifact this
+    single injection event touched. Most injection kinds touch exactly one
+    artifact; ``INCONSISTENT_SYMBOL_MEANING`` touches two (the two sections
+    disagreeing about the symbol) by construction, so a singular
+    ``injected_ref`` field would not fit every kind uniformly.
+
+    ``predicted_affected_artifact_ids`` is the injector's OWN prediction
+    (``ArtifactGraphStore.impact_candidates`` at injection time) of what
+    should propagate -- kept separate from whatever a later repair/
+    classification step actually observes as affected, so "predicted
+    propagation" and "observed propagation" are never silently conflated
+    into one field (the same discipline ``RepairExecutionResult`` already
+    applies to its own "what should be checked" vs "what a fresh check
+    actually found").
+    """
+
+    fault_id: str
+    kind: FaultInjectionKind
+    pre_injection_refs: List[ArtifactRef]
+    injected_refs: List[ArtifactRef]
+    description: str
+    predicted_affected_artifact_ids: List[str] = Field(default_factory=list)
+
+    def model_post_init(self, __context: object) -> None:
+        if len(self.pre_injection_refs) != len(self.injected_refs):
+            raise ValueError(
+                "pre_injection_refs and injected_refs must be the same length "
+                "(one old->new pair per artifact this injection touched); got "
+                f"{len(self.pre_injection_refs)} vs {len(self.injected_refs)}."
+            )
+        if not self.pre_injection_refs:
+            raise ValueError("an InjectedFault must touch at least one artifact.")
+
+
+class FailureOrigin(str, Enum):
+    """Revision direction 4's required separation: "자연 발생 실패와 통제된
+    fault injection은 별도로 보고한다" -- kept as an explicit field on every
+    ``FailureRecord`` rather than left inferable from whether
+    ``injected_fault`` happens to be set, so a query/report can filter on it
+    directly without re-deriving the distinction each time."""
+
+    NATURAL = "natural"
+    INJECTED = "injected"
+
+
+class FailureDifficultyProfile(BaseModel):
+    """The four classification axes Stage 6's checklist names verbatim
+    ("의존 깊이·fan-out·공유 정의 사용·관계 누락에 따라 분류한다"), computed purely
+    from the dependency graph state around one failing artifact at the
+    moment of failure -- never from that failure's eventual repair outcome,
+    which would make difficulty circular with the thing later analysis
+    (Stage 7/8) measures difficulty against.
+
+    ``dependency_depth``: length of the longest current upstream chain
+    leading into this artifact (0 for an artifact with no current
+    dependencies at all).
+    ``fan_out``: number of artifacts currently declaring a direct
+    dependency on this one (``ArtifactGraphStore.direct_dependents``).
+    ``shared_definition_use``: whether this artifact is a non-block/
+    section/document kind with ``fan_out > 1`` -- the same "shared
+    definition-like artifact with more than one direct dependent" condition
+    ``repair_operations.FixedGraphAwareRepairPolicy._scope_for`` already
+    uses to decide when a failure's blast radius extends beyond itself;
+    reused here rather than redefined, so "difficulty" and "repair scope
+    selection" never quietly drift apart.
+    ``missing_relations_count``: number of ``DependencyEdge``s of
+    ``relation=INFERRED`` touching this artifact (as either endpoint),
+    across the full edge history -- each one is, by construction, a
+    relation that was NOT declared at generation time and had to be added
+    after the fact (``ArtifactGraphStore.add_inferred_edge``), i.e. a
+    concrete instance of "관계 누락."
+    """
+
+    dependency_depth: int = Field(ge=0)
+    fan_out: int = Field(ge=0)
+    shared_definition_use: bool
+    missing_relations_count: int = Field(ge=0)
+
+
+class FailureRecord(BaseModel):
+    """One collected failure event -- natural or injected -- tied to the
+    checkpoint it was observed at and classified by its dependency-graph
+    difficulty profile. ``dataset_version`` is this record's OWN schema
+    version (the Stage 6 completion criterion "버전이 있는 데이터 명세") --
+    bumped whenever this shape changes; independent of any single stored
+    record's content or of ``src/dataset/schemas.py::BenchmarkItem.
+    benchmark_version``, which versions a different thing (the benchmark
+    contract, not this failure/action dataset).
+    """
+
+    dataset_version: str = "v1"
+    failure_id: str
+    origin: FailureOrigin
+    injected_fault: Optional[InjectedFault] = None
+    failing_artifact: ArtifactRef
+    evidence: List[Evidence] = Field(default_factory=list)
+    difficulty: FailureDifficultyProfile
+    source_checkpoint_id: str
+    sample_id: Optional[str] = None
+
+    def model_post_init(self, __context: object) -> None:
+        if self.origin == FailureOrigin.INJECTED and self.injected_fault is None:
+            raise ValueError("FailureRecord with origin=INJECTED requires injected_fault.")
+        if self.origin == FailureOrigin.NATURAL and self.injected_fault is not None:
+            raise ValueError("FailureRecord with origin=NATURAL must not carry injected_fault.")
+
+
+class RepairGainScore(BaseModel):
+    """Net effect of one candidate repair action from one shared source
+    checkpoint -- revision direction 4's "repair gain, 손상, 총비용" made
+    concrete on top of Stage 4's already-computed, already-reviewed
+    ``BranchExecutionResult``.
+
+    ``outcome_counts`` maps each ``RepairOutcome`` value seen to how many
+    distinct artifact_ids resolved to it, by the END of the whole branch
+    (every round merged via ``BranchExecutionResult``'s own documented
+    last-write-wins rule, read only through ``RepairExecutionResult.
+    final_outcome_by_artifact`` -- never by independently re-scanning
+    ``regenerated``/``reverified_untouched``, exactly the mistake that
+    schema's own docstring warns every external caller against).
+    ``gain`` is ``outcome_counts["resolved"] / sum(outcome_counts.values())``;
+    left ``None`` with ``not_implemented_reason`` set when the denominator
+    is 0 (nothing in this branch ever reached a final outcome -- e.g. the
+    very first action was rejected for budget) rather than fabricated as
+    0.0, the same "never silently backfill" discipline
+    ``ContentPreservationScore``/``VerifierPrecisionRecall`` already use.
+    ``damage`` is computed by comparing the source checkpoint's stored
+    content against ``BranchExecutionResult.final_checkpoint`` for every
+    artifact_id NOT present in ``outcome_counts``'s underlying per-artifact
+    map -- i.e. every artifact this branch's cascade never even visited;
+    any content difference found there is, by construction, unrelated to
+    what the branch was actually trying to fix.
+    """
+
+    outcome_counts: Dict[str, int] = Field(default_factory=dict)
+    gain: Optional[float] = None
+    not_implemented_reason: Optional[str] = None
+    damage: ContentPreservationScore
+    total_cost_tokens: float = 0.0
+
+
+class CandidateActionRecord(BaseModel):
+    """One ``(checkpoint, candidate repair action, downstream result)``
+    triple -- the unit revision direction 4's benchmark spec asks to store
+    ("초기 상태, 오류 근거, 의존관계, 후보 복구 범위, 독립 평가 기준, 행동별
+    결과와 비용"). Links back to the ``FailureRecord`` that triggered this
+    branch rather than re-embedding it, so the same failure's several
+    candidate actions (one ``CandidateActionRecord`` per ``BranchSpec``)
+    never duplicate the difficulty-classification/evidence payload.
+    """
+
+    dataset_version: str = "v1"
+    record_id: str
+    failure_id: str
+    source_checkpoint_id: str
+    branch_label: str
+    action: RepairAction
+    outcome: RepairGainScore
+    rounds_executed: int = Field(ge=0)
+
+
+class AnnotationOutcome(str, Enum):
+    """Mirrors ``CheckOutcome`` (pass/fail/unknown) but kept as its own enum
+    rather than reused directly -- ``CheckOutcome.UNKNOWN`` always carries a
+    machine ``UnknownReason``; a human annotator's "unknown" has no such
+    structured reason, only free-text ``AnnotationLabel.rationale``, so
+    reusing the same type would let a human label silently satisfy
+    ``Evidence.model_post_init``'s ``unknown_reason`` requirement with
+    nothing meaningful behind it."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    UNKNOWN = "unknown"
+
+
+class AnnotationStratum(BaseModel):
+    """The sampling/reporting strata ``docs/stage1_experiment_design.md``
+    §2 names: ``Domain``/``Difficulty`` (``src/dataset/schemas.py``) plus
+    the online-trigger split -- all three optional except ``trigger``
+    because a failure/action-dataset task may not always have a resolvable
+    domain/difficulty (e.g. one built from a synthetic fake in a test)."""
+
+    domain: Optional[str] = None
+    difficulty: Optional[str] = None
+    trigger: bool
+
+    @property
+    def key(self) -> str:
+        """A single hashable/printable stratum identity, used by
+        ``annotation.compute_stratum_weights``/agreement-by-stratum
+        reporting -- defined once here so two call sites can never compute
+        slightly different strings for "the same" stratum."""
+        return f"domain={self.domain}|difficulty={self.difficulty}|trigger={self.trigger}"
+
+
+class AnnotationTask(BaseModel):
+    """One blind-labeling task -- ``docs/stage1_experiment_design.md`` §2's
+    protocol made concrete. Deliberately carries no online-validator name or
+    result anywhere on this model: showing that to an annotator would make
+    the eventual verifier precision/recall comparison circular
+    (``interfaces.FinalEvaluator``'s own docstring on the same point).
+    ``stratum.trigger`` is used only to build a *balanced* sample and is
+    never shown to the annotator and never written back onto the resulting
+    label -- it is this model's own field, not something read off the
+    label.
+    """
+
+    dataset_version: str = "v1"
+    task_id: str
+    artifact: ArtifactRef
+    content_shown: str
+    stratum: AnnotationStratum
+    sample_id: Optional[str] = None
+
+
+class AnnotationLabel(BaseModel):
+    """One annotator's raw, blind judgment on one ``AnnotationTask``.
+    ``is_adjudicator`` marks the (at most one) third-labeler call that only
+    happens after the first two disagree -- ``annotation.
+    resolve_annotations`` uses it to tell a genuine tie-break label apart
+    from a third independent opinion gathered for some other reason."""
+
+    task_id: str
+    annotator_id: str
+    outcome: AnnotationOutcome
+    rationale: str = ""
+    is_adjudicator: bool = False
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class ResolvedLabelStatus(str, Enum):
+    AGREED = "agreed"
+    ADJUDICATED = "adjudicated"
+    UNRESOLVED = "unresolved"
+
+
+class ResolvedAnnotation(BaseModel):
+    """``docs/stage1_experiment_design.md`` §2's disagreement procedure
+    applied to one task's raw labels: two independent (blind) labels that
+    agree resolve directly (``AGREED``); two that disagree require a third,
+    adjudicating label and resolve by majority (``ADJUDICATED``); a
+    disagreement with no majority even after adjudication resolves to
+    ``outcome=None``/``UNRESOLVED`` and must be excluded from any
+    precision/recall denominator -- but the disagreement itself is still
+    counted, never silently dropped (§2: "불일치율 자체를 별도로 보고한다";
+    see ``AnnotationAgreementReport``).
+    """
+
+    task_id: str
+    outcome: Optional[AnnotationOutcome] = None
+    status: ResolvedLabelStatus
+    label_count: int = Field(ge=0)
+
+    def model_post_init(self, __context: object) -> None:
+        if self.status == ResolvedLabelStatus.UNRESOLVED and self.outcome is not None:
+            raise ValueError("ResolvedAnnotation with status=UNRESOLVED must not carry an outcome.")
+        if self.status != ResolvedLabelStatus.UNRESOLVED and self.outcome is None:
+            raise ValueError(f"ResolvedAnnotation with status={self.status!r} requires an outcome.")
+
+
+class AnnotationAgreementReport(BaseModel):
+    """Aggregate inter-annotator agreement over one batch of tasks --
+    overall and per ``AnnotationStratum.key``, so a stratum with unusually
+    high disagreement is visible rather than averaged away."""
+
+    total_tasks: int = Field(ge=0)
+    agreed_count: int = Field(ge=0)
+    adjudicated_count: int = Field(ge=0)
+    unresolved_count: int = Field(ge=0)
+    disagreement_rate: float = Field(ge=0.0, le=1.0)
+    disagreement_rate_by_stratum: Dict[str, float] = Field(default_factory=dict)
+
+
+class StratumWeight(BaseModel):
+    """Inverse-probability weight for one ``AnnotationStratum.key`` --
+    Stage 6's completion criterion "계층별 표본을 사용했다면 전체 비율 추정에
+    필요한 가중치를 적용한다". ``weight = population_count / sample_count``;
+    a stratum sampled at the same rate as its population share gets
+    weight 1.0, one oversampled (e.g. rare trigger cases, deliberately
+    over-collected for annotation efficiency) gets a weight below 1.0 so a
+    population-level estimate built from the sample does not overweight it.
+    """
+
+    stratum_key: str
+    population_count: int = Field(ge=0)
+    sample_count: int = Field(gt=0)
+    weight: float = Field(ge=0.0)
+
+
+class SplitName(str, Enum):
+    TRAIN = "train"
+    DEV = "dev"
+    TEST = "test"
+
+
+class SplitFamilyKey(BaseModel):
+    """The grouping key whose members must never cross a split boundary --
+    Stage 6's checklist: "template·topic·graph 구조를 고려한 train/dev/test
+    분할을 고정하고". Two samples sharing this key are always assigned to the
+    same split together, never split across train/dev vs. test, which is
+    what actually prevents the "같은 template/topic/graph 구조가 양쪽에
+    중복되어 평가가 쉬워지는" leak the checklist names.
+    """
+
+    document_type: str
+    topic: str
+    graph_structure_bucket: str
+
+    @property
+    def key(self) -> str:
+        return f"{self.document_type}|{self.topic}|{self.graph_structure_bucket}"
+
+
+class SplitAssignment(BaseModel):
+    dataset_version: str = "v1"
+    sample_id: str
+    family_key: SplitFamilyKey
+    split: SplitName
+
+
+class DatasetSplit(BaseModel):
+    """A fixed train/dev/test partition. ``seed``/``dataset_version`` make
+    the assignment reproducible and auditable. ``locked`` defaults to
+    ``True``: Stage 6's completion criterion is "held-out test를 정책
+    개선에 사용하지 않는다" -- ``dataset_split.held_out_test_sample_ids``
+    is the one place that is actually enforced (requires an explicit
+    ``acknowledge_test_use=True``, never a silent default), rather than left
+    as a convention a future Stage 7 script could violate by accident.
+    """
+
+    dataset_version: str = "v1"
+    seed: int
+    assignments: List[SplitAssignment] = Field(default_factory=list)
+    locked: bool = True
