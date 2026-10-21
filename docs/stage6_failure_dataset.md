@@ -232,3 +232,149 @@ test/core/ test/evaluation/ -q` 결과.
 이 중 어느 것도 Notion 체크리스트 박스를 올리지 못한 이유다(§범위 결정 참고) — 이번 라운드는
 "무엇을 측정/수집/분할할지"와 "그 계산이 올바른지"를 메커니즘 수준에서 완성한 것이고, 실제
 데이터가 들어오면 그 위에서 바로 동작하도록 설계했다.
+
+---
+
+## 6. 사용자 재검토 후 수정 (2026-10-22)
+
+1차 공개 후 사용자가 코드 위치·재현 시나리오와 함께 8건의 실제 결함을 지적했다 — Stage 1-5가
+모두 거친 "첫 리뷰에서 다수 결함" 패턴이 Stage 6에도 똑같이 적용됐다. 전부 수정했고 각
+수정마다 회귀 테스트를 추가했다.
+
+1. **Fault injection이 기존 입력 의존관계를 끊음** (`fault_injection.py`): 4개 injector
+   모두 `read_input_versions=[current.ref]`(자기 자신의 이전 버전)을 새 버전의 입력으로
+   선언했다 — 이는 (a) 버전 이력(store가 이미 관리함)을 가짜 semantic dependency로
+   오염시키고, (b) 자기 자신을 의존자로 만드는 self-loop을 만들며, (c) 진짜 상위 입력으로의
+   edge를 조용히 끊었다(`_current_dependents`의 "to_artifact가 현재 최신 버전인 edge만
+   유효" 필터 때문에, 새 버전이 실제 입력을 재선언하지 않으면 과거 edge가 즉시 무효화된다).
+   재현: A→B→T에서 T에 주입하면 `direct_dependencies("T")`가 `{"T"}`로, `dependency_depth`
+   가 2→1로, `fan_out`이 0→1로 왜곡됐고, 이후 A를 바꿔도 T가 stale이 되지 않았다. **수정**:
+   `read_input_versions=current.ref.read_input_versions`(실제 상위 입력을 그대로 재선언)로
+   4곳 전부 교체했다. 회귀 테스트:
+   `test_injection_preserves_real_upstream_dependency_not_a_self_loop`.
+2. **분할이 template/topic/graph의 개별 중복을 차단하지 못함** (`dataset_split.py`):
+   `SplitFamilyKey.key`(세 필드의 튜플 동치)로만 그룹을 묶어서, 같은 document_type·같은
+   graph_structure_bucket이지만 topic만 다른 두 샘플이 서로 다른 그룹이 되어 train/dev/test
+   경계를 넘을 수 있었다. "세 축 중 어느 것도 경계를 넘지 않는다"는 요구는 세 속성 값 중
+   **하나라도** 공유하면 같은 그룹으로 묶는 union-find(연결 요소)로만 만족 가능하다 — 어느
+   한 속성 값을 공유하는 두 샘플이 다른 컴포넌트에 있으면 그 속성 값 자체가 두 split에
+   걸치게 된다. **수정**: `_group_by_shared_attribute`(document_type/topic/
+   graph_structure_bucket 각각을 join key로 쓰는 union-find)를 추가해 튜플 동치 그룹화를
+   대체했다. 기존 테스트 fixture `_families()`도 모든 family가 세 속성을 전부 겹치지 않게
+   고쳤다(이전엔 graph_structure_bucket을 전부 공유해서 새 구현에서는 모두 한 그룹으로
+   뭉쳐버리는, 더 이상 유효하지 않은 fixture였다). 회귀 테스트:
+   `test_build_fixed_split_merges_samples_sharing_any_single_attribute`,
+   `test_build_fixed_split_transitively_merges_through_a_shared_attribute_chain`,
+   `test_no_individual_attribute_value_ever_crosses_a_split_boundary`.
+3. **미해결 artifact가 있어도 repair gain이 1.0으로 나옴** (`failure_dataset.py`):
+   `compute_repair_gain_score`의 분모가 `final_outcome_by_artifact`(그 branch 자신의
+   cascade가 실제로 방문한 것만)였다 — `RepairExecutionResult.left_stale`은 그 필드
+   자체에 **존재하지 않는다**(schema 자신의 docstring: "Absent from this map entirely means
+   never actually resolved"). 재현: A만 trigger로 주어지고 A의 복구가 B를 stale로 만들지만
+   B에 등록된 constraint가 없어 B가 left_stale로 남는 경우, gain이 1/1=1.0으로 나왔다(B가
+   분모에 전혀 들어가지 않음). **수정**: 분모를 branch 자신이 아니라 **모든 비교 대상
+   branch에 걸쳐 공통으로 정한** `target_artifact_ids`로 바꿨다 — 새 함수
+   `compute_common_target_artifact_ids(comparison, triggering_evidence)`가 (a) 원래
+   trigger로 주어진 FAIL 전체와 (b) 비교 대상 **모든** branch의 실행 이력이 한 번이라도
+   final_outcome을 보고했거나 left_stale로 남긴 모든 artifact_id의 합집합을 계산한다 —
+   어떤 branch가 B를 전혀 발견하지 못했어도, 다른 branch가 B를 문제로 식별했다면 B는 모든
+   branch의 공통 평가 대상에 포함된다. `compute_repair_gain_score`는 이제
+   `target_artifact_ids`를 필수 키워드 인자로 받고, 그 집합의 모든 id를 정확히 하나의
+   outcome 버킷(진짜 `RepairOutcome` 값, 또는 판정불가를 FAIL로 바꾸지 않는 새 sentinel
+   `LEFT_STALE_OR_UNRESOLVED`)에 배정한다 — `sum(outcome_counts.values()) ==
+   len(target_artifact_ids)`가 항상 성립. `gain`이 `None`이 되는 유일한 경우는
+   `target_artifact_ids` 자체가 빈 집합일 때뿐이다(이전엔 "이 branch가 아무것도
+   final_outcome에 못 남겼을 때"도 None이었는데, 이는 실제로는 유효한 0.0이어야 했다 —
+   `test_repair_gain_score_unresolved_target_is_a_real_zero_not_a_fabricated_none`). 회귀
+   테스트: `test_repair_gain_score_orphaned_dependent_counts_against_a_branch_that_ignored_it`
+   (좁은 branch A와 넓은 branch B를 실제로 실행해 A의 gain이 0.5로, B는 1.0으로 나옴을
+   확인).
+4. **복구가 정상 내용을 손상시켜도 보존율이 1.0으로 나옴** (`failure_dataset.py`):
+   `_compute_damage`가 "이 branch의 cascade가 건드린 적 있는 artifact"를 평가에서 제외했다
+   — 넓은 복구 범위에 휩쓸려 들어간 정상 artifact가 실제로 FAIL이 돼도 "건드렸다"는 이유로
+   제외됐다. 또한 "건드리지 않은" 쪽 판정 기준이 단순 `before_content != after_content`
+   문자열 비교였다 — 성공적인 재생성/reaffirm으로 내용이 바뀌는 것(실제 오류 아님)과 진짜
+   새 오류를 구분하지 못했다. **수정**: 평가 대상을 "이 branch의 cascade가 방문했는지"가
+   아니라 "복구 **전에** 정한 `target_artifact_ids`에 속하는지"로 바꿔 — 즉 `before_checkpoint`
+   의 모든 artifact_id에서 `target_artifact_ids`를 뺀 집합(복구가 건드릴 의도가 전혀 없던
+   "정상으로 남아야 할" 집합)을 평가 대상으로 쓴다. "손상 여부"도 문자열 비교 대신
+   `branch.final_checkpoint`를 복원한 store에서 `is_stale()` 또는 live FAIL evidence가
+   있는지로 판정한다(`ArtifactGraphStore.from_checkpoint`로 읽기 전용 재구성). 회귀 테스트:
+   `test_damage_ignores_a_harmless_content_change_with_no_real_error`(내용은 바뀌지만
+   PASS → 손상 아님), `test_damage_flags_a_confirmed_new_failure_even_with_unchanged_content`
+   (내용은 그대로지만 FAIL → 손상), `test_damage_considers_every_non_target_artifact_even_ones_the_branch_touched`
+   (넓은 복구에 휩쓸려 FAIL이 된 비-target artifact가 실제로 damage로 잡힘).
+5. **복수의 초기 행동이 첫 번째 행동 하나로 기록됨** (`schemas.py`/`failure_dataset.py`):
+   `CandidateActionRecord.action`(단수)이 `branch.rounds[0].executions[0].action`만
+   저장했다 — `FixedGraphAwareRepairPolicy.decide()`처럼 한 번의 호출이 독립적인 실패마다
+   하나씩, 여러 개의 `RepairAction`을 반환하는 게 정상인데, `outcome`(gain/손상/비용)은
+   그 라운드가 실제로 실행한 **모든** action의 결합 효과를 반영하면서 `action`은 그중
+   하나만 가리켰다. `branching_runner.py`가 이미 겪은 "`List[X]`는 복수 계약이다, 0번째만
+   쓰는 건 암묵적 단일성 가정이다" 교훈이 기록 계층에서 그대로 재발한 것. **수정**:
+   `CandidateActionRecord.action: RepairAction` → `actions: List[RepairAction] =
+   Field(min_length=1)`로 바꾸고, `build_candidate_action_record`가
+   `branch.rounds[0].executions`의 모든 `.action`을 모은다. 회귀 테스트:
+   `test_build_candidate_action_record_keeps_every_initiating_action_not_just_the_first`
+   (a·b가 동시에 실패해 한 라운드에 2개 action이 실제로 실행되는 것을 직접 확인한 뒤,
+   `record.actions`에 둘 다 남는지 검증).
+6. **Verifier precision/recall 집계의 두 문제** (`annotation.py`): (a) 사람이 합의한
+   `AnnotationOutcome.UNKNOWN`(annotator들이 독립적으로 "판정 불가"에 합의한 경우)이
+   `gold.outcome is None`(= UNRESOLVED) 필터만으로는 걸러지지 않아 "actual_fail이
+   아님"으로 암묵 처리됐다 — gold=UNKNOWN + prediction=FAIL 한 건이 precision을 0.0으로
+   끌어내렸다. **수정**: 공유 필터 `_included_gold_items`를 추가해 gold가 PASS/FAIL이 아닌
+   모든 경우(UNRESOLVED 포함 UNKNOWN 포함)를 명시적으로 제외한다. (b) `compute_stratum_weights`
+   가 가중치 테이블을 만들어도 어떤 지표 계산도 그 값을 실제로 쓰지 않았다 — 층화 표본을
+   오버샘플한 희귀 stratum이 모집단 비율로는 다른 결과를 내야 하는데도 단순 비가중 recall과
+   똑같은 값이 나왔다. **수정**: 새 함수 `compute_weighted_verifier_precision_recall`
+   (Horvitz-Thompson 방식 가중 추정)을 추가했다 — 기존 `compute_verifier_precision_recall`
+   (표본 지표, 비가중)은 그대로 두고 완전히 분리된 별도 함수로 둬서 "표본 지표"와 "가중
+   모집단 추정치"가 하나의 반환값에 섞이지 않는다. 회귀 테스트:
+   `test_compute_verifier_precision_recall_excludes_a_genuine_agreed_unknown_gold`,
+   `test_compute_weighted_verifier_precision_recall_differs_from_the_unweighted_sample_metric`
+   (비가중 recall=0.5, 가중 recall=0.1로 정확히 재현).
+7. **독립 평가자 조건을 레코드 개수로만 검사함** (`annotation.py`): `_resolve_one`이
+   `len(primary) >= 2`만 확인하고 "서로 다른 사람인지"는 전혀 보지 않아, 같은
+   `annotator_id`의 동일 라벨 2개도 AGREED로 통과했다 — 독립성은 "라벨이 몇 개인가"가
+   아니라 "누가 라벨링했는가"의 조건이다. 조정자가 원래 두 primary 중 한 명과 같은
+   `annotator_id`인 경우(자기 불일치를 자기가 조정)도 막히지 않았다. **수정**: 한 task의
+   모든 라벨(primary+adjudicator)에서 `annotator_id`가 중복되면(둘 중 어느 역할이든) 거부
+   — 이 하나의 규칙이 "같은 primary가 두 번" 경우와 "adjudicator가 자기 자신" 경우를 동시에
+   잡는다. 추가로 task_id 불일치(그룹화 키와 라벨 자신의 task_id가 다름)도 거부하도록
+   했다. **추가로 지적된 범위 공백**: `AnnotationStratum`에 성공/실패·stage 축이 없었다 —
+   Notion 6단계 체크리스트 원문이 "trigger/non-trigger와 **성공/실패**를 포함한 표본"을
+   명시적으로 요구하는데, 기존 schema는 `trigger`만 있었다. **수정**: `AnnotationStratum`에
+   `stage: Optional[str]`/`success: Optional[bool]`를 추가하고 `.key`에도 반영했다 — 같은
+   non-trigger라도 실패한 trajectory(미스)와 성공한 trajectory는 서로 다른 stratum이
+   된다. 회귀 테스트: `test_resolve_annotations_raises_on_duplicate_annotator_for_the_same_task`,
+   `test_resolve_annotations_raises_when_adjudicator_is_also_a_primary_labeler`,
+   `test_resolve_annotations_raises_on_task_id_mismatch`,
+   `test_select_balanced_sample_treats_trigger_and_success_as_independent_axes`.
+8. **'관계 누락' 지표가 현재 누락이 아니라 과거 INFERRED edge 수였음** (`schemas.py`/
+   `failure_dataset.py`): `missing_relations_count`가 `store.edges`(전체 이력)에서
+   INFERRED edge를 세어, 그 관계가 이후 재생성으로 현재 버전에 더 이상 적용되지 않아도
+   값이 줄지 않았다(과거에 한 번이라도 발견됐으면 영원히 누적). "지금 몇 개가 누락됐는가"로
+   읽히는 필드명이면서 실제로는 "지금까지 몇 번 발견됐는가"를 세고 있었다. **수정**: 필드를
+   `historical_inferred_relations_count`로 이름 바꿔 누적/이력 값임을 명시하고, 완전히
+   별도의 새 필드 `current_missing_relations_vs_reference`(기본값 `None`)를 추가했다 — 이
+   값은 호출자가 **알고 있는 기준**(`reference_dependency_ids`)과 현재
+   `direct_dependencies()`를 비교해서만 채워진다(일반적인 자동 탐지가 아니라, Stage 2
+   자신의 "자동 reference scanner는 만들지 않는다"는 비목표를 그대로 따름). 새 함수
+   `count_missing_relations_against_reference`가 이 비교를 구현한다.
+   `build_failure_record`는 `injected_fault`가 주어지면 그 fault의 주입 전
+   `read_input_versions`(= 그 artifact가 실제로 무엇에 의존했는지에 대한 알려진 "주입
+   기록")을 기준으로 자동으로 채운다 — 사용자가 제안한 두 방법("알려진 기준 그래프·주입
+   기록") 중 실제로 가진 데이터인 "주입 기록" 쪽을 구현했다. 회귀 테스트:
+   `test_historical_inferred_relations_count_stays_set_after_the_relation_stops_applying`,
+   `test_current_missing_relations_vs_reference_detects_a_dropped_dependency`,
+   `test_build_failure_record_injected_derives_reference_from_the_injected_fault`.
+
+**검증**: `test/core/`에 22개 테스트 추가(`test_fault_injection.py` 10→11,
+`test_failure_dataset.py` 17→26, `test_annotation.py` 16→25, `test_dataset_split.py`
+9→12). `test/core/` 312→334개, `test/evaluation/` 38개 변경 없음. 전체 저장소 기준 880
+passed / 57 failed(Stage 1부터 이미 알려진 것과 정확히 같은 수, 이번 라운드가 새로 깨뜨린
+것 없음).
+
+**아직 하지 않은 것(§5와 동일, 이번 라운드로 바뀌지 않음)**: 실제 자연/주입 실패 수집,
+실제 human annotation 수집, 실제 benchmark에 대한 분할 산출물, `FinalEvaluator` 연결.
+이번 라운드는 메커니즘 자체의 정확성만 다뤘다 — Notion 체크리스트 박스는 여전히 올리지
+않았다.

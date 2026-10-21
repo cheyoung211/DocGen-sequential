@@ -378,6 +378,14 @@ class ContentPreservationScore(BaseModel):
     until Stage 2's versioned artifact store lands. Until then every
     ``FinalEvaluator`` must leave the score fields ``None`` and set
     ``not_implemented_reason`` -- never fabricate a number.
+
+    First real implementation: ``failure_dataset._compute_damage`` (Stage
+    6). ``newly_broken_artifacts`` means "has a live FAIL (or is currently
+    stale) in the final checkpoint" -- NEVER a bare before/after content
+    string comparison. A review caught that a plain string diff conflates
+    a harmless, legitimate content refresh (e.g. a successful regeneration
+    whose wording simply changed) with an actual new error; the two must
+    stay distinguishable, and only the latter counts as damage.
     """
 
     preserved_fraction: Optional[float] = None
@@ -1448,18 +1456,44 @@ class FailureDifficultyProfile(BaseModel):
     uses to decide when a failure's blast radius extends beyond itself;
     reused here rather than redefined, so "difficulty" and "repair scope
     selection" never quietly drift apart.
-    ``missing_relations_count``: number of ``DependencyEdge``s of
-    ``relation=INFERRED`` touching this artifact (as either endpoint),
-    across the full edge history -- each one is, by construction, a
-    relation that was NOT declared at generation time and had to be added
-    after the fact (``ArtifactGraphStore.add_inferred_edge``), i.e. a
-    concrete instance of "관계 누락."
+    ``historical_inferred_relations_count``: number of ``DependencyEdge``s
+    of ``relation=INFERRED`` ever recorded touching this artifact (as
+    either endpoint), across the FULL edge history -- each one is, by
+    construction, a relation that was NOT declared at generation time and
+    had to be added after the fact (``ArtifactGraphStore.add_inferred_edge``).
+    Named (and renamed from an earlier ``missing_relations_count``) to be
+    explicit that this is a cumulative, historical count, never a
+    current-state one: a review caught that an INFERRED edge recorded
+    against a since-superseded version of this artifact stayed counted
+    here forever, even after that version stopped being current and the
+    relation it described stopped applying at all (``ArtifactGraphStore.
+    direct_dependencies`` would no longer return it) -- reading this field
+    as "how many relations are missing RIGHT NOW" is exactly the mistake
+    that review was reacting to. It remains a legitimate difficulty signal
+    in its own right (an artifact whose documented dependencies have
+    needed correction more often is plausibly harder/more error-prone),
+    just not a snapshot-at-this-moment one.
+    ``current_missing_relations_vs_reference``: ``None`` unless a caller
+    supplied a known-correct reference dependency set for this artifact
+    (``classify_failure_difficulty``'s ``reference_dependency_ids``) --
+    e.g. an ``InjectedFault``'s own pre-injection ``read_input_versions``,
+    which IS a genuine, currently-known ground truth for what this
+    artifact is supposed to depend on. When supplied, this is the count of
+    reference ids NOT currently reflected in ``ArtifactGraphStore.
+    direct_dependencies`` -- a properly current-scoped "관계 누락" measure,
+    kept as its own field rather than overloading the historical count
+    above with a second, incompatible meaning. General automatic
+    current-missingness detection (inferring the "correct" dependency set
+    with no reference at all) is out of scope here, the same as Stage 2's
+    own "no automatic reference scanner" non-goal (``ArtifactGraphStore.
+    add_inferred_edge``'s docstring).
     """
 
     dependency_depth: int = Field(ge=0)
     fan_out: int = Field(ge=0)
     shared_definition_use: bool
-    missing_relations_count: int = Field(ge=0)
+    historical_inferred_relations_count: int = Field(ge=0)
+    current_missing_relations_vs_reference: Optional[int] = Field(default=None, ge=0)
 
 
 class FailureRecord(BaseModel):
@@ -1496,25 +1530,49 @@ class RepairGainScore(BaseModel):
     concrete on top of Stage 4's already-computed, already-reviewed
     ``BranchExecutionResult``.
 
-    ``outcome_counts`` maps each ``RepairOutcome`` value seen to how many
-    distinct artifact_ids resolved to it, by the END of the whole branch
-    (every round merged via ``BranchExecutionResult``'s own documented
-    last-write-wins rule, read only through ``RepairExecutionResult.
-    final_outcome_by_artifact`` -- never by independently re-scanning
-    ``regenerated``/``reverified_untouched``, exactly the mistake that
-    schema's own docstring warns every external caller against).
-    ``gain`` is ``outcome_counts["resolved"] / sum(outcome_counts.values())``;
-    left ``None`` with ``not_implemented_reason`` set when the denominator
-    is 0 (nothing in this branch ever reached a final outcome -- e.g. the
-    very first action was rejected for budget) rather than fabricated as
-    0.0, the same "never silently backfill" discipline
-    ``ContentPreservationScore``/``VerifierPrecisionRecall`` already use.
-    ``damage`` is computed by comparing the source checkpoint's stored
-    content against ``BranchExecutionResult.final_checkpoint`` for every
-    artifact_id NOT present in ``outcome_counts``'s underlying per-artifact
-    map -- i.e. every artifact this branch's cascade never even visited;
-    any content difference found there is, by construction, unrelated to
-    what the branch was actually trying to fix.
+    A review caught that the first draft's denominator -- "every artifact
+    this branch's own cascade happened to produce a final outcome for" --
+    was branch-dependent: a narrow action that only ever attempted 1 of 2
+    originally-failing artifacts reported ``gain=1.0`` (1/1) by silently
+    never counting the one it ignored, and a branch that left an artifact
+    ``left_stale`` (cascaded into it, but never got back to re-checking it
+    before stopping) dropped that artifact from the denominator entirely
+    for the identical reason -- ``RepairExecutionResult.left_stale``'s own
+    docstring already says such an artifact is absent from
+    ``final_outcome_by_artifact`` by design, which this class's gain
+    computation must NOT read as "nothing to count here."
+
+    Fixed by requiring every caller (``failure_dataset.
+    compute_repair_gain_score``) to supply one COMMON
+    ``target_artifact_ids`` set -- decided once per source checkpoint,
+    from the artifacts that were actually failing before ANY branch ran,
+    identical across every branch/candidate action being compared from
+    that checkpoint -- rather than letting each branch's own cascade
+    silently define its own denominator. ``outcome_counts`` maps each
+    ``RepairOutcome`` value seen, PLUS the sentinel key
+    ``"left_stale_or_unresolved"`` (never a real ``RepairOutcome`` value --
+    an UNKNOWN/left-stale target must never be silently promoted to FAIL or
+    quietly dropped either), to how many of ``target_artifact_ids``
+    resolved to it; every id in ``target_artifact_ids`` is accounted for in
+    exactly one bucket, so ``sum(outcome_counts.values()) ==
+    len(target_artifact_ids)`` always. ``gain`` is
+    ``outcome_counts.get("resolved", 0) / len(target_artifact_ids)``; the
+    only way it is left ``None`` (with ``not_implemented_reason`` set) is
+    an empty ``target_artifact_ids`` itself -- never a 0-sized internal
+    denominator, since the denominator is now fixed up front.
+
+    ``damage`` is computed over every artifact_id that existed in the
+    source checkpoint and is NOT in ``target_artifact_ids`` -- i.e. the set
+    of artifacts that were healthy BEFORE this repair started and were
+    never meant to be touched, decided at the same time as
+    ``target_artifact_ids`` and for the same reason: a review found the
+    original "skip whatever this branch's own cascade happened to visit"
+    rule let a previously-healthy artifact that got swept into a WIDE
+    repair action (e.g. whole-document regeneration) and came out actually
+    FAILING be silently excluded from damage just because it was, in fact,
+    visited. "Visited by this branch" and "was this artifact supposed to
+    be touched at all" are different questions; only the second one should
+    gate damage.
     """
 
     outcome_counts: Dict[str, int] = Field(default_factory=dict)
@@ -1525,13 +1583,27 @@ class RepairGainScore(BaseModel):
 
 
 class CandidateActionRecord(BaseModel):
-    """One ``(checkpoint, candidate repair action, downstream result)``
+    """One ``(checkpoint, candidate repair action(s), downstream result)``
     triple -- the unit revision direction 4's benchmark spec asks to store
     ("초기 상태, 오류 근거, 의존관계, 후보 복구 범위, 독립 평가 기준, 행동별
     결과와 비용"). Links back to the ``FailureRecord`` that triggered this
     branch rather than re-embedding it, so the same failure's several
     candidate actions (one ``CandidateActionRecord`` per ``BranchSpec``)
     never duplicate the difficulty-classification/evidence payload.
+
+    ``actions`` (plural) holds EVERY ``RepairAction`` the branch's own
+    initiating round actually executed, not only the first. A review
+    caught that a policy's ``decide()`` legitimately returns more than one
+    independent action in one call (e.g. ``FixedGraphAwareRepairPolicy``
+    returns one action per distinct failing artifact) -- recording only
+    ``actions[0]`` left ``outcome``'s gain/damage/cost reflecting the
+    combined effect of EVERY action that round actually ran, while
+    ``actions`` silently named only one of them, misattributing the full
+    combined result to a single, partial cause. This is the same
+    "``List[X]`` is a plural contract, consuming only element 0 is an
+    unstated cardinality assumption" lesson ``branching_runner.py`` already
+    had to learn once, recurring here one layer up, at the recording
+    layer rather than the execution layer.
     """
 
     dataset_version: str = "v1"
@@ -1539,7 +1611,7 @@ class CandidateActionRecord(BaseModel):
     failure_id: str
     source_checkpoint_id: str
     branch_label: str
-    action: RepairAction
+    actions: List[RepairAction] = Field(min_length=1)
     outcome: RepairGainScore
     rounds_executed: int = Field(ge=0)
 
@@ -1560,13 +1632,30 @@ class AnnotationOutcome(str, Enum):
 
 class AnnotationStratum(BaseModel):
     """The sampling/reporting strata ``docs/stage1_experiment_design.md``
-    §2 names: ``Domain``/``Difficulty`` (``src/dataset/schemas.py``) plus
-    the online-trigger split -- all three optional except ``trigger``
-    because a failure/action-dataset task may not always have a resolvable
-    domain/difficulty (e.g. one built from a synthetic fake in a test)."""
+    §2 names: ``Domain``/``Difficulty``/stage (``src/dataset/schemas.py``/
+    ``src/evaluation/schemas.py::Stage``) plus the online-trigger split --
+    all optional except ``trigger`` because a failure/action-dataset task
+    may not always have a resolvable domain/difficulty/stage (e.g. one
+    built from a synthetic fake in a test).
+
+    ``success`` was added after a review found the ORIGINAL Stage 6
+    checklist line itself -- "trigger/non-trigger와 성공/실패를 포함한 표본을
+    사람이 평가하고" -- names success/failure as its own required coverage
+    axis, independent of ``trigger``: a sample can be non-trigger (the
+    online verifier never fired) yet still belong to an ultimately FAILED
+    trajectory (a miss), or trigger yet belong to a trajectory that
+    succeeded after repair. Collapsing these into ``trigger`` alone would
+    make the trigger x success/failure 2x2 -- exactly what a verifier
+    precision/recall analysis needs to see broken out (true/false
+    positives/negatives) -- unrepresentable as a stratum at all. ``stage``
+    was added for the same reason the design doc's own stratification list
+    already named it but this model had never carried it.
+    """
 
     domain: Optional[str] = None
     difficulty: Optional[str] = None
+    stage: Optional[str] = None
+    success: Optional[bool] = None
     trigger: bool
 
     @property
@@ -1575,7 +1664,10 @@ class AnnotationStratum(BaseModel):
         ``annotation.compute_stratum_weights``/agreement-by-stratum
         reporting -- defined once here so two call sites can never compute
         slightly different strings for "the same" stratum."""
-        return f"domain={self.domain}|difficulty={self.difficulty}|trigger={self.trigger}"
+        return (
+            f"domain={self.domain}|difficulty={self.difficulty}|stage={self.stage}|"
+            f"success={self.success}|trigger={self.trigger}"
+        )
 
 
 class AnnotationTask(BaseModel):

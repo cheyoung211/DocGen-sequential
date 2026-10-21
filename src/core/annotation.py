@@ -83,10 +83,16 @@ def resolve_annotations(labels_by_task: Dict[str, List[AnnotationLabel]]) -> Dic
     a resolved outcome; it does not also need to borrow the real
     ``AnnotationOutcome.UNKNOWN`` value to do that.
 
-    Raises ``ValueError`` if a task has fewer than 2 non-adjudicator labels
-    (the protocol's minimum), or if its non-adjudicator labels disagree but
-    no adjudicator label was supplied -- both are caller/data errors, not
-    states this function should silently paper over.
+    Raises ``ValueError`` if: a label's own ``task_id`` does not match the
+    key it was grouped under; any two labels for the same task (primary or
+    adjudicator) come from the same ``annotator_id`` (a review's explicit
+    concern -- the protocol requires independent annotators, and neither
+    "the same primary labeler counted twice" nor "a primary labeler also
+    adjudicating their own disagreement" is independence, and neither was
+    being checked at all before); a task has fewer than 2 primary labels;
+    or its primary labels disagree with no adjudicator supplied. All are
+    caller/data errors, not states this function should silently paper
+    over.
     """
     resolved: Dict[str, ResolvedAnnotation] = {}
     for task_id, labels in labels_by_task.items():
@@ -95,6 +101,24 @@ def resolve_annotations(labels_by_task: Dict[str, List[AnnotationLabel]]) -> Dic
 
 
 def _resolve_one(task_id: str, labels: List[AnnotationLabel]) -> ResolvedAnnotation:
+    mismatched = [label for label in labels if label.task_id != task_id]
+    if mismatched:
+        raise ValueError(
+            f"labels_by_task[{task_id!r}] contains a label actually stamped with task_id "
+            f"{mismatched[0].task_id!r} -- labels must be grouped under their own task_id, "
+            "never reassigned to a different key."
+        )
+
+    annotator_ids = [label.annotator_id for label in labels]
+    duplicated = {annotator_id for annotator_id in annotator_ids if annotator_ids.count(annotator_id) > 1}
+    if duplicated:
+        raise ValueError(
+            f"task {task_id!r} has more than one label from annotator(s) {sorted(duplicated)!r} -- "
+            "the protocol requires independent annotators: the same person cannot contribute two "
+            "labels for one task, whether as two 'independent' primaries, or as both a primary "
+            "labeler and that same task's own adjudicator."
+        )
+
     primary = [label for label in labels if not label.is_adjudicator]
     adjudicators = [label for label in labels if label.is_adjudicator]
     if len(primary) < 2:
@@ -211,26 +235,47 @@ def compute_stratum_weights(
     return weights
 
 
+def _included_gold_items(gold: Dict[str, ResolvedAnnotation], predictions: Dict[str, CheckOutcome]):
+    """Shared filter for both the unweighted and weighted precision/recall
+    computations below -- a task is included only if its gold is a real,
+    valid PASS/FAIL human consensus (excludes ``UNRESOLVED``, where
+    ``outcome`` is structurally ``None``, AND a review-caught gap: a
+    genuine, AGREED gold of ``AnnotationOutcome.UNKNOWN`` -- annotators who
+    independently agreed they could not tell -- which the first draft let
+    fall through to "not actual_fail," silently scoring it as if the
+    annotators had agreed PASS) and the verifier's own prediction for it is
+    PASS or FAIL (excludes a verifier UNKNOWN the same way). Yields
+    ``(task_id, resolved, predicted_fail, actual_fail)`` for each included
+    task so both callers apply the identical inclusion rule -- a precision/
+    recall pair computed with two different filters would not be
+    comparable at all.
+    """
+    for task_id, resolved in gold.items():
+        if resolved.outcome not in (AnnotationOutcome.PASS, AnnotationOutcome.FAIL):
+            continue
+        predicted = predictions.get(task_id)
+        if predicted not in (CheckOutcome.PASS, CheckOutcome.FAIL):
+            continue
+        yield task_id, resolved, predicted == CheckOutcome.FAIL, resolved.outcome == AnnotationOutcome.FAIL
+
+
 def compute_verifier_precision_recall(
     predictions: Dict[str, CheckOutcome],
     gold: Dict[str, ResolvedAnnotation],
 ) -> VerifierPrecisionRecall:
-    """Online ``Validator`` precision/recall against the resolved human
-    gold, with FAIL as the positive class (direction 2's own framing: a
-    verifier "triggers" by reporting FAIL). ``interfaces.FinalEvaluator``'s
-    docstring already forbids reusing the online stream as the gold label
-    itself -- ``gold`` here must come only from ``resolve_annotations``,
-    never from ``predictions``' own source.
+    """RAW, UNWEIGHTED sample-level online ``Validator`` precision/recall
+    against the resolved human gold, with FAIL as the positive class
+    (direction 2's own framing: a verifier "triggers" by reporting FAIL).
+    ``interfaces.FinalEvaluator``'s docstring already forbids reusing the
+    online stream as the gold label itself -- ``gold`` here must come only
+    from ``resolve_annotations``, never from ``predictions``' own source.
 
-    A task counts toward ``sample_size`` only if its gold is actually
-    resolved (``ResolvedLabelStatus`` other than ``UNRESOLVED`` --
-    enforced structurally by ``ResolvedAnnotation`` itself, since an
-    ``UNRESOLVED`` entry's ``outcome`` is always ``None``) AND the
-    verifier's own prediction for it is PASS or FAIL (a verifier UNKNOWN is
-    excluded from this comparison, not silently counted as a miss on
-    either side -- ``CheckOutcome.UNKNOWN`` already means "could not
-    determine," which is not evidence of correctness or incorrectness
-    either way).
+    This is the per-sample metric, treating every included task as equally
+    weighted regardless of which stratum it came from -- see
+    ``compute_weighted_verifier_precision_recall`` for the SEPARATE,
+    population-level estimate a stratified sample needs instead (a review
+    caught that conflating the two silently returned the unweighted number
+    where a population estimate was expected).
 
     ``precision``/``recall`` stay ``None`` when their respective
     denominator (predicted-FAIL count / actual-FAIL count) is 0, rather
@@ -243,16 +288,8 @@ def compute_verifier_precision_recall(
     actual_positive = 0
     sample_size = 0
 
-    for task_id, resolved in gold.items():
-        if resolved.outcome is None:
-            continue
-        predicted = predictions.get(task_id)
-        if predicted not in (CheckOutcome.PASS, CheckOutcome.FAIL):
-            continue
-
+    for _task_id, _resolved, predicted_fail, actual_fail in _included_gold_items(gold, predictions):
         sample_size += 1
-        predicted_fail = predicted == CheckOutcome.FAIL
-        actual_fail = resolved.outcome == AnnotationOutcome.FAIL
         if predicted_fail:
             predicted_positive += 1
         if actual_fail:
@@ -262,4 +299,70 @@ def compute_verifier_precision_recall(
 
     precision = (true_positive / predicted_positive) if predicted_positive > 0 else None
     recall = (true_positive / actual_positive) if actual_positive > 0 else None
+    return VerifierPrecisionRecall(precision=precision, recall=recall, sample_size=sample_size)
+
+
+def compute_weighted_verifier_precision_recall(
+    predictions: Dict[str, CheckOutcome],
+    gold: Dict[str, ResolvedAnnotation],
+    task_strata: Dict[str, str],
+    weights: Dict[str, StratumWeight],
+) -> VerifierPrecisionRecall:
+    """POPULATION-LEVEL, stratum-weighted precision/recall -- Stage 6's
+    completion criterion "계층별 표본을 사용했다면 전체 비율 추정에 필요한
+    가중치를 적용한다" actually applied to a metric, not merely available as
+    a separate, never-used weight table (a review caught that
+    ``compute_stratum_weights`` existed but nothing in this module actually
+    used its output: a stratified sample that deliberately oversampled a
+    rare stratum reported the SAME recall as the naive unweighted version,
+    silently overweighting that stratum's cases in the result).
+
+    Standard stratified (Horvitz-Thompson-style) estimator: every
+    included task's contribution to true-positive/predicted-positive/
+    actual-positive is scaled by ``weights[task_strata[task_id]].weight``
+    before summing, so a stratum sampled above its true population rate
+    contributes proportionally less to the final estimate, and one
+    undersampled contributes more. Uses the SAME inclusion filter as
+    ``compute_verifier_precision_recall`` (``_included_gold_items``) --
+    the two numbers must differ only in weighting, never in which tasks
+    they are computed over.
+
+    ``sample_size`` on the returned object is still the RAW, unweighted
+    count of included tasks (how many real human-labeled comparisons went
+    into this estimate) -- only ``precision``/``recall`` themselves are
+    weighted; conflating the two would make it impossible to tell a
+    population estimate's sample size from its (differently-scaled)
+    statistical weight.
+
+    Raises ``ValueError`` if any included task's stratum
+    (``task_strata[task_id]``) has no entry in ``weights`` -- the same
+    "never silently omit a stratum from a weighted estimate" discipline
+    ``compute_stratum_weights`` itself already enforces when building that
+    table.
+    """
+    weighted_true_positive = 0.0
+    weighted_predicted_positive = 0.0
+    weighted_actual_positive = 0.0
+    sample_size = 0
+
+    for task_id, _resolved, predicted_fail, actual_fail in _included_gold_items(gold, predictions):
+        sample_size += 1
+        stratum_key = task_strata.get(task_id)
+        if stratum_key is None or stratum_key not in weights:
+            raise ValueError(
+                f"task {task_id!r} has no resolvable stratum weight "
+                f"(stratum_key={stratum_key!r}) -- every included task must have an entry "
+                "in both task_strata and weights; omitting one would silently bias the "
+                "population estimate without saying so."
+            )
+        weight = weights[stratum_key].weight
+        if predicted_fail:
+            weighted_predicted_positive += weight
+        if actual_fail:
+            weighted_actual_positive += weight
+        if predicted_fail and actual_fail:
+            weighted_true_positive += weight
+
+    precision = (weighted_true_positive / weighted_predicted_positive) if weighted_predicted_positive > 0 else None
+    recall = (weighted_true_positive / weighted_actual_positive) if weighted_actual_positive > 0 else None
     return VerifierPrecisionRecall(precision=precision, recall=recall, sample_size=sample_size)

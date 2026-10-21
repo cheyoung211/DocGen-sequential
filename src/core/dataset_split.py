@@ -8,6 +8,22 @@ by family (document_type/topic/graph-structure-bucket) first, then assign
 whole families to a split -- never individual samples -- so a template,
 topic, or graph structure that appears in train/dev never also appears in
 test.
+
+**Grouping is connected-components over the three attributes individually,
+not an exact-tuple match.** A review caught that the first draft grouped
+samples only when ALL THREE of ``document_type``/``topic``/
+``graph_structure_bucket`` matched at once (``SplitFamilyKey.key``, a
+plain tuple-equality key) -- two samples sharing the same ``document_type``
+and ``graph_structure_bucket`` but a different ``topic`` landed in
+*different* groups and could legally be split across train/dev/test, even
+though that is exactly the leak the checklist's "template·topic·graph 구조를
+고려한" wording forbids for EACH axis independently, not only for their
+joint combination. "No value of any single axis crosses a split boundary"
+is only satisfiable by grouping every sample that shares ANY one of the
+three attribute values into one connected component (``_group_by_shared_attribute``)
+-- a strictly coarser, and the only correct, partition: if two samples
+sharing one axis value ended up in different components, that axis value
+would necessarily appear in two different splits.
 """
 
 from __future__ import annotations
@@ -16,6 +32,48 @@ import random
 from typing import Dict, List
 
 from src.core.schemas import DatasetSplit, SplitAssignment, SplitFamilyKey, SplitName
+
+
+def _group_by_shared_attribute(sample_families: Dict[str, SplitFamilyKey]) -> Dict[str, List[str]]:
+    """Union-find over ``sample_families``: two samples end up in the same
+    group iff they are connected by a chain of shared ``document_type``,
+    ``topic``, or ``graph_structure_bucket`` values -- not only when all
+    three match simultaneously. Returns ``{group_root_sample_id: [member
+    sample_ids]}``; the root is just whichever sample_id the union-find
+    happened to settle on, not a meaningful identity of its own.
+    """
+    parent: Dict[str, str] = {sample_id: sample_id for sample_id in sample_families}
+
+    def find(x: str) -> str:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_a] = root_b
+
+    by_attribute_value: Dict[str, List[str]] = {}
+    for sample_id, family_key in sample_families.items():
+        for attribute_value in (
+            f"document_type:{family_key.document_type}",
+            f"topic:{family_key.topic}",
+            f"graph_structure_bucket:{family_key.graph_structure_bucket}",
+        ):
+            by_attribute_value.setdefault(attribute_value, []).append(sample_id)
+
+    for members in by_attribute_value.values():
+        for other in members[1:]:
+            union(members[0], other)
+
+    groups: Dict[str, List[str]] = {}
+    for sample_id in sample_families:
+        groups.setdefault(find(sample_id), []).append(sample_id)
+    return groups
 
 
 class HeldOutSplitLockedError(RuntimeError):
@@ -51,15 +109,24 @@ def build_fixed_split(
 ) -> DatasetSplit:
     """Assign every ``sample_id`` in ``sample_families`` to TRAIN/DEV/TEST.
 
-    Samples sharing the same ``SplitFamilyKey.key`` are always assigned
-    together, as one unit -- the hard constraint this function exists to
-    satisfy. Families are then greedily assigned, in a ``seed``-shuffled
-    order, to whichever split is currently furthest below its target count
+    Samples connected by a shared ``document_type``, ``topic``, or
+    ``graph_structure_bucket`` value -- transitively, via
+    ``_group_by_shared_attribute`` -- are always assigned together, as one
+    unit; this, not plain ``SplitFamilyKey`` tuple-equality, is the hard
+    constraint this function exists to satisfy (see the module docstring).
+    Groups are then greedily assigned, in a ``seed``-shuffled order, to
+    whichever split is currently furthest below its target count
     (``train_frac``/``dev_frac``/``test_frac`` of the total sample count) --
     a best-effort approximation of the target ratios, since the hard
-    family-grouping constraint can make an exact ratio impossible (e.g. one
-    family containing most of the pool). Deterministic given the same
-    inputs and ``seed``.
+    grouping constraint can make an exact ratio impossible, and is now
+    *more* likely to dominate than a naive tuple-based grouping would
+    suggest: a single widely-reused ``document_type`` (or ``topic``, or
+    ``graph_structure_bucket``) value can transitively pull a large
+    fraction of all samples into one group. Deterministic given the same
+    inputs and ``seed``. Each ``SplitAssignment.family_key`` records that
+    sample's OWN ``document_type``/``topic``/``graph_structure_bucket`` for
+    audit purposes -- not the (otherwise-meaningless) internal union-find
+    group id it was actually grouped by.
 
     Raises ``ValueError`` if ``sample_families`` is empty or the three
     fractions do not sum to 1.0.
@@ -70,14 +137,9 @@ def build_fixed_split(
     if abs(total_frac - 1.0) > 1e-9:
         raise ValueError(f"train_frac + dev_frac + test_frac must sum to 1.0, got {total_frac}.")
 
-    families: Dict[str, List[str]] = {}
-    key_objects: Dict[str, SplitFamilyKey] = {}
-    for sample_id, family_key in sample_families.items():
-        families.setdefault(family_key.key, []).append(sample_id)
-        key_objects[family_key.key] = family_key
-
-    family_order = sorted(families)
-    random.Random(seed).shuffle(family_order)
+    groups = _group_by_shared_attribute(sample_families)
+    group_order = sorted(groups)
+    random.Random(seed).shuffle(group_order)
 
     total_samples = len(sample_families)
     targets = {
@@ -88,8 +150,8 @@ def build_fixed_split(
     assigned_counts = {SplitName.TRAIN: 0, SplitName.DEV: 0, SplitName.TEST: 0}
 
     assignments: List[SplitAssignment] = []
-    for family_key_str in family_order:
-        sample_ids = sorted(families[family_key_str])
+    for group_root in group_order:
+        sample_ids = sorted(groups[group_root])
         chosen = max(SplitName, key=lambda split: targets[split] - assigned_counts[split])
         assigned_counts[chosen] += len(sample_ids)
         for sample_id in sample_ids:
@@ -97,7 +159,7 @@ def build_fixed_split(
                 SplitAssignment(
                     dataset_version=dataset_version,
                     sample_id=sample_id,
-                    family_key=key_objects[family_key_str],
+                    family_key=sample_families[sample_id],
                     split=chosen,
                 )
             )

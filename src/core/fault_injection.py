@@ -27,9 +27,26 @@ Each ``inject_*`` method:
    "read the live state, don't trust a stale pointer" discipline
    ``repair_operations.py`` already follows).
 2. Writes exactly one new version per touched artifact through the public
-   ``add_version`` API, with ``read_input_versions`` echoing the pre-
-   injection version so the injection itself becomes a normal, auditable
-   edge in the dependency graph -- not a special-cased mutation path.
+   ``add_version`` API, with ``read_input_versions`` echoing the artifact's
+   OWN pre-injection ``read_input_versions`` -- i.e. whatever real upstream
+   artifacts it was actually built from (``current.ref.read_input_versions``)
+   -- never ``[current.ref]`` (the artifact's own previous version). A
+   review caught that passing ``[current.ref]`` models "this version
+   depends on its own prior version" as a real semantic ``DependencyEdge``,
+   which is wrong on two counts: (a) version history is already tracked by
+   the store's own version list, with no edge needed at all, and (b) doing
+   so creates a self-loop edge that pollutes both
+   ``direct_dependents``/``direct_dependencies`` (the corrupted artifact
+   now appears to depend on, and be depended on by, itself) AND silently
+   severs the REAL upstream edge: `_current_dependents`'s "currently
+   applicable" filter drops any edge whose ``to_artifact`` is no longer
+   that artifact's latest version, so the moment a new version is written
+   with no real input re-declared, the genuine upstream dependency
+   (recorded against the now-superseded old version) stops counting, and
+   a later change to that real upstream artifact no longer propagates
+   staleness forward at all. Re-declaring the real ``read_input_versions``
+   keeps the genuine dependency chain intact across the injection -- the
+   fault corrupts *content*, never the artifact's documented provenance.
 3. Returns an ``InjectedFault`` recording what changed and, via
    ``store.impact_candidates`` evaluated *after* the write, which
    artifacts the injector itself predicts should be affected -- kept
@@ -101,7 +118,7 @@ class FaultInjector:
             theorem_ref.artifact_id,
             current.ref.kind,
             content=corrupted,
-            read_input_versions=[current.ref],
+            read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
         predicted = sorted(store.impact_candidates(theorem_ref.artifact_id) - {theorem_ref.artifact_id})
@@ -153,7 +170,7 @@ class FaultInjector:
             table_ref.artifact_id,
             ArtifactKind.TABLE,
             content=corrupted,
-            read_input_versions=[current.ref],
+            read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
         predicted = sorted(store.impact_candidates(table_ref.artifact_id) - {table_ref.artifact_id})
@@ -202,14 +219,14 @@ class FaultInjector:
             section_a_ref.artifact_id,
             current_a.ref.kind,
             content=content_a,
-            read_input_versions=[current_a.ref],
+            read_input_versions=current_a.ref.read_input_versions,
             produced_by=produced_by,
         )
         result_b = store.add_version(
             section_b_ref.artifact_id,
             current_b.ref.kind,
             content=content_b,
-            read_input_versions=[current_b.ref],
+            read_input_versions=current_b.ref.read_input_versions,
             produced_by=produced_by,
         )
         predicted = sorted(
@@ -259,7 +276,7 @@ class FaultInjector:
             document_ref.artifact_id,
             current.ref.kind,
             content=corrupted,
-            read_input_versions=[current.ref],
+            read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
         predicted = sorted(store.impact_candidates(document_ref.artifact_id) - {document_ref.artifact_id})

@@ -70,6 +70,46 @@ def test_inject_missing_assumption_raises_when_text_not_present() -> None:
         FaultInjector().inject_missing_assumption(store, theorem_ref, assumption_text="Assume X > 0.")
 
 
+def test_injection_preserves_real_upstream_dependency_not_a_self_loop() -> None:
+    """Repro from the user's review: A -> B -> T (T reads B, B reads A).
+    Injecting into T must NOT replace T's real dependency on B with a
+    self-reference to T's own previous version -- that would both fabricate
+    a phantom self-loop (T depends on itself) and sever the real B -> T
+    edge (since the store's "currently applicable edge" filter drops any
+    edge pointing at a version of T that is no longer latest)."""
+    from src.core.failure_dataset import classify_failure_difficulty
+
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.DEFINITION, content="b uses a", read_input_versions=[a_ref])
+    b_ref = store.latest("b").ref
+    store.add_version(
+        "t", ArtifactKind.CLAIM, content="Assume X > 0. Conclusion uses b.", read_input_versions=[b_ref]
+    )
+    t_ref = store.latest("t").ref
+
+    assert classify_failure_difficulty(store, "t").dependency_depth == 2
+    assert classify_failure_difficulty(store, "t").fan_out == 0
+
+    FaultInjector().inject_missing_assumption(store, t_ref, assumption_text="Assume X > 0. ")
+
+    # The real upstream dependency on b must still be declared -- not a
+    # self-reference to t's own prior version.
+    new_t = store.latest("t")
+    assert new_t.ref.version == 2
+    assert [r.artifact_id for r in new_t.ref.read_input_versions] == ["b"]
+
+    # Depth/fan-out must be unaffected by the injection -- only content changed.
+    profile_after = classify_failure_difficulty(store, "t")
+    assert profile_after.dependency_depth == 2
+    assert profile_after.fan_out == 0  # no phantom self-dependent
+
+    # A later change to A must still propagate staleness through B to T.
+    store.add_version("a", ArtifactKind.DEFINITION, content="a changed", read_input_versions=[])
+    assert store.is_stale("t") is True
+
+
 # ---------------------------------------------------------------------------
 # inject_altered_denominator
 # ---------------------------------------------------------------------------
