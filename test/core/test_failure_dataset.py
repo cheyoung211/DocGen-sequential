@@ -20,6 +20,7 @@ from src.core.artifact_graph import ArtifactGraphStore, UnknownArtifactError
 from src.core.branching_runner import BranchingRunner, BranchSpec
 from src.core.fault_injection import FaultInjector
 from src.core.failure_dataset import (
+    ALREADY_HEALTHY_UNTOUCHED,
     LEFT_STALE_OR_UNRESOLVED,
     _dependency_depth,
     _merge_final_outcomes,
@@ -755,6 +756,84 @@ def test_repair_gain_score_does_not_trust_a_resolved_verdict_the_final_state_has
     assert score.outcome_counts == {LEFT_STALE_OR_UNRESOLVED: 1}
 
 
+def test_repair_gain_score_already_healthy_untouched_counts_toward_gain() -> None:
+    """Main repro from a third review: "a" fails, "b" already has a
+    valid PASS recorded against it. A narrow branch correctly repairs
+    only "a" and leaves "b" completely alone; a wide sibling branch's
+    action redundantly regenerates BOTH "a" and "b" (both end up fine).
+    compute_common_target_artifact_ids correctly pulls "b" into the
+    COMMON target purely via the wide branch's own history -- but the
+    narrow branch never touched "b" at all, and "b" was never actually a
+    problem, so it must not be scored as if the narrow branch had ignored
+    a real one."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    store.add_version("b", ArtifactKind.SECTION, content="orig-b")
+    b_ref = store.latest("b").ref
+    store.record_evidence(
+        Evidence(constraint_id="c:b", outcome=CheckOutcome.PASS, checked_artifact=b_ref, detail="already fine")
+    )
+    checkpoint = store.save_checkpoint()
+    refs = {"a": store.latest("a").ref, "b": b_ref}
+    trigger_evidence = [_fail_evidence(refs["a"])]
+
+    branch_narrow = _run_branch(checkpoint, [refs["a"]], producer=_FakeProducer(), validator=_FakeValidator())
+    branch_wide = _run_branch(
+        checkpoint,
+        [refs["a"]],
+        producer=_FakeProducer(),
+        validator=_FakeValidator(),
+        policy=_AlsoRegenerate(refs["b"]),
+    )
+    # Sanity-check the premise: the narrow branch truly never touched "b".
+    assert "b" not in _merge_final_outcomes(branch_narrow)
+    assert "b" in _merge_final_outcomes(branch_wide)
+
+    comparison = BranchComparisonResult(
+        source_checkpoint_id=checkpoint.checkpoint_id, branches=[branch_narrow, branch_wide]
+    )
+    target_ids = compute_common_target_artifact_ids(comparison, triggering_evidence=trigger_evidence)
+    assert target_ids == {"a", "b"}  # "b" is swept in purely via the wide branch's own history
+
+    score_narrow = compute_repair_gain_score(
+        checkpoint, branch_narrow, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+    score_wide = compute_repair_gain_score(
+        checkpoint, branch_wide, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+
+    assert score_narrow.outcome_counts == {RepairOutcome.RESOLVED.value: 1, ALREADY_HEALTHY_UNTOUCHED: 1}
+    assert score_narrow.gain == 1.0
+    assert score_wide.outcome_counts == {RepairOutcome.RESOLVED.value: 2}
+    assert score_wide.gain == 1.0
+
+
+def test_repair_gain_score_already_healthy_untouched_does_not_apply_to_a_genuinely_broken_target() -> None:
+    """The guard that keeps the new sentinel from over-reaching: a target
+    absent from this branch's own history that IS genuinely broken in
+    this branch's final state (the original orphaned-dependent repro,
+    not a redundant touch) must stay LEFT_STALE_OR_UNRESOLVED, never be
+    reclassified as "already healthy" just because it was never directly
+    attempted."""
+    checkpoint, refs = _checkpoint_with_dependency("a", "b")
+    trigger = [refs["a"]]
+    branch = _run_branch(
+        checkpoint,
+        trigger,
+        producer=_FakeProducer(),
+        validator=_FakeValidator(),
+        constraint_provider=lambda ref: [] if ref.artifact_id == "b" else _one_constraint_per_artifact(ref),
+    )
+    assert "b" not in _merge_final_outcomes(branch)
+
+    score = compute_repair_gain_score(
+        checkpoint, branch, target_artifact_ids={"a", "b"}, triggering_evidence=[_fail_evidence(refs["a"])]
+    )
+
+    assert score.outcome_counts == {RepairOutcome.RESOLVED.value: 1, LEFT_STALE_OR_UNRESOLVED: 1}
+    assert score.gain == 0.5
+
+
 def test_build_candidate_action_record_end_to_end() -> None:
     checkpoint, refs = _checkpoint_with_sections("a", "b")
     branch = _run_single_branch(checkpoint, refs, producer=_FakeProducer(), validator=_FakeValidator())
@@ -896,3 +975,34 @@ def test_damage_considers_every_non_target_artifact_even_ones_the_branch_touched
 
     assert "b" in score.damage.newly_broken_artifacts
     assert score.damage.preserved_fraction == 0.0
+
+
+def test_damage_excludes_an_artifact_that_was_already_broken_before_the_repair() -> None:
+    """Repro from a third review: "b" is already stale in the
+    before_checkpoint, for a reason that predates this repair entirely
+    (x, something b depends on, changed again after b was built from
+    it) and has nothing to do with "a". Repairing only "a" leaves "b"
+    completely untouched -- same content, same version, same stale
+    status throughout -- so it must not be reported as "newly broken";
+    it was never healthy to begin with."""
+    store = ArtifactGraphStore()
+    store.add_version("x", ArtifactKind.SECTION, content="x")
+    x_ref = store.latest("x").ref
+    store.add_version("b", ArtifactKind.SECTION, content="b depends on x", read_input_versions=[x_ref])
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    # x changes again, after b was already built from it -- b is now
+    # genuinely, pre-existingly stale, for a reason unrelated to a's
+    # own repair.
+    store.add_version("x", ArtifactKind.SECTION, content="x changed", read_input_versions=[])
+    assert store.is_stale("b") is True  # sanity-check the premise is real
+
+    before_checkpoint = store.save_checkpoint()
+    a_ref = store.latest("a").ref
+    branch = _run_branch(before_checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
+
+    score = compute_repair_gain_score(
+        before_checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(a_ref)]
+    )
+
+    assert score.damage.newly_broken_artifacts == []
+    assert score.damage.preserved_fraction == 1.0

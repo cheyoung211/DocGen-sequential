@@ -467,3 +467,55 @@ import하려다 생기는 것으로, 이번 Stage 6 변경과 무관한 훨씬 �
 `git log`로 확인했다).
 
 **아직 하지 않은 것**: §5/§6과 동일, 이번 라운드로 바뀌지 않음.
+
+## 8. 사용자 3차 재검토 후 수정 (2026.10.22)
+
+7절의 4개 수정을 반영한 뒤, 사용자가 다시 검토해 3개의 추가 버그를 지적함.
+
+1. **[P1] 정상 내용을 그대로 보존한 좁은 복구의 gain이 여전히 낮게 계산됨**
+   (`failure_dataset.py`): A는 실패, B는 이미 유효한 PASS인 상태에서, 좁은 분기는 A만
+   복구하고 B는 건드리지 않았는데, 넓은 분기가 A·B를 모두 재생성(둘 다 정상으로 끝남)하면
+   그 사실만으로 B가 공통 `target_artifact_ids`(`compute_common_target_artifact_ids`의
+   구성요소 (b))에 들어간다. 좁은 분기는 B에 대한 실행 이력이 전혀 없으므로 기존 로직은
+   무조건 `LEFT_STALE_OR_UNRESOLVED`로 집계해 gain=0.5가 됐다 — 더 선택적이고 효율적인
+   복구가 오히려 더 나쁜 점수를 받는 구조. **수정**: 새 sentinel
+   `ALREADY_HEALTHY_UNTOUCHED`를 추가 — target이 (a) 원래 트리거가 아니고, (b) 이
+   branch 실행 이력에 전혀 없고, (c) 이 branch의 최종 상태에서 실제로 건강함이 확인되는
+   경우에만 적용되며, gain의 분자에 RESOLVED와 함께 합산된다. 진짜 미해결(예: 실제로
+   cascade되어 stale이 됐지만 재방문되지 않은 dependent)은 여전히
+   `LEFT_STALE_OR_UNRESOLVED`로 남아 이 sentinel로 새지 않음을 별도 테스트로 확인했다.
+   회귀 테스트: `test_repair_gain_score_already_healthy_untouched_counts_toward_gain`,
+   `test_repair_gain_score_already_healthy_untouched_does_not_apply_to_a_genuinely_broken_target`.
+2. **[P2] 복구 전부터 stale이었던 artifact를 '새로 발생한 손상'으로 집계함**
+   (`failure_dataset.py`): 기존 `healthy_before_artifact_ids` 계산은 "원래 트리거가
+   아닌 모든 artifact = 복구 전 정상"이라고 가정했다 — 이는 그 artifact가 이번 복구와
+   무관한 이유로 이미 stale/FAIL이었을 가능성을 놓친다. B가 이미 stale인 checkpoint에서
+   A만 복구했더니(B는 전혀 건드리지 않았는데도) B의 상태가 그대로인데도
+   `newly_broken_artifacts=["b"]`가 나왔다. **수정**: 새 함수
+   `_pre_repair_healthy_artifact_ids(before, triggering_evidence)`가
+   `before_checkpoint`를 복원한 store의 실제 ground truth(`_is_broken_in_final_state`)로
+   한 번 더 걸러낸다 — 원래 트리거가 아니면서 **동시에** 복구 전 실제로 건강했던
+   artifact만 손상 평가 대상에 들어간다. 정상→손상 전환만 손상으로 집계되고, 복구 전부터
+   깨져 있던 상태가 그대로 유지되는 경우는 평가 대상에서 완전히 제외된다. 회귀 테스트:
+   `test_damage_excludes_an_artifact_that_was_already_broken_before_the_repair`.
+3. **[P2] 동일 artifact의 다른 버전을 참조하는 INFERRED edge가 주입 과정에서 사라짐**
+   (`fault_injection.py`): 7절에서 추가한 `_carry_forward_inferred_edges`는
+   `direct_dependencies()`(artifact ID만 반환)의 결과를 새 EXPLICIT
+   `read_input_versions`의 ID 집합과 **ID만으로** 차집합해 "INFERRED로 추정되는 것"을
+   걸러냈다. T가 A@2를 EXPLICIT으로, A@1을 INFERRED로 참조하는 경우 두 관계가 모두 ID
+   "a"로 collapse되어 차집합이 빈 집합이 되고, 실제 INFERRED A@1→T edge가 조용히
+   누락됐다 — 그 결과 그 edge가 유일한 원인이었던 T의 retroactive staleness도 함께
+   사라졌다(의존관계를 복구한 적이 없는데 `add_version`의 "입력이 모두 정상이면
+   staleness 해제" 로직에 의해 정상화됨). **수정**: `_carry_forward_inferred_edges`를
+   재작성해 `store.edges`에서 `to_artifact`가 정확히 `(artifact_id, version)` 쌍으로
+   일치하는 INFERRED edge만 직접 조회하고, EXPLICIT과의 ID 기반 차집합 로직을 완전히
+   제거했다 — 같은 ID의 다른 버전은 절대 같은 사실이 아니므로 "이미 커버됐는지" 비교 자체가
+   불필요하다. 회귀 테스트:
+   `test_injection_preserves_an_inferred_edge_to_a_different_version_than_the_explicit_one`.
+
+**검증**: `test/core/`에 4개 테스트 추가(`test_fault_injection.py` 12→13,
+`test_failure_dataset.py` 29→32). `test/core/` 339→343개. 전체 저장소 기준 889 passed /
+57 failed(기존과 동일). 수정 전 코드에 대해 각 회귀 테스트를 직접 실행(스크립트로 구 로직을
+재현)해 실제로 실패함을 확인한 뒤에야 "수정됨"으로 기록했다.
+
+**아직 하지 않은 것**: §5/§6/§7과 동일, 이번 라운드로 바뀌지 않음.

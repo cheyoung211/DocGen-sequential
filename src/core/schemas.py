@@ -1605,6 +1605,29 @@ class RepairGainScore(BaseModel):
     exclusion set must stay anchored to what was actually failing *before
     any branch ran at all* -- a strictly narrower, branch-independent
     fact -- never to the broader, gain-only common target.
+
+    A *third* review found two more problems with this same pairing.
+    First: a target_id absent from a branch's own history is not always
+    ``LEFT_STALE_OR_UNRESOLVED`` -- if it entered the COMMON
+    ``target_artifact_ids`` only because a *sibling* branch's wider action
+    redundantly touched an artifact that was never actually broken (not
+    because that artifact ever needed fixing), a branch that correctly
+    left it alone was scored as if it had ignored a real problem, making
+    the MORE selective repair look worse. ``outcome_counts`` gained a
+    second sentinel, ``"already_healthy_untouched"``, for exactly this
+    case -- never touched, not part of the original trigger, confirmed
+    non-broken in THIS branch's own final state -- counted toward
+    ``gain``'s numerator alongside ``"resolved"``. Second: ``damage``'s
+    exclusion set (the previous paragraph's fix) still assumed every
+    non-triggering artifact was healthy before the repair, which is false
+    whenever some *other*, unrelated artifact was already broken in the
+    source checkpoint for a pre-existing reason -- such an artifact,
+    left completely untouched, kept reading as "newly broken" simply for
+    remaining exactly as broken as it always was. Both exclusion/inclusion
+    sets must check the checkpoint's OWN ground truth
+    (``failure_dataset._is_broken_in_final_state``), not just trigger
+    membership -- see ``failure_dataset._pre_repair_healthy_artifact_ids``
+    and ``compute_repair_gain_score``'s own (rewritten) docstring.
     """
 
     outcome_counts: Dict[str, int] = Field(default_factory=dict)

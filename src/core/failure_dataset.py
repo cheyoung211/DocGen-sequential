@@ -23,7 +23,7 @@ instead of one COMMON ``target_artifact_ids`` set fixed once per checkpoint
 the full repro of both; and ``build_candidate_action_record`` recorded only
 the first of a round's possibly-several initiating actions.
 
-**Revised again after a second review found 3 more real bugs**: (1)
+**Revised a second time after a second review found 3 more real bugs**: (1)
 ``compute_common_target_artifact_ids``'s COMMON ``target_artifact_ids`` --
 the very fix the first review above added -- was then being reused as
 ``_compute_damage``'s exclusion set too, which reintroduced the *original*
@@ -54,6 +54,41 @@ revised docstring) was invisible to that baseline, so
 INFERRED relation was the one actually at risk. Fixed by reading
 ``InjectedFault.pre_injection_dependency_ids_by_artifact`` instead, which
 ``ArtifactGraphStore.direct_dependencies`` populates with both kinds.
+
+**Revised a third time after a third review found 3 more real bugs**: (1)
+a target_id absent from a branch's own ``final_outcome_by_artifact`` was
+unconditionally bucketed ``LEFT_STALE_OR_UNRESOLVED`` for gain -- correct
+when that target genuinely needed fixing and nothing addressed it, but
+wrong when the id only entered ``target_artifact_ids`` via a *sibling*
+branch's wider action touching an artifact that was never actually broken
+to begin with (e.g. a sibling redundantly regenerating an already-PASSing
+artifact): a narrow branch that correctly left a genuinely-healthy
+artifact alone was penalized as if it had ignored a real problem. Fixed by
+adding a new sentinel, ``ALREADY_HEALTHY_UNTOUCHED``, for exactly this
+case -- a target NOT in the original trigger set, never touched by this
+branch, and confirmed non-broken in this branch's own final state -- and
+counting it toward ``gain``'s numerator alongside ``RESOLVED`` (see
+``compute_repair_gain_score``'s docstring for the full repro and why this
+is NOT the same case ``RepairGainScore``'s gain-denominator fix already
+handles). (2) ``_compute_damage``'s evaluation set assumed every artifact
+NOT in the original trigger was healthy before the repair -- which is
+false whenever some *other*, unrelated artifact was already stale/FAILing
+in the ``before_checkpoint`` for a pre-existing reason that has nothing to
+do with this repair at all; such an artifact, left completely untouched,
+was reported as "newly broken" simply because it was still broken
+afterward. Fixed with a new ``_pre_repair_healthy_artifact_ids`` that
+additionally checks the ``before_checkpoint``'s own ground truth
+(``_is_broken_in_final_state``), so only a genuine healthy-before to
+broken-after TRANSITION counts as damage, never a pre-existing problem
+that was simply never part of this repair's scope. (3) fault injection's
+INFERRED-edge carry-forward (previous revision, point 4 below) diffed an
+artifact-id-only set to decide which dependencies "must be INFERRED,"
+which silently treated an INFERRED edge pointing at an OLDER version of an
+id as already covered by an EXPLICIT edge to a NEWER version of the SAME
+id -- dropping the INFERRED edge (and the retroactive staleness it alone
+was responsible for) entirely. Fixed in ``fault_injection.py`` by looking
+up INFERRED edges directly by exact ``(artifact_id, version)``, never by
+id-only set subtraction -- see that module's own revised docstring.
 """
 
 from __future__ import annotations
@@ -88,6 +123,21 @@ _NON_SHARED_KINDS = frozenset({ArtifactKind.BLOCK, ArtifactKind.SECTION, Artifac
 # never be silently dropped from the denominator, and must never be
 # promoted to FAIL/INCONCLUSIVE either -- it genuinely has no verdict yet.
 LEFT_STALE_OR_UNRESOLVED = "left_stale_or_unresolved"
+
+# A second sentinel, on the opposite side of LEFT_STALE_OR_UNRESOLVED: a
+# target_id this branch's own execution history never mentions at all, but
+# which was NOT part of the original trigger and is confirmed non-broken in
+# this branch's own final state -- i.e. there was genuinely nothing for
+# this branch to do. A review's repro had a sibling branch redundantly
+# regenerate an already-PASSing artifact (pulling it into the COMMON
+# `target_artifact_ids` via `compute_common_target_artifact_ids`'s own
+# component (b)), which made a narrow branch that correctly left that
+# artifact untouched read as if it had ignored a real problem
+# (LEFT_STALE_OR_UNRESOLVED, dragging gain down from a deserved 1.0 to
+# 0.5). Counted toward `gain`'s numerator alongside RESOLVED -- see
+# `compute_repair_gain_score`'s docstring for the full repro and why this
+# is a different case from LEFT_STALE_OR_UNRESOLVED, not a relaxation of it.
+ALREADY_HEALTHY_UNTOUCHED = "already_healthy_untouched"
 
 
 def _dependency_depth(store: ArtifactGraphStore, artifact_id: str, *, _stack: frozenset = frozenset()) -> int:
@@ -288,6 +338,36 @@ def _originally_failing_artifact_ids(triggering_evidence: List[Evidence]) -> Set
     return {item.checked_artifact.artifact_id for item in triggering_evidence if item.outcome == CheckOutcome.FAIL}
 
 
+def _pre_repair_healthy_artifact_ids(before: Checkpoint, triggering_evidence: List[Evidence]) -> Set[str]:
+    """Every artifact_id in ``before`` that is NEITHER part of the original
+    trigger (``_originally_failing_artifact_ids``) NOR already broken in
+    ``before``'s own ground truth (``_is_broken_in_final_state``, read from
+    a store reconstructed from ``before`` itself) -- the only artifacts for
+    which a repair starting from this checkpoint can meaningfully be said
+    to have caused *new* damage.
+
+    A review caught that the previous version of this logic (inlined in
+    ``compute_repair_gain_score`` as ``set(before.artifacts) -
+    _originally_failing_artifact_ids(...)``) assumed every non-triggering
+    artifact was healthy before the repair -- false whenever some *other*,
+    unrelated artifact was already stale/FAILing in ``before`` for a
+    pre-existing reason that has nothing to do with this repair at all. An
+    artifact left completely untouched, still exactly as stale as it was
+    in ``before``, was reported as "newly broken" purely because
+    ``_compute_damage`` never checked whether it had actually ever been
+    healthy to begin with. Only a genuine healthy-before -> broken-after
+    TRANSITION is damage; a pre-existing problem outside this repair's
+    scope is neither this repair's achievement nor its fault.
+    """
+    before_store = ArtifactGraphStore.from_checkpoint(before, branch_id="damage-baseline")
+    originally_failing_ids = _originally_failing_artifact_ids(triggering_evidence)
+    return {
+        artifact_id
+        for artifact_id in before.artifacts
+        if artifact_id not in originally_failing_ids and not _is_broken_in_final_state(before_store, artifact_id)
+    }
+
+
 def _compute_damage(before: Checkpoint, after: Checkpoint, healthy_before_artifact_ids: Set[str]) -> ContentPreservationScore:
     """Compare ``before``/``after`` state for every artifact_id in
     ``healthy_before_artifact_ids`` -- i.e. every artifact that was never
@@ -316,6 +396,17 @@ def _compute_damage(before: Checkpoint, after: Checkpoint, healthy_before_artifa
     ``compute_repair_gain_score``'s docstring for why the caller must pass
     ``_originally_failing_artifact_ids(triggering_evidence)``'s complement
     here, never ``target_artifact_ids``'s.
+
+    A *third* review then caught that this complement is still not quite
+    "healthy before" -- an artifact that was already broken in ``before``
+    for a pre-existing, unrelated reason is also not "originally failing"
+    (it is not in ``triggering_evidence`` at all), so it was still ending
+    up in this set and being reported as "newly broken" for simply
+    staying exactly as broken as it already was. Callers must pass
+    ``_pre_repair_healthy_artifact_ids(before, triggering_evidence)``,
+    never the raw ``set(before.artifacts) -
+    _originally_failing_artifact_ids(...)`` this replaces -- see that
+    function's own docstring.
     """
     after_store = ArtifactGraphStore.from_checkpoint(after, branch_id="damage-check")
     newly_broken: List[str] = []
@@ -396,11 +487,11 @@ def compute_repair_gain_score(
 
     Every id in ``target_artifact_ids`` lands in exactly one
     ``outcome_counts`` bucket: its real ``RepairOutcome`` if
-    ``_merge_final_outcomes`` has one, else the sentinel
-    ``LEFT_STALE_OR_UNRESOLVED`` -- never silently omitted, and never
-    promoted to FAIL/INCONCLUSIVE (an absent verdict is not a FAIL
-    verdict). A ``RESOLVED`` verdict is additionally cross-checked against
-    ``branch.final_checkpoint``'s own ground truth
+    ``_merge_final_outcomes`` has one, else one of two sentinels --
+    ``LEFT_STALE_OR_UNRESOLVED`` or ``ALREADY_HEALTHY_UNTOUCHED`` -- never
+    silently omitted, and never promoted to FAIL/INCONCLUSIVE (an absent
+    verdict is not a FAIL verdict). A ``RESOLVED`` verdict is additionally
+    cross-checked against ``branch.final_checkpoint``'s own ground truth
     (``_is_broken_in_final_state``) before being trusted: a review's repro
     had an artifact resolved in round 1, then re-invalidated by a later,
     unrelated round's own change that nothing ever re-checked afterward --
@@ -411,43 +502,80 @@ def compute_repair_gain_score(
     genuinely has no fresh verdict for it, which is exactly what that
     sentinel already means.
 
+    A target_id this branch's own history never mentions at all is NOT
+    automatically ``LEFT_STALE_OR_UNRESOLVED`` either: if it is not part
+    of the original trigger (``_originally_failing_artifact_ids``) AND is
+    confirmed non-broken in this branch's own final state, it becomes
+    ``ALREADY_HEALTHY_UNTOUCHED`` instead, and counts toward ``gain``'s
+    numerator alongside ``RESOLVED``. A review's repro had A fail and B
+    already sitting on a valid PASS; a narrow branch correctly repaired
+    only A and left B alone, while a wide sibling branch redundantly
+    regenerated both -- pulling B into the COMMON ``target_artifact_ids``
+    via ``compute_common_target_artifact_ids``'s component (b). Without
+    this sentinel, the narrow branch's own, correct choice to leave an
+    already-healthy B untouched read as if it had ignored a real problem
+    (``gain=0.5`` instead of the deserved ``1.0``) -- a comparison that
+    structurally penalizes the MORE selective, MORE efficient repair. This
+    is a different case from ``LEFT_STALE_OR_UNRESOLVED``, which still
+    applies whenever the untouched target genuinely IS broken in this
+    branch's final state (e.g. a true dependent that cascaded into
+    staleness and was simply never revisited) -- only a target that was
+    NEVER actually a problem for this checkpoint at all is eligible for
+    the new sentinel.
+
     ``triggering_evidence`` -- the SAME list passed to
     ``compute_common_target_artifact_ids`` for this comparison -- is used
-    only to derive ``damage``'s evaluation set:
-    ``_originally_failing_artifact_ids(triggering_evidence)``'s complement
-    within ``before_checkpoint``, i.e. "healthy before this repair started
-    and never part of the original problem." This is deliberately NOT
-    ``target_artifact_ids``'s complement -- a review caught that excluding
-    the full common target (which also includes whatever a *sibling*
-    branch's own history later adds) let an artifact THIS branch itself
-    swept into a wide action and broke escape damage-checking, simply
-    because some other branch's history happened to also mention it.
+    for two things: the ``ALREADY_HEALTHY_UNTOUCHED`` check above, and to
+    derive ``damage``'s evaluation set,
+    ``_pre_repair_healthy_artifact_ids(before_checkpoint, triggering_evidence)``
+    -- every artifact that both (a) was not part of the original trigger,
+    and (b) was not ALREADY broken in ``before_checkpoint``'s own ground
+    truth for some pre-existing, unrelated reason (a review caught that
+    assuming "not the trigger" alone meant "healthy before" let an
+    already-stale, completely untouched artifact be reported as "newly
+    broken" for simply remaining exactly as broken as it always was).
+    This is deliberately NOT ``target_artifact_ids``'s complement either
+    -- excluding the full common target (which also includes whatever a
+    *sibling* branch's own history later adds) let an artifact THIS
+    branch itself swept into a wide action and broke escape
+    damage-checking, simply because some other branch's history happened
+    to also mention it.
     """
     final_outcomes = _merge_final_outcomes(branch)
     final_store = ArtifactGraphStore.from_checkpoint(branch.final_checkpoint, branch_id="gain-check")
+    originally_failing_ids = _originally_failing_artifact_ids(triggering_evidence)
     outcome_counts: Dict[str, int] = {}
     for target_id in target_artifact_ids:
         outcome = final_outcomes.get(target_id)
+        confirmed_in_final_checkpoint = target_id in branch.final_checkpoint.artifacts
         if (
             outcome == RepairOutcome.RESOLVED
-            and target_id in branch.final_checkpoint.artifacts
+            and confirmed_in_final_checkpoint
             and _is_broken_in_final_state(final_store, target_id)
         ):
             bucket = LEFT_STALE_OR_UNRESOLVED
+        elif (
+            outcome is None
+            and target_id not in originally_failing_ids
+            and confirmed_in_final_checkpoint
+            and not _is_broken_in_final_state(final_store, target_id)
+        ):
+            bucket = ALREADY_HEALTHY_UNTOUCHED
         else:
             bucket = outcome.value if outcome is not None else LEFT_STALE_OR_UNRESOLVED
         outcome_counts[bucket] = outcome_counts.get(bucket, 0) + 1
 
     if target_artifact_ids:
-        gain: Optional[float] = outcome_counts.get(RepairOutcome.RESOLVED.value, 0) / len(target_artifact_ids)
+        resolved_count = outcome_counts.get(RepairOutcome.RESOLVED.value, 0) + outcome_counts.get(
+            ALREADY_HEALTHY_UNTOUCHED, 0
+        )
+        gain: Optional[float] = resolved_count / len(target_artifact_ids)
         not_implemented_reason = None
     else:
         gain = None
         not_implemented_reason = "target_artifact_ids is empty -- nothing was being evaluated for repair"
 
-    healthy_before_artifact_ids = set(before_checkpoint.artifacts) - _originally_failing_artifact_ids(
-        triggering_evidence
-    )
+    healthy_before_artifact_ids = _pre_repair_healthy_artifact_ids(before_checkpoint, triggering_evidence)
     damage = _compute_damage(before_checkpoint, branch.final_checkpoint, healthy_before_artifact_ids)
     return RepairGainScore(
         outcome_counts=outcome_counts,

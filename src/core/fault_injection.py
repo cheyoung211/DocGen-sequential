@@ -55,24 +55,29 @@ Each ``inject_*`` method:
 
 4. Captures ``store.direct_dependencies(artifact_id)`` -- EXPLICIT *and*
    INFERRED, the complete real dependency set -- immediately *before*
-   writing the corrupted version, and (a) records it on ``InjectedFault.
+   writing the corrupted version, and records it on ``InjectedFault.
    pre_injection_dependency_ids_by_artifact`` as the known reference
-   baseline, and (b) re-registers, against the new version, any of those
-   dependencies that came from an INFERRED edge (via
-   ``_carry_forward_inferred_edges``). A review caught that point 2's own
-   fix -- re-declaring ``read_input_versions`` -- only carries EXPLICIT
-   deps forward: an INFERRED edge (``ArtifactGraphStore.add_inferred_edge``)
-   never appears in any ``ArtifactRef.read_input_versions`` at all, so it
-   still silently dropped the moment the corrupted version superseded the
-   one the INFERRED edge pointed at (the same "edge only counts against
-   the current version" filter point 2's docstring already explains, one
+   baseline. Separately, re-registers against the new version every
+   INFERRED edge that was live against the OLD version (via
+   ``_carry_forward_inferred_edges``, looked up directly from
+   ``store.edges`` by exact ``(artifact_id, version)``, never by diffing
+   artifact-id-only sets -- see that function's own docstring for the bug
+   an id-only diff caused when the same artifact_id appeared EXPLICIT at
+   one version and INFERRED at another). A review caught that point 2's
+   own fix -- re-declaring ``read_input_versions`` -- only carries
+   EXPLICIT deps forward: an INFERRED edge
+   (``ArtifactGraphStore.add_inferred_edge``) never appears in any
+   ``ArtifactRef.read_input_versions`` at all, so it still silently
+   dropped the moment the corrupted version superseded the one the
+   INFERRED edge pointed at (the same "edge only counts against the
+   current version" filter point 2's docstring already explains, one
    layer deeper).
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import List, Optional, Set
+from typing import List, Optional
 
 from src.core.artifact_graph import ArtifactGraphStore
 from src.core.schemas import (
@@ -98,7 +103,6 @@ def _new_fault_id(kind: FaultInjectionKind) -> str:
 
 def _carry_forward_inferred_edges(
     store: ArtifactGraphStore,
-    pre_injection_dependency_ids: Set[str],
     old_ref: ArtifactRef,
     new_ref: ArtifactRef,
 ) -> None:
@@ -114,26 +118,34 @@ def _carry_forward_inferred_edges(
     entirely, exactly the way the original ``[current.ref]`` self-loop bug
     dropped EXPLICIT ones.
 
-    Only the ids in ``pre_injection_dependency_ids`` that are NOT already
-    covered by ``new_ref.read_input_versions`` can possibly be INFERRED
-    (``direct_dependencies`` returns both kinds together) -- those are
-    looked up against the actual pre-injection INFERRED edges so the
-    original ``reason`` and exact ``from_artifact`` version are preserved,
-    not fabricated.
+    Looked up directly from ``store.edges`` by matching ``to_artifact``
+    against ``old_ref`` on BOTH ``artifact_id`` AND ``version`` -- a review
+    caught that an earlier draft instead diffed ``direct_dependencies()``'s
+    artifact-id-only set against ``new_ref.read_input_versions``'s ids, to
+    guess which ids "must be INFERRED." That collapses two genuinely
+    different facts into one the moment the same artifact_id appears at
+    two different versions on each side (e.g. T declares A@2 EXPLICIT *and*
+    was separately found, via ``add_inferred_edge``, to depend on A@1) --
+    the id-only diff saw "a" on both sides and concluded nothing needed
+    carrying forward, silently dropping the real INFERRED A@1 edge (and,
+    through it, whatever retroactive staleness that edge was the only
+    reason the target was stale for -- ``add_version``'s own un-staling
+    logic has no way to know about a relation this function fails to
+    re-register). Carrying forward unconditionally, by exact (id, version)
+    match, never needs to ask whether EXPLICIT "already covers" an id --
+    a different version of the same id is never the same fact, and even a
+    genuine exact-duplicate (same id *and* version on both sides) is at
+    worst a harmless second edge recording an already-true fact twice, not
+    a wrong one.
     """
-    declared_ids = {ref.artifact_id for ref in new_ref.read_input_versions}
-    inferred_from_ids = pre_injection_dependency_ids - declared_ids
-    if not inferred_from_ids:
-        return
-    inferred_edges_by_from_id = {
-        edge.from_artifact.artifact_id: edge
+    inferred_edges = [
+        edge
         for edge in store.edges
         if edge.relation == DependencyRelationKind.INFERRED
         and edge.to_artifact.artifact_id == old_ref.artifact_id
         and edge.to_artifact.version == old_ref.version
-    }
-    for from_id in inferred_from_ids:
-        edge = inferred_edges_by_from_id[from_id]
+    ]
+    for edge in inferred_edges:
         store.add_inferred_edge(
             edge.from_artifact,
             new_ref,
@@ -188,7 +200,7 @@ class FaultInjector:
             read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
-        _carry_forward_inferred_edges(store, pre_injection_dependency_ids, current.ref, result.ref)
+        _carry_forward_inferred_edges(store, current.ref, result.ref)
         predicted = sorted(store.impact_candidates(theorem_ref.artifact_id) - {theorem_ref.artifact_id})
         return InjectedFault(
             fault_id=_new_fault_id(FaultInjectionKind.MISSING_ASSUMPTION),
@@ -245,7 +257,7 @@ class FaultInjector:
             read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
-        _carry_forward_inferred_edges(store, pre_injection_dependency_ids, current.ref, result.ref)
+        _carry_forward_inferred_edges(store, current.ref, result.ref)
         predicted = sorted(store.impact_candidates(table_ref.artifact_id) - {table_ref.artifact_id})
         return InjectedFault(
             fault_id=_new_fault_id(FaultInjectionKind.ALTERED_DENOMINATOR),
@@ -300,7 +312,7 @@ class FaultInjector:
             read_input_versions=current_a.ref.read_input_versions,
             produced_by=produced_by,
         )
-        _carry_forward_inferred_edges(store, pre_injection_dependency_ids_a, current_a.ref, result_a.ref)
+        _carry_forward_inferred_edges(store, current_a.ref, result_a.ref)
         result_b = store.add_version(
             section_b_ref.artifact_id,
             current_b.ref.kind,
@@ -308,7 +320,7 @@ class FaultInjector:
             read_input_versions=current_b.ref.read_input_versions,
             produced_by=produced_by,
         )
-        _carry_forward_inferred_edges(store, pre_injection_dependency_ids_b, current_b.ref, result_b.ref)
+        _carry_forward_inferred_edges(store, current_b.ref, result_b.ref)
         predicted = sorted(
             (store.impact_candidates(section_a_ref.artifact_id) | store.impact_candidates(section_b_ref.artifact_id))
             - {section_a_ref.artifact_id, section_b_ref.artifact_id}
@@ -364,7 +376,7 @@ class FaultInjector:
             read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
-        _carry_forward_inferred_edges(store, pre_injection_dependency_ids, current.ref, result.ref)
+        _carry_forward_inferred_edges(store, current.ref, result.ref)
         predicted = sorted(store.impact_candidates(document_ref.artifact_id) - {document_ref.artifact_id})
         return InjectedFault(
             fault_id=_new_fault_id(FaultInjectionKind.UNSATISFIABLE_BLUEPRINT),

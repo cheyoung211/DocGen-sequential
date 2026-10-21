@@ -140,6 +140,42 @@ def test_injection_preserves_a_pre_existing_inferred_dependency() -> None:
     assert store.is_stale("t") is True
 
 
+def test_injection_preserves_an_inferred_edge_to_a_different_version_than_the_explicit_one() -> None:
+    """Repro from a third review: T declares A@2 as an EXPLICIT input AND
+    was separately found (add_inferred_edge) to also depend on the OLDER
+    A@1. The previous fix diffed direct_dependencies()'s artifact-id-only
+    set against read_input_versions' ids to guess which dependencies
+    "must be INFERRED" -- both edges collapse to the same id "a" in that
+    diff, so it wrongly concluded the INFERRED A@1 edge was "already
+    covered" by the EXPLICIT A@2 one and silently dropped it, along with
+    the retroactive staleness only that INFERRED edge was responsible
+    for."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a v1")
+    a_ref_1 = store.latest("a").ref
+    store.add_version("a", ArtifactKind.DEFINITION, content="a v2", read_input_versions=[])
+    a_ref_2 = store.latest("a").ref
+    store.add_version("t", ArtifactKind.CLAIM, content="Assume X > 0. Conclusion.", read_input_versions=[a_ref_2])
+    t_ref = store.latest("t").ref
+    # t is separately found to also depend on the OLDER a@1 -- outdated
+    # relative to a's current latest (a@2), so this retroactively marks
+    # t stale.
+    store.add_inferred_edge(a_ref_1, t_ref, reason="t actually cites a@1's label too")
+    assert store.is_stale("t") is True  # sanity-check the premise is real
+
+    FaultInjector().inject_missing_assumption(store, t_ref, assumption_text="Assume X > 0. ")
+
+    new_t = store.latest("t")
+    assert new_t.ref.version == 2
+    # The EXPLICIT dependency on a@2 is still declared...
+    assert [r.artifact_id for r in new_t.ref.read_input_versions] == ["a"]
+    # ...and the separate INFERRED dependency on the OLDER a@1 must ALSO
+    # have been carried forward, re-triggering the same retroactive
+    # staleness -- never silently dropped just because "a" also appears
+    # via the EXPLICIT edge at a different version.
+    assert store.is_stale("t") is True
+
+
 # ---------------------------------------------------------------------------
 # inject_altered_denominator
 # ---------------------------------------------------------------------------
