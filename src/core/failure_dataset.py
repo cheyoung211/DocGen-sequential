@@ -22,6 +22,38 @@ instead of one COMMON ``target_artifact_ids`` set fixed once per checkpoint
 -- see ``RepairGainScore``'s own (rewritten) docstring in ``schemas.py`` for
 the full repro of both; and ``build_candidate_action_record`` recorded only
 the first of a round's possibly-several initiating actions.
+
+**Revised again after a second review found 3 more real bugs**: (1)
+``compute_common_target_artifact_ids``'s COMMON ``target_artifact_ids`` --
+the very fix the first review above added -- was then being reused as
+``_compute_damage``'s exclusion set too, which reintroduced the *original*
+damage bug through a new door: an artifact a WIDE branch swept into its own
+action and broke got unioned into the common target by component (b) of
+that function (every branch's own execution history), which then made
+``_compute_damage`` skip it for EVERY branch being compared, including a
+narrow sibling that never touched it at all. Fixed by giving damage its own,
+narrower exclusion set -- ``_originally_failing_artifact_ids(triggering_evidence)``,
+component (a) alone -- decoupled from whatever (b) later adds for gain's
+purposes. (2) ``compute_repair_gain_score`` trusted ``_merge_final_outcomes``'s
+last-recorded verdict even when a *later*, unrelated round's own change
+re-invalidated that artifact without anything ever re-checking it
+afterward -- a target resolved in round 1 and silently re-invalidated by
+round 2 still read back as ``RESOLVED``. Fixed by cross-checking every
+``RESOLVED`` verdict against the branch's own final checkpoint
+(``_is_broken_in_final_state``, the same ground-truth check ``_compute_damage``
+already uses) and downgrading a contradicted one to the
+``LEFT_STALE_OR_UNRESOLVED`` sentinel -- never promoted to FAIL, exactly
+the same discipline the first review's "판정불가를 FAIL로 바꾸라는 뜻은
+아닙니다" already established. (3) ``build_failure_record``'s reference
+dependency baseline came from ``injected_fault.pre_injection_refs[i].
+read_input_versions`` alone, which can only ever hold EXPLICIT inputs --
+an INFERRED dependency the artifact had right before injection (and which
+the injector itself now carries forward, see ``fault_injection``'s own
+revised docstring) was invisible to that baseline, so
+``current_missing_relations_vs_reference`` silently read 0 even when the
+INFERRED relation was the one actually at risk. Fixed by reading
+``InjectedFault.pre_injection_dependency_ids_by_artifact`` instead, which
+``ArtifactGraphStore.direct_dependencies`` populates with both kinds.
 """
 
 from __future__ import annotations
@@ -165,14 +197,17 @@ def build_failure_record(
     mistake.
 
     When ``injected_fault`` is given, its own pre-injection record of
-    ``failing_artifact_id``'s real dependencies (``ArtifactRef.
-    read_input_versions`` on whichever of ``injected_fault.
-    pre_injection_refs`` matches this artifact_id) is used as the known
-    reference for ``classify_failure_difficulty``'s
+    ``failing_artifact_id``'s real dependencies
+    (``InjectedFault.pre_injection_dependency_ids_by_artifact``) is used as
+    the known reference for ``classify_failure_difficulty``'s
     ``current_missing_relations_vs_reference`` -- an injected fault is
     exactly the one case where this stage genuinely has ground truth for
     "what this artifact is supposed to depend on," without needing a
-    general reference-graph mechanism.
+    general reference-graph mechanism. Deliberately reads
+    ``pre_injection_dependency_ids_by_artifact``, not
+    ``pre_injection_refs[i].read_input_versions`` -- a review caught that
+    ``read_input_versions`` can only ever hold EXPLICIT inputs, silently
+    dropping any INFERRED dependency from the reference baseline.
     """
     current = store.latest(failing_artifact_id)
     if current is None:
@@ -180,11 +215,9 @@ def build_failure_record(
 
     reference_dependency_ids: Optional[Set[str]] = None
     if injected_fault is not None:
-        matching_pre_ref = next(
-            (ref for ref in injected_fault.pre_injection_refs if ref.artifact_id == failing_artifact_id), None
-        )
-        if matching_pre_ref is not None:
-            reference_dependency_ids = {r.artifact_id for r in matching_pre_ref.read_input_versions}
+        matching_ids = injected_fault.pre_injection_dependency_ids_by_artifact.get(failing_artifact_id)
+        if matching_ids is not None:
+            reference_dependency_ids = set(matching_ids)
 
     return FailureRecord(
         failure_id=failure_id,
@@ -226,37 +259,72 @@ def _merge_final_outcomes(branch: BranchExecutionResult) -> Dict[str, RepairOutc
     return merged
 
 
-def _compute_damage(before: Checkpoint, after: Checkpoint, non_target_artifact_ids: Set[str]) -> ContentPreservationScore:
-    """Compare ``before``/``after`` state for every artifact_id that
-    existed in ``before`` and is NOT in ``non_target_artifact_ids``'s
-    complement -- i.e. every artifact that was never part of what this
-    repair was trying to fix (revision directions 1/4's "정상 내용 보존").
+def _is_broken_in_final_state(store: ArtifactGraphStore, artifact_id: str) -> bool:
+    """An artifact counts as currently broken iff the store's own ground
+    truth says so: ``is_stale`` or a live FAIL ``Evidence`` -- NEVER a bare
+    before/after content-string comparison (a review caught that a plain
+    string diff conflates a harmless, legitimate content refresh with an
+    actual new error). Shared by ``_compute_damage`` and
+    ``compute_repair_gain_score`` so the two never silently disagree about
+    what "actually broken right now" means.
+    """
+    return store.is_stale(artifact_id) or any(
+        item.outcome == CheckOutcome.FAIL for item in store.live_evidence(artifact_id)
+    )
+
+
+def _originally_failing_artifact_ids(triggering_evidence: List[Evidence]) -> Set[str]:
+    """Every artifact_id that was actually FAILING in ``triggering_evidence``
+    -- what every branch being compared started from, before any of them
+    acted. This is deliberately NOT the same set as
+    ``compute_common_target_artifact_ids``'s return value: that function
+    unions this with (b) whatever any branch's own execution history later
+    adds, which is correct for gain (a sibling branch can discover a
+    problem this one's own cascade never found) but wrong for damage,
+    which must stay anchored to what was *actually* failing up front --
+    see ``compute_repair_gain_score``'s docstring for the bug this
+    separation fixes.
+    """
+    return {item.checked_artifact.artifact_id for item in triggering_evidence if item.outcome == CheckOutcome.FAIL}
+
+
+def _compute_damage(before: Checkpoint, after: Checkpoint, healthy_before_artifact_ids: Set[str]) -> ContentPreservationScore:
+    """Compare ``before``/``after`` state for every artifact_id in
+    ``healthy_before_artifact_ids`` -- i.e. every artifact that was never
+    part of what this repair was trying to fix (revision directions 1/4's
+    "정상 내용 보존"), decided independently of which branch touched what.
 
     "Broken" is decided from the RECONSTRUCTED FINAL STORE's own ground
-    truth (``is_stale`` / a live FAIL ``Evidence``), never from a bare
-    before/after content-string comparison. A review caught two bugs in
-    the original design at once: (1) it excluded every artifact_id this
-    branch's cascade happened to visit from damage-checking at all, which
-    let a previously-healthy artifact swept into a WIDE repair action
-    (e.g. whole-document regeneration) that came out genuinely FAILING be
-    silently excluded just because it had been "touched"; (2) it used
-    ``before_content != after_content`` as the damage signal, which cannot
-    distinguish a harmless content refresh (e.g. a successful regeneration
-    whose wording simply changed, or a reaffirm) from an actual new error
-    -- only a confirmed FAIL/stale state in the final graph counts as
-    damage now.
+    truth via ``_is_broken_in_final_state`` (``is_stale`` / a live FAIL
+    ``Evidence``), never from a bare before/after content-string
+    comparison. A review caught two bugs in the original design at once:
+    (1) it excluded every artifact_id this branch's cascade happened to
+    visit from damage-checking at all, which let a previously-healthy
+    artifact swept into a WIDE repair action (e.g. whole-document
+    regeneration) that came out genuinely FAILING be silently excluded
+    just because it had been "touched"; (2) it used ``before_content !=
+    after_content`` as the damage signal, which cannot distinguish a
+    harmless content refresh from an actual new error.
+
+    A *second* review then caught that fixing (1) by excluding
+    ``target_artifact_ids`` (plural, the COMMON set shared across
+    branches) reintroduced the exact same bug through a new door: once
+    that common set also includes whatever a *sibling* branch's own
+    history happened to touch, a branch that never touched a given
+    artifact at all could still have it excluded from ITS OWN damage
+    check, just because a sibling's wider action collided with it. See
+    ``compute_repair_gain_score``'s docstring for why the caller must pass
+    ``_originally_failing_artifact_ids(triggering_evidence)``'s complement
+    here, never ``target_artifact_ids``'s.
     """
     after_store = ArtifactGraphStore.from_checkpoint(after, branch_id="damage-check")
     newly_broken: List[str] = []
     checked = 0
-    for artifact_id in non_target_artifact_ids:
+    for artifact_id in healthy_before_artifact_ids:
         if artifact_id not in before.artifacts or artifact_id not in after.artifacts:
             continue
         checked += 1
-        is_broken = after_store.is_stale(artifact_id) or any(
-            item.outcome == CheckOutcome.FAIL for item in after_store.live_evidence(artifact_id)
-        )
-        if is_broken:
+        if _is_broken_in_final_state(after_store, artifact_id):
             newly_broken.append(artifact_id)
 
     preserved_fraction = (checked - len(newly_broken)) / checked if checked > 0 else None
@@ -264,7 +332,7 @@ def _compute_damage(before: Checkpoint, after: Checkpoint, non_target_artifact_i
         preserved_fraction=preserved_fraction,
         newly_broken_artifacts=sorted(newly_broken),
         not_implemented_reason=(
-            None if checked > 0 else "no non-target artifact existed in the source checkpoint to compare against"
+            None if checked > 0 else "no artifact was healthy-before-repair in the source checkpoint to compare against"
         ),
     )
 
@@ -277,10 +345,10 @@ def compute_common_target_artifact_ids(
     평가 대상을 정하고" made concrete.
 
     The union of: (a) every artifact_id that was actually FAILING in
-    ``triggering_evidence`` (what every branch started from, before any of
-    them acted), and (b) every artifact_id that ANY branch's own execution
-    history (across every round) ever reported a final outcome for, OR
-    left genuinely unresolved (``RepairExecutionResult.left_stale``).
+    ``triggering_evidence`` (``_originally_failing_artifact_ids``), and (b)
+    every artifact_id that ANY branch's own execution history (across
+    every round) ever reported a final outcome for, OR left genuinely
+    unresolved (``RepairExecutionResult.left_stale``).
 
     (b) matters even for a branch that never itself touched a given
     artifact_id: a review's repro had branch A's narrow action resolve
@@ -292,10 +360,13 @@ def compute_common_target_artifact_ids(
     from only one branch's own history (the bug this function replaces)
     cannot see what a *sibling* branch discovered; computing it from every
     compared branch's combined history can.
+
+    This broader union is correct for GAIN, but must never be reused as
+    damage's exclusion set -- see ``_originally_failing_artifact_ids``'s
+    own docstring and ``compute_repair_gain_score``'s for why (a) alone,
+    not this function's full return value, is what damage needs.
     """
-    target_ids: Set[str] = {
-        item.checked_artifact.artifact_id for item in triggering_evidence if item.outcome == CheckOutcome.FAIL
-    }
+    target_ids: Set[str] = set(_originally_failing_artifact_ids(triggering_evidence))
     for branch in comparison.branches:
         for round_ in branch.rounds:
             for execution in round_.executions:
@@ -309,35 +380,62 @@ def compute_repair_gain_score(
     branch: BranchExecutionResult,
     *,
     target_artifact_ids: Set[str],
+    triggering_evidence: List[Evidence],
 ) -> RepairGainScore:
     """Revision direction 4's "repair gain, 손상, 총비용" for one branch.
 
-    ``target_artifact_ids`` is the COMMON evaluation target -- the
-    artifact_ids that were actually failing before ANY branch from this
-    checkpoint ran -- fixed once by the caller and passed identically to
-    every branch being compared from the same checkpoint (see
-    ``RepairGainScore``'s own, rewritten docstring in ``schemas.py`` for
-    the full repro this replaces: a branch-dependent denominator derived
-    from each branch's own ``final_outcome_by_artifact`` let a narrow
-    action that simply never attempted some of the originally-failing
-    artifacts report a perfect, misleading ``gain=1.0``).
+    ``target_artifact_ids`` is the COMMON evaluation target used for GAIN
+    only -- fixed once by the caller (``compute_common_target_artifact_ids``)
+    and passed identically to every branch being compared from the same
+    checkpoint (see ``RepairGainScore``'s own, rewritten docstring in
+    ``schemas.py`` for the full repro this replaces: a branch-dependent
+    denominator derived from each branch's own ``final_outcome_by_artifact``
+    let a narrow action that simply never attempted some of the
+    originally-failing artifacts report a perfect, misleading
+    ``gain=1.0``).
 
     Every id in ``target_artifact_ids`` lands in exactly one
     ``outcome_counts`` bucket: its real ``RepairOutcome`` if
     ``_merge_final_outcomes`` has one, else the sentinel
     ``LEFT_STALE_OR_UNRESOLVED`` -- never silently omitted, and never
     promoted to FAIL/INCONCLUSIVE (an absent verdict is not a FAIL
-    verdict). ``damage`` is computed over every OTHER artifact_id in
-    ``before_checkpoint`` (i.e. ``before_checkpoint``'s ids minus
-    ``target_artifact_ids``) -- the "was meant to stay healthy" set,
-    decided at the same time and for the same reason as the gain
-    denominator.
+    verdict). A ``RESOLVED`` verdict is additionally cross-checked against
+    ``branch.final_checkpoint``'s own ground truth
+    (``_is_broken_in_final_state``) before being trusted: a review's repro
+    had an artifact resolved in round 1, then re-invalidated by a later,
+    unrelated round's own change that nothing ever re-checked afterward --
+    ``_merge_final_outcomes`` (last-write-wins) still read back
+    ``RESOLVED`` even though the branch's actual final state showed it
+    stale again. A verdict contradicted this way is downgraded to
+    ``LEFT_STALE_OR_UNRESOLVED``, never promoted to FAIL -- the branch
+    genuinely has no fresh verdict for it, which is exactly what that
+    sentinel already means.
+
+    ``triggering_evidence`` -- the SAME list passed to
+    ``compute_common_target_artifact_ids`` for this comparison -- is used
+    only to derive ``damage``'s evaluation set:
+    ``_originally_failing_artifact_ids(triggering_evidence)``'s complement
+    within ``before_checkpoint``, i.e. "healthy before this repair started
+    and never part of the original problem." This is deliberately NOT
+    ``target_artifact_ids``'s complement -- a review caught that excluding
+    the full common target (which also includes whatever a *sibling*
+    branch's own history later adds) let an artifact THIS branch itself
+    swept into a wide action and broke escape damage-checking, simply
+    because some other branch's history happened to also mention it.
     """
     final_outcomes = _merge_final_outcomes(branch)
+    final_store = ArtifactGraphStore.from_checkpoint(branch.final_checkpoint, branch_id="gain-check")
     outcome_counts: Dict[str, int] = {}
     for target_id in target_artifact_ids:
         outcome = final_outcomes.get(target_id)
-        bucket = outcome.value if outcome is not None else LEFT_STALE_OR_UNRESOLVED
+        if (
+            outcome == RepairOutcome.RESOLVED
+            and target_id in branch.final_checkpoint.artifacts
+            and _is_broken_in_final_state(final_store, target_id)
+        ):
+            bucket = LEFT_STALE_OR_UNRESOLVED
+        else:
+            bucket = outcome.value if outcome is not None else LEFT_STALE_OR_UNRESOLVED
         outcome_counts[bucket] = outcome_counts.get(bucket, 0) + 1
 
     if target_artifact_ids:
@@ -347,8 +445,10 @@ def compute_repair_gain_score(
         gain = None
         not_implemented_reason = "target_artifact_ids is empty -- nothing was being evaluated for repair"
 
-    non_target_artifact_ids = set(before_checkpoint.artifacts) - target_artifact_ids
-    damage = _compute_damage(before_checkpoint, branch.final_checkpoint, non_target_artifact_ids)
+    healthy_before_artifact_ids = set(before_checkpoint.artifacts) - _originally_failing_artifact_ids(
+        triggering_evidence
+    )
+    damage = _compute_damage(before_checkpoint, branch.final_checkpoint, healthy_before_artifact_ids)
     return RepairGainScore(
         outcome_counts=outcome_counts,
         gain=gain,
@@ -365,6 +465,7 @@ def build_candidate_action_record(
     before_checkpoint: Checkpoint,
     branch: BranchExecutionResult,
     target_artifact_ids: Set[str],
+    triggering_evidence: List[Evidence],
 ) -> CandidateActionRecord:
     """One ``(checkpoint, candidate action(s), downstream result)`` triple
     -- revision direction 4's benchmark-storage unit. ``branch.rounds[0]``
@@ -380,7 +481,9 @@ def build_candidate_action_record(
     caught that recording just ``executions[0].action`` while ``outcome``
     reflected the combined effect of every action the round ran
     misattributed a multi-action round's full result to a single, partial
-    cause.
+    cause. ``triggering_evidence`` is forwarded as-is to
+    ``compute_repair_gain_score`` -- see that function's docstring for why
+    it must be the same list used to build ``target_artifact_ids``.
     """
     if not branch.rounds or not branch.rounds[0].executions:
         raise ValueError(
@@ -394,6 +497,11 @@ def build_candidate_action_record(
         source_checkpoint_id=branch.source_checkpoint_id,
         branch_label=branch.policy_label,
         actions=initiating_actions,
-        outcome=compute_repair_gain_score(before_checkpoint, branch, target_artifact_ids=target_artifact_ids),
+        outcome=compute_repair_gain_score(
+            before_checkpoint,
+            branch,
+            target_artifact_ids=target_artifact_ids,
+            triggering_evidence=triggering_evidence,
+        ),
         rounds_executed=len(branch.rounds),
     )

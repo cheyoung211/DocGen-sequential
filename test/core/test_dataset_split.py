@@ -126,6 +126,40 @@ def test_build_fixed_split_is_deterministic_given_the_same_seed() -> None:
     assert {a.sample_id: a.split for a in first.assignments} == {a.sample_id: a.split for a in second.assignments}
 
 
+def test_build_fixed_split_is_independent_of_input_iteration_order() -> None:
+    """Repro from the user's review: the union-find's internal root label
+    depends on processing order, and build_fixed_split was sorting/
+    shuffling groups BY that root -- so the same 20 samples with the same
+    seed, with only the input dict's iteration order reversed, moved
+    samples to a different split (12 of 20 in the user's own repro). The
+    actual partition (which samples belong together) is provably
+    order-independent; only the (now fixed) group-keying was leaking
+    order into the result.
+
+    Sample ids are deliberately NOT in family/numeric order -- with
+    strictly-increasing ids (one family per consecutive pair), the old
+    buggy root happens to still sort the same way after a plain reversal,
+    making the bug invisible; scrambled ids expose it (confirmed against
+    the pre-fix code before relying on this fixture)."""
+    ids_per_family = [
+        ["m3", "a1"], ["z9", "b2"], ["k4", "c0"], ["q7", "d5"], ["x2", "e8"],
+        ["n6", "f1"], ["t0", "g3"], ["y5", "h9"], ["p8", "i2"], ["v1", "j4"],
+    ]
+    families: Dict[str, SplitFamilyKey] = {}
+    for f, ids in enumerate(ids_per_family):
+        key = SplitFamilyKey(document_type=f"doc_type_{f}", topic=f"topic_{f}", graph_structure_bucket=f"bucket_{f}")
+        for sample_id in ids:
+            families[sample_id] = key
+
+    forward = build_fixed_split(families, seed=1)
+    reversed_families = dict(reversed(list(families.items())))
+    backward = build_fixed_split(reversed_families, seed=1)
+
+    assert {a.sample_id: a.split for a in forward.assignments} == {
+        a.sample_id: a.split for a in backward.assignments
+    }
+
+
 def test_build_fixed_split_locked_by_default() -> None:
     split = build_fixed_split(_families(4, 2), seed=1)
     assert split.locked is True

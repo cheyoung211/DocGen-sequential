@@ -110,6 +110,36 @@ def test_injection_preserves_real_upstream_dependency_not_a_self_loop() -> None:
     assert store.is_stale("t") is True
 
 
+def test_injection_preserves_a_pre_existing_inferred_dependency() -> None:
+    """Repro from the user's review: an INFERRED edge
+    (store.add_inferred_edge) lives only in store.edges, never in any
+    ArtifactRef.read_input_versions -- so the self-loop fix above
+    (re-declaring read_input_versions) is not enough to carry one
+    forward. A -> T registered as INFERRED, then injecting into T must
+    not drop it: T's current dependency on A must survive the injection,
+    and a later change to A must still make T stale."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a")
+    a_ref = store.latest("a").ref
+    store.add_version("t", ArtifactKind.CLAIM, content="Assume X > 0. Conclusion.", produced_by="seed")
+    t_ref = store.latest("t").ref
+    store.add_inferred_edge(a_ref, t_ref, reason="t actually cites a's label")
+    assert store.direct_dependencies("t") == {"a"}  # sanity-check the premise
+
+    fault = FaultInjector().inject_missing_assumption(store, t_ref, assumption_text="Assume X > 0. ")
+
+    # The INFERRED dependency on a must still show up against t's new version.
+    assert store.direct_dependencies("t") == {"a"}
+    # The reference baseline recorded on the fault must reflect it too --
+    # not silently empty just because read_input_versions never carries
+    # INFERRED edges.
+    assert fault.pre_injection_dependency_ids_by_artifact["t"] == ["a"]
+
+    # A later change to a must still propagate staleness through to t.
+    store.add_version("a", ArtifactKind.DEFINITION, content="a changed", read_input_versions=[])
+    assert store.is_stale("t") is True
+
+
 # ---------------------------------------------------------------------------
 # inject_altered_denominator
 # ---------------------------------------------------------------------------

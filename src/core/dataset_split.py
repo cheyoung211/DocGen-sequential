@@ -24,6 +24,18 @@ three attribute values into one connected component (``_group_by_shared_attribut
 -- a strictly coarser, and the only correct, partition: if two samples
 sharing one axis value ended up in different components, that axis value
 would necessarily appear in two different splits.
+
+**Group keys are ``min(members)``, never the raw union-find root.** A
+second review caught that the union-find's internal root label is an
+artifact of processing order (which member happened to get unioned into
+which), and ``build_fixed_split`` was sorting/shuffling groups BY that
+root -- so the exact same ``sample_families`` dict, same ``seed``, with
+only its iteration order reversed, produced a materially different split
+(12 of 20 samples moved in the reported repro) even though the actual
+groups (which samples belong together) are themselves provably
+order-independent. Re-keying each group by the minimum member id --
+a pure function of group membership alone -- fixes this without changing
+anything about which samples end up grouped together.
 """
 
 from __future__ import annotations
@@ -38,9 +50,22 @@ def _group_by_shared_attribute(sample_families: Dict[str, SplitFamilyKey]) -> Di
     """Union-find over ``sample_families``: two samples end up in the same
     group iff they are connected by a chain of shared ``document_type``,
     ``topic``, or ``graph_structure_bucket`` values -- not only when all
-    three match simultaneously. Returns ``{group_root_sample_id: [member
-    sample_ids]}``; the root is just whichever sample_id the union-find
-    happened to settle on, not a meaningful identity of its own.
+    three match simultaneously. Returns ``{min(member sample_ids):
+    [member sample_ids]}``.
+
+    The key is deliberately ``min(members)``, NOT whichever sample_id the
+    union-find's internal root happened to settle on. A review caught
+    that the raw root depends on processing order (which member got
+    unioned into which first, itself driven by ``sample_families``'s own
+    dict/list iteration order) even though the actual partition -- which
+    samples end up grouped together -- does not: connected components are
+    a pure function of the "shares an attribute value" relation, order-
+    independent by construction. ``build_fixed_split`` sorts and shuffles
+    groups BY this dict's keys, so leaking the order-dependent raw root
+    into those keys let the exact same data and ``seed`` produce a
+    different split merely because ``sample_families`` was iterated in a
+    different order. ``min(members)`` is a pure function of a group's
+    final membership alone, so it cannot carry that leak.
     """
     parent: Dict[str, str] = {sample_id: sample_id for sample_id in sample_families}
 
@@ -70,10 +95,10 @@ def _group_by_shared_attribute(sample_families: Dict[str, SplitFamilyKey]) -> Di
         for other in members[1:]:
             union(members[0], other)
 
-    groups: Dict[str, List[str]] = {}
+    raw_groups: Dict[str, List[str]] = {}
     for sample_id in sample_families:
-        groups.setdefault(find(sample_id), []).append(sample_id)
-    return groups
+        raw_groups.setdefault(find(sample_id), []).append(sample_id)
+    return {min(members): members for members in raw_groups.values()}
 
 
 class HeldOutSplitLockedError(RuntimeError):

@@ -1405,12 +1405,32 @@ class InjectedFault(BaseModel):
     into one field (the same discipline ``RepairExecutionResult`` already
     applies to its own "what should be checked" vs "what a fresh check
     actually found").
+
+    ``pre_injection_dependency_ids_by_artifact`` maps each touched
+    ``artifact_id`` to its COMPLETE real dependency set (EXPLICIT *and*
+    INFERRED) exactly as it stood immediately before this injection wrote
+    a new version -- captured via ``ArtifactGraphStore.direct_dependencies``,
+    never derived from ``pre_injection_refs[i].read_input_versions``. A
+    review caught that ``read_input_versions`` can only ever hold EXPLICIT
+    inputs (``add_inferred_edge`` never appends to it, by design -- see
+    that method's own docstring), so a caller using it alone as "the known
+    reference dependency set" (``failure_dataset.build_failure_record``)
+    silently dropped every INFERRED dependency from the baseline, making a
+    genuinely-lost INFERRED relation invisible to
+    ``current_missing_relations_vs_reference``. This field is also what
+    the injector itself uses to decide which INFERRED edges need
+    re-registering against the freshly-injected version (see
+    ``fault_injection._carry_forward_inferred_edges``) -- the same root
+    cause as the original ``[current.ref]`` self-loop bug, one layer
+    deeper: re-declaring ``read_input_versions`` alone carries EXPLICIT
+    deps forward but silently drops any INFERRED one.
     """
 
     fault_id: str
     kind: FaultInjectionKind
     pre_injection_refs: List[ArtifactRef]
     injected_refs: List[ArtifactRef]
+    pre_injection_dependency_ids_by_artifact: Dict[str, List[str]] = Field(default_factory=dict)
     description: str
     predicted_affected_artifact_ids: List[str] = Field(default_factory=list)
 
@@ -1562,10 +1582,10 @@ class RepairGainScore(BaseModel):
     denominator, since the denominator is now fixed up front.
 
     ``damage`` is computed over every artifact_id that existed in the
-    source checkpoint and is NOT in ``target_artifact_ids`` -- i.e. the set
-    of artifacts that were healthy BEFORE this repair started and were
-    never meant to be touched, decided at the same time as
-    ``target_artifact_ids`` and for the same reason: a review found the
+    source checkpoint and was NOT actually failing before any branch ran
+    (``failure_dataset._originally_failing_artifact_ids(triggering_evidence)``'s
+    complement) -- i.e. the set of artifacts that were healthy BEFORE this
+    repair started and were never meant to be touched. A review found the
     original "skip whatever this branch's own cascade happened to visit"
     rule let a previously-healthy artifact that got swept into a WIDE
     repair action (e.g. whole-document regeneration) and came out actually
@@ -1573,6 +1593,18 @@ class RepairGainScore(BaseModel):
     visited. "Visited by this branch" and "was this artifact supposed to
     be touched at all" are different questions; only the second one should
     gate damage.
+
+    A *second* review then found that the first fix's replacement rule --
+    excluding ``target_artifact_ids`` itself, this class's own GAIN
+    denominator -- reintroduced the identical bug through a new door:
+    ``target_artifact_ids`` is the COMMON set shared across every branch
+    being compared, which also includes whatever a *sibling* branch's own
+    history happens to touch. That let an artifact THIS branch swept into
+    a wide action and broke escape ITS OWN damage check too, merely
+    because a different branch's history also named it. Damage's
+    exclusion set must stay anchored to what was actually failing *before
+    any branch ran at all* -- a strictly narrower, branch-independent
+    fact -- never to the broader, gain-only common target.
     """
 
     outcome_counts: Dict[str, int] = Field(default_factory=dict)

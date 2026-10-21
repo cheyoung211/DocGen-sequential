@@ -378,3 +378,92 @@ passed / 57 failed(Stage 1부터 이미 알려진 것과 정확히 같은 수, �
 실제 human annotation 수집, 실제 benchmark에 대한 분할 산출물, `FinalEvaluator` 연결.
 이번 라운드는 메커니즘 자체의 정확성만 다뤘다 — Notion 체크리스트 박스는 여전히 올리지
 않았다.
+
+## 7. 사용자 2차 재검토 후 수정 (2026.10.22)
+
+6절의 8개 수정을 반영한 뒤, 사용자가 같은 코드를 다시 검토해 4개의 추가 버그를 지적했다.
+이번 라운드는 모두 6절에서 고친 메커니즘들 사이의 **상호작용**에서 생긴 문제였다 — 개별
+수정은 각자 맞았지만, 두 수정을 합치면 한쪽이 다른 쪽이 막았던 구멍을 다시 열었다.
+
+1. **공통 target 생성과 손상 계산을 연결하면 정상 artifact의 손상이 다시 빠짐**
+   (`failure_dataset.py`): 6절의 버그 3 수정(`compute_common_target_artifact_ids`)과
+   버그 4 수정(`_compute_damage`가 `target_artifact_ids`의 여집합만 평가)을 그대로
+   합치면, "넓은 복구가 어떤 artifact를 건드렸다"는 사실 자체가 그 artifact를
+   `target_artifact_ids`(공통 집합의 구성요소 (b))에 넣어버리고, 그 순간 `_compute_damage`가
+   그 artifact를 평가 대상에서 빼버린다. A는 실패, B는 정상인 상태에서 좁은 복구는 B를
+   보존하고 넓은 복구는 B를 망가뜨렸는데, B가 공통 target에 포함되면서 **두 branch 모두**
+   B에 대한 손상 평가가 왜곡됐다(좁은 쪽은 "B를 안 건드렸다"는 이유로 gain만 깎이고, 넓은
+   쪽은 preserved_fraction=1.0으로 손상이 안 보였다). **수정**: 손상의 평가 대상(="복구
+   전 정상이었던 집합")을 `target_artifact_ids`가 아니라 완전히 독립된 새 함수
+   `_originally_failing_artifact_ids(triggering_evidence)`의 여집합으로 고정한다 — 이
+   함수는 `compute_common_target_artifact_ids`의 구성요소 (a)만 떼어낸 것으로, 어떤
+   branch가 나중에 무엇을 건드렸는지와 무관하게 "애초에 실제로 실패했던 것"만 가리킨다.
+   `compute_repair_gain_score`/`build_candidate_action_record`에 새 필수 키워드
+   `triggering_evidence`가 추가됐다(gain 쪽 `target_artifact_ids`는 그대로 둔다 — 이건
+   의도된 더 넓은 집합이다). 회귀 테스트:
+   `test_damage_of_a_branch_is_not_hidden_by_a_siblings_collateral_sweep`(A/B 완전
+   무관, 넓은 branch의 전용 fake policy `_AlsoRegenerate`가 B를 직접 건드려 깨뜸),
+   기존 `test_repair_gain_score_orphaned_dependent_counts_against_a_branch_that_ignored_it`
+   에도 동일 원리의 damage 단언을 추가.
+2. **한 번 RESOLVED였다가 다시 stale이 된 artifact를 여전히 해결된 것으로 셈**
+   (`failure_dataset.py`): `_merge_final_outcomes`는 라운드 순서대로 last-write-wins만
+   적용한다 — B가 라운드 1에서 RESOLVED로 기록된 뒤, 라운드 2가 (B와 무관한 이유로) A를
+   다시 바꿔 B를 stale로 되돌려도, 라운드 2는 B에 대해 아무것도 기록하지 않으므로 병합
+   결과는 여전히 "B: RESOLVED"로 남는다. 실제로는 `final_checkpoint`에서 B가 stale인데도
+   gain이 1.0으로 나왔다. **수정**: `compute_repair_gain_score`가 각 target의 RESOLVED
+   판정을 그대로 믿지 않고, `branch.final_checkpoint`를 복원한 store에 대해
+   `_is_broken_in_final_state`(= `is_stale` 또는 live FAIL evidence, `_compute_damage`와
+   공유하는 동일한 판정)로 다시 확인한다 — 모순되면 FAIL로 바꾸는 게 아니라
+   `LEFT_STALE_OR_UNRESOLVED` sentinel로 내려간다(사용자 지적대로 "판정불가를 FAIL로
+   바꾸라는 뜻은 아님"과 동일한 원칙). 회귀 테스트:
+   `test_repair_gain_score_does_not_trust_a_resolved_verdict_the_final_state_has_since_invalidated`
+   (라운드 1이 B를 RESOLVED, 라운드 2가 A를 다시 바꿔 B를 stale로 되돌리는 것을
+   `_merge_final_outcomes(branch)["b"] == RESOLVED`로 전제를 먼저 확인한 뒤 gain=0.0,
+   `outcome_counts == {LEFT_STALE_OR_UNRESOLVED: 1}`을 단언).
+3. **Injector가 INFERRED 의존관계를 보존하지 않음** (`fault_injection.py`/
+   `schemas.py`/`failure_dataset.py`): 6절 버그 1의 수정은
+   `read_input_versions=current.ref.read_input_versions`만 재선언한다 —
+   `read_input_versions`는 EXPLICIT 입력만 담을 수 있고, `add_inferred_edge`로 별도
+   등록된 INFERRED edge는 애초에 거기 들어가지 않는다. A→T를 INFERRED edge로 등록한 뒤
+   T에 주입하면, 주입이 쓰는 새 버전은 EXPLICIT 입력만 재선언하므로 INFERRED edge가
+   가리키던 "T의 이전 버전"이 더 이상 현재 버전이 아니게 되는 순간 그 관계가 조용히
+   사라진다(`direct_dependencies`가 빈 집합이 됨) — 6절 버그 1과 정확히 같은 매커니즘의,
+   한 단계 더 깊은 재발이다. 기준선도 마찬가지로 왜곡됐다: `build_failure_record`가
+   `pre_injection_refs[i].read_input_versions`에서만 기준을 가져오므로
+   `current_missing_relations_vs_reference`가 항상 0으로 나왔다(기준 집합 자체가
+   INFERRED 관계를 담을 수 없는 필드에서 왔으므로). **수정**: `InjectedFault`에 새 필드
+   `pre_injection_dependency_ids_by_artifact: Dict[str, List[str]]`를 추가해
+   `store.direct_dependencies()`(EXPLICIT+INFERRED 전체)로 주입 직전 상태를 캡처한다.
+   `fault_injection.py`의 새 헬퍼 `_carry_forward_inferred_edges`가 이 중
+   `read_input_versions`로 커버되지 않는 id만 걸러 원래 INFERRED edge를 찾아 새 버전에
+   대해 `add_inferred_edge`로 재등록한다. `build_failure_record`는 이제
+   `pre_injection_refs[...].read_input_versions` 대신
+   `InjectedFault.pre_injection_dependency_ids_by_artifact`를 기준으로 쓴다. 회귀
+   테스트: `test_injection_preserves_a_pre_existing_inferred_dependency`(주입 후에도
+   `direct_dependencies`가 그대로임을 확인), `test_build_failure_record_reference_baseline_includes_inferred_dependencies`
+   (기준 집합에 INFERRED 의존성이 실제로 포함됐음을, 이후 그 의존성을 완전히 떨어뜨려
+   `current_missing_relations_vs_reference`가 0→1로 바뀌는 것으로 증명).
+4. **같은 데이터·같은 seed라도 입력 순서가 바뀌면 split이 달라짐** (`dataset_split.py`):
+   `_group_by_shared_attribute`는 union-find의 내부 root(어느 샘플이 "대표"가 되는지)를
+   그대로 반환 dict의 key로 썼는데, 이 root는 처리 순서(= 입력 dict의 순회 순서)에 따라
+   달라진다. `build_fixed_split`이 이 key들을 `sorted()`한 뒤 `seed`로 shuffle하므로,
+   실제 그룹 구성(어떤 샘플들이 같은 그룹인지)은 입력 순서와 무관하게 동일해도, 그
+   root-label이 바뀌면 `sorted()` 결과 순서가 바뀌고 따라서 동일한 `seed`로 shuffle한
+   결과도 완전히 달라진다. **수정**: 그룹의 key를 union-find root가 아니라
+   `min(members)`로 다시 매긴다 — 이 값은 그룹의 최종 구성원 집합만으로 결정되는 순수
+   함수이므로 처리 순서를 전혀 반영하지 않는다. 회귀 테스트:
+   `test_build_fixed_split_is_independent_of_input_iteration_order`(동일한
+   families dict를 순서만 뒤집어 넣고 결과가 같은지 확인 — 처음에는 숫자 순서대로 증가하는
+   sample_id로 작성했는데 우연히 재정렬 후에도 상대 순서가 보존돼 버그를 못 잡았고, 뒤섞인
+   sample_id로 바꾸자 수정 전 코드에서 실제로 8~12개 샘플이 이동하는 것을 확인한 뒤에야
+   이 테스트를 확정했다).
+
+**검증**: `test/core/`에 5개 테스트 추가(`test_fault_injection.py` 11→12,
+`test_failure_dataset.py` 26→29, `test_dataset_split.py` 12→13, `test_annotation.py`
+25개 변경 없음). `test/core/` 334→339개. 전체 저장소 기준 885 passed / 57 failed(이번
+라운드도 기존에 알려진 것과 정확히 같은 수 — `test/test_pipeline_dependency_ordering.py`의
+collection error는 `scripts/run_full_pipeline.py`에 없는 `_dependency_ordered`를
+import하려다 생기는 것으로, 이번 Stage 6 변경과 무관한 훨씬 오래된 사전 존재 이슈임을
+`git log`로 확인했다).
+
+**아직 하지 않은 것**: §5/§6과 동일, 이번 라운드로 바뀌지 않음.

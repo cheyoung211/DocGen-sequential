@@ -289,6 +289,50 @@ def test_build_failure_record_injected_derives_reference_from_the_injected_fault
     assert record.difficulty.current_missing_relations_vs_reference == 0
 
 
+def test_build_failure_record_reference_baseline_includes_inferred_dependencies() -> None:
+    """Repro from the user's review: deriving the reference set from
+    injected_fault.pre_injection_refs[i].read_input_versions alone misses
+    any INFERRED dependency the artifact had right before injection
+    (read_input_versions can only ever hold EXPLICIT ones) --
+    build_failure_record must read InjectedFault.
+    pre_injection_dependency_ids_by_artifact instead, which captures both."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a")
+    a_ref = store.latest("a").ref
+    store.add_version("t", ArtifactKind.CLAIM, content="Assume X > 0. Conclusion.", produced_by="seed")
+    t_ref = store.latest("t").ref
+    store.add_inferred_edge(a_ref, t_ref, reason="t actually cites a's label")
+    fault = FaultInjector().inject_missing_assumption(store, t_ref, assumption_text="Assume X > 0. ")
+
+    record = build_failure_record(
+        store,
+        failure_id="f1",
+        origin=FailureOrigin.INJECTED,
+        failing_artifact_id="t",
+        evidence=[],
+        source_checkpoint_id="cp1",
+        injected_fault=fault,
+    )
+    # The INFERRED dependency on a was carried forward by the injector's
+    # own fix, so nothing is missing yet.
+    assert record.difficulty.current_missing_relations_vs_reference == 0
+
+    # Now drop it entirely (a regeneration that forgets to re-declare any
+    # dependency at all) -- this must register as a real miss, proving the
+    # baseline really did include "a" and was not just vacuously empty.
+    store.add_version("t", ArtifactKind.CLAIM, content="Assume X > 0. Conclusion, rewritten.", read_input_versions=[])
+    record_after_drop = build_failure_record(
+        store,
+        failure_id="f2",
+        origin=FailureOrigin.INJECTED,
+        failing_artifact_id="t",
+        evidence=[],
+        source_checkpoint_id="cp1",
+        injected_fault=fault,
+    )
+    assert record_after_drop.difficulty.current_missing_relations_vs_reference == 1
+
+
 # ---------------------------------------------------------------------------
 # _merge_final_outcomes: last-write-wins across rounds
 # ---------------------------------------------------------------------------
@@ -422,6 +466,36 @@ def _fail_evidence(ref: ArtifactRef) -> Evidence:
     return Evidence(constraint_id="c", outcome=CheckOutcome.FAIL, checked_artifact=ref, detail="bad")
 
 
+class _AlsoRegenerate:
+    """Fake policy for the bug-9 repro: reacts to a FAIL exactly like
+    _ActOnAllFailures, but also throws in one extra action against an
+    unrelated, not-yet-failing artifact -- a stand-in for a WIDE repair
+    action (e.g. whole-document regeneration) that regenerates more than
+    strictly necessary."""
+
+    def __init__(self, extra_ref: ArtifactRef) -> None:
+        self.extra_ref = extra_ref
+
+    def decide(self, evidence, dependency_edges, budget) -> List[RepairAction]:
+        if budget.remaining <= 0:
+            return []
+        fail_refs = [item.checked_artifact for item in evidence if item.outcome == CheckOutcome.FAIL]
+        if not fail_refs:
+            return []
+        actions = [
+            RepairAction(action_type=RepairActionType.REGENERATE_SECTION, target_artifacts=[ref], use_diagnostic_feedback=False)
+            for ref in fail_refs
+        ]
+        actions.append(
+            RepairAction(
+                action_type=RepairActionType.REGENERATE_SECTION,
+                target_artifacts=[self.extra_ref],
+                use_diagnostic_feedback=False,
+            )
+        )
+        return actions
+
+
 def _run_branch(
     checkpoint,
     trigger_refs: List[ArtifactRef],
@@ -430,6 +504,7 @@ def _run_branch(
     validator,
     constraint_provider=_one_constraint_per_artifact,
     budget=None,
+    policy=None,
 ) -> BranchExecutionResult:
     runner = BranchingRunner(
         producer_registry={ArtifactKind.SECTION: producer},
@@ -439,7 +514,7 @@ def _run_branch(
     )
     result = runner.run_branches(
         checkpoint,
-        [BranchSpec("A", _ActOnAllFailures())],
+        [BranchSpec("A", policy if policy is not None else _ActOnAllFailures())],
         downstream_policy_factory=_NothingPolicy,
         triggering_evidence=[_fail_evidence(ref) for ref in trigger_refs],
         budget_factory=(budget if budget is not None else (lambda: Budget(cap=1000))),
@@ -455,7 +530,9 @@ def test_repair_gain_score_resolved_case_has_full_gain_and_no_damage() -> None:
     checkpoint, refs = _checkpoint_with_sections("a", "b")
     branch = _run_single_branch(checkpoint, refs, producer=_FakeProducer(), validator=_FakeValidator())
 
-    score = compute_repair_gain_score(checkpoint, branch, target_artifact_ids={"a"})
+    score = compute_repair_gain_score(
+        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(refs["a"])]
+    )
 
     assert score.gain == 1.0
     assert score.outcome_counts == {RepairOutcome.RESOLVED.value: 1}
@@ -471,7 +548,9 @@ def test_repair_gain_score_still_failing_case_has_zero_gain() -> None:
         checkpoint, refs, producer=_FakeProducer(), validator=_FakeValidator(fail_ids=frozenset({"a"}))
     )
 
-    score = compute_repair_gain_score(checkpoint, branch, target_artifact_ids={"a"})
+    score = compute_repair_gain_score(
+        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(refs["a"])]
+    )
 
     assert score.gain == 0.0
     assert score.outcome_counts == {RepairOutcome.STILL_FAILING.value: 1}
@@ -484,7 +563,7 @@ def test_repair_gain_score_empty_target_set_leaves_gain_none_with_reason() -> No
     checkpoint, refs = _checkpoint_with_sections("a", "b")
     branch = _run_single_branch(checkpoint, refs, producer=_FakeProducer(), validator=_FakeValidator())
 
-    score = compute_repair_gain_score(checkpoint, branch, target_artifact_ids=set())
+    score = compute_repair_gain_score(checkpoint, branch, target_artifact_ids=set(), triggering_evidence=[])
 
     assert score.gain is None
     assert score.not_implemented_reason is not None
@@ -502,7 +581,9 @@ def test_repair_gain_score_unresolved_target_is_a_real_zero_not_a_fabricated_non
         checkpoint, refs, producer=_FakeProducer(), validator=_FakeValidator(), budget=lambda: Budget(cap=0)
     )
 
-    score = compute_repair_gain_score(checkpoint, branch, target_artifact_ids={"a"})
+    score = compute_repair_gain_score(
+        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(refs["a"])]
+    )
 
     assert score.gain == 0.0
     assert score.outcome_counts == {LEFT_STALE_OR_UNRESOLVED: 1}
@@ -538,17 +619,140 @@ def test_repair_gain_score_orphaned_dependent_counts_against_a_branch_that_ignor
     assert "b" not in _merge_final_outcomes(branch_a)
     assert "b" in _merge_final_outcomes(branch_b)
 
+    trigger_evidence = [_fail_evidence(refs["a"])]
     comparison = BranchComparisonResult(source_checkpoint_id=checkpoint.checkpoint_id, branches=[branch_a, branch_b])
-    target_ids = compute_common_target_artifact_ids(comparison, triggering_evidence=[_fail_evidence(refs["a"])])
+    target_ids = compute_common_target_artifact_ids(comparison, triggering_evidence=trigger_evidence)
     assert target_ids == {"a", "b"}
 
-    score_a = compute_repair_gain_score(checkpoint, branch_a, target_artifact_ids=target_ids)
-    score_b = compute_repair_gain_score(checkpoint, branch_b, target_artifact_ids=target_ids)
+    score_a = compute_repair_gain_score(
+        checkpoint, branch_a, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+    score_b = compute_repair_gain_score(
+        checkpoint, branch_b, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
 
     assert score_a.gain == 0.5
     assert score_a.outcome_counts == {RepairOutcome.RESOLVED.value: 1, LEFT_STALE_OR_UNRESOLVED: 1}
     assert score_b.gain == 1.0
     assert score_b.outcome_counts == {RepairOutcome.RESOLVED.value: 2}
+
+    # Repro from the second review: "b" is also in target_ids (above), but
+    # damage must be decided from the ORIGINAL failure ("a" alone), not
+    # from target_ids -- so "b"'s real final state still gets evaluated
+    # for both branches, regardless of its target_ids membership. Branch
+    # A left "b" genuinely stale; branch B genuinely resolved it.
+    assert score_a.damage.newly_broken_artifacts == ["b"]
+    assert score_a.damage.preserved_fraction == 0.0
+    assert score_b.damage.newly_broken_artifacts == []
+    assert score_b.damage.preserved_fraction == 1.0
+
+
+def test_damage_of_a_branch_is_not_hidden_by_a_siblings_collateral_sweep() -> None:
+    """Main repro from the second review: "a" fails, "b" is completely
+    unrelated and healthy. A narrow branch resolves only "a"; a wide
+    sibling branch's own action ALSO regenerates "b" (unprompted) and
+    breaks it. compute_common_target_artifact_ids correctly unions "b"
+    into the COMMON target (since the wide branch's history names it) --
+    but that common set must never be reused as damage's exclusion set:
+    doing so let the wide branch's own collateral damage to "b" disappear
+    from ITS OWN score, merely because "b" also collided with the common
+    target computed across both branches."""
+    checkpoint, refs = _checkpoint_with_sections("a", "b")
+    trigger_evidence = [_fail_evidence(refs["a"])]
+
+    branch_narrow = _run_branch(checkpoint, [refs["a"]], producer=_FakeProducer(), validator=_FakeValidator())
+    branch_wide = _run_branch(
+        checkpoint,
+        [refs["a"]],
+        producer=_FakeProducer(),
+        validator=_FakeValidator(fail_ids=frozenset({"b"})),
+        policy=_AlsoRegenerate(refs["b"]),
+    )
+
+    # Sanity-check the premise: "b" was never part of the original
+    # failure, yet the wide branch's own history now names it.
+    assert "b" not in _merge_final_outcomes(branch_narrow)
+    assert "b" in _merge_final_outcomes(branch_wide)
+
+    comparison = BranchComparisonResult(
+        source_checkpoint_id=checkpoint.checkpoint_id, branches=[branch_narrow, branch_wide]
+    )
+    target_ids = compute_common_target_artifact_ids(comparison, triggering_evidence=trigger_evidence)
+    assert target_ids == {"a", "b"}  # "b" is swept in purely via the wide branch's own history
+
+    score_narrow = compute_repair_gain_score(
+        checkpoint, branch_narrow, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+    score_wide = compute_repair_gain_score(
+        checkpoint, branch_wide, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+
+    # Narrow never touched "b" -- it stayed healthy, and damage must say so.
+    assert score_narrow.damage.newly_broken_artifacts == []
+    assert score_narrow.damage.preserved_fraction == 1.0
+    # Wide actually broke the previously-healthy "b" -- damage must catch
+    # this even though "b" is also (correctly) inside target_artifact_ids.
+    assert score_wide.damage.newly_broken_artifacts == ["b"]
+    assert score_wide.damage.preserved_fraction == 0.0
+
+
+def test_repair_gain_score_does_not_trust_a_resolved_verdict_the_final_state_has_since_invalidated() -> None:
+    """Second repro from the second review: "b" is resolved in round 1,
+    then something in a later round regenerates "a" again, which
+    re-invalidates "b" via ordinary staleness propagation -- but nothing
+    ever re-checks "b" afterward. _merge_final_outcomes's last-write-wins
+    rule still reads back RESOLVED for "b" (round 2 never touched it at
+    all), even though the branch's own final_checkpoint shows "b"
+    genuinely stale again. Gain must trust the final checkpoint's ground
+    truth over a now-superseded historical verdict, and must leave this
+    as unresolved -- never promoted to FAIL (RepairOutcome has no real
+    verdict for it; only the sentinel bucket is honest)."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.DEFINITION, content="a1")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.CLAIM, content="b1", read_input_versions=[a_ref])
+    b_ref = store.latest("b").ref
+    before_checkpoint = store.save_checkpoint(label="pre-repair")
+
+    # Round 1: b is regenerated and passes -- genuinely RESOLVED at the time.
+    store.add_version("b", ArtifactKind.CLAIM, content="b-fixed", read_input_versions=[a_ref])
+    fixed_b_ref = store.latest("b").ref
+    store.record_evidence(
+        Evidence(constraint_id="c:b", outcome=CheckOutcome.PASS, checked_artifact=fixed_b_ref, detail="fine")
+    )
+    round_1 = RepairRound(
+        round_index=0, policy_label="initial", executions=[_minimal_execution({"b": RepairOutcome.RESOLVED})]
+    )
+
+    # Something else, in a later round, regenerates "a" again -- this
+    # re-invalidates "b" through ordinary staleness propagation, but
+    # nothing re-checks "b" afterward.
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2", read_input_versions=[])
+    assert store.is_stale("b") is True  # sanity-check the premise is real
+
+    round_2 = RepairRound(
+        round_index=1, policy_label="downstream", executions=[_minimal_execution({"a": RepairOutcome.RESOLVED})]
+    )
+    final_checkpoint = store.save_checkpoint(label="post-repair")
+    branch = BranchExecutionResult(
+        branch_id="A",
+        source_checkpoint_id=before_checkpoint.checkpoint_id,
+        policy_label="A",
+        rounds=[round_1, round_2],
+        stopped_reason="unresolved_remaining",
+        final_checkpoint=final_checkpoint,
+    )
+
+    # Sanity-check the premise: the raw merge still says RESOLVED -- that
+    # stale ledger entry is exactly what must not be trusted blindly.
+    assert _merge_final_outcomes(branch)["b"] == RepairOutcome.RESOLVED
+
+    score = compute_repair_gain_score(
+        before_checkpoint, branch, target_artifact_ids={"b"}, triggering_evidence=[_fail_evidence(b_ref)]
+    )
+
+    assert score.gain == 0.0
+    assert score.outcome_counts == {LEFT_STALE_OR_UNRESOLVED: 1}
 
 
 def test_build_candidate_action_record_end_to_end() -> None:
@@ -561,6 +765,7 @@ def test_build_candidate_action_record_end_to_end() -> None:
         before_checkpoint=checkpoint,
         branch=branch,
         target_artifact_ids={"a"},
+        triggering_evidence=[_fail_evidence(refs["a"])],
     )
 
     assert record.failure_id == "f1"
@@ -587,6 +792,7 @@ def test_build_candidate_action_record_keeps_every_initiating_action_not_just_th
         before_checkpoint=checkpoint,
         branch=branch,
         target_artifact_ids={"a", "b"},
+        triggering_evidence=[_fail_evidence(refs["a"]), _fail_evidence(refs["b"])],
     )
 
     assert len(record.actions) == 2
@@ -607,6 +813,7 @@ def test_build_candidate_action_record_raises_when_branch_never_executed_anythin
             before_checkpoint=checkpoint,
             branch=branch,
             target_artifact_ids={"a"},
+            triggering_evidence=[_fail_evidence(refs["a"])],
         )
 
 
@@ -639,7 +846,7 @@ def test_damage_ignores_a_harmless_content_change_with_no_real_error() -> None:
     )
     after = branch_store.save_checkpoint()
 
-    damage = _compute_damage(before, after, non_target_artifact_ids={"b"})
+    damage = _compute_damage(before, after, healthy_before_artifact_ids={"b"})
 
     assert damage.newly_broken_artifacts == []
     assert damage.preserved_fraction == 1.0
@@ -663,7 +870,7 @@ def test_damage_flags_a_confirmed_new_failure_even_with_unchanged_content() -> N
     )
     after = branch_store.save_checkpoint()
 
-    damage = _compute_damage(before, after, non_target_artifact_ids={"b"})
+    damage = _compute_damage(before, after, healthy_before_artifact_ids={"b"})
 
     assert damage.newly_broken_artifacts == ["b"]
     assert damage.preserved_fraction == 0.0
@@ -683,7 +890,9 @@ def test_damage_considers_every_non_target_artifact_even_ones_the_branch_touched
         checkpoint, [refs["a"]], producer=_FakeProducer(), validator=_FakeValidator(fail_ids=frozenset({"b"}))
     )
 
-    score = compute_repair_gain_score(checkpoint, branch, target_artifact_ids={"a"})
+    score = compute_repair_gain_score(
+        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(refs["a"])]
+    )
 
     assert "b" in score.damage.newly_broken_artifacts
     assert score.damage.preserved_fraction == 0.0

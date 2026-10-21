@@ -52,15 +52,36 @@ Each ``inject_*`` method:
    artifacts the injector itself predicts should be affected -- kept
    separate from whatever a later classification/repair step actually
    observes (see that schema's own docstring for why).
+
+4. Captures ``store.direct_dependencies(artifact_id)`` -- EXPLICIT *and*
+   INFERRED, the complete real dependency set -- immediately *before*
+   writing the corrupted version, and (a) records it on ``InjectedFault.
+   pre_injection_dependency_ids_by_artifact`` as the known reference
+   baseline, and (b) re-registers, against the new version, any of those
+   dependencies that came from an INFERRED edge (via
+   ``_carry_forward_inferred_edges``). A review caught that point 2's own
+   fix -- re-declaring ``read_input_versions`` -- only carries EXPLICIT
+   deps forward: an INFERRED edge (``ArtifactGraphStore.add_inferred_edge``)
+   never appears in any ``ArtifactRef.read_input_versions`` at all, so it
+   still silently dropped the moment the corrupted version superseded the
+   one the INFERRED edge pointed at (the same "edge only counts against
+   the current version" filter point 2's docstring already explains, one
+   layer deeper).
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from src.core.artifact_graph import ArtifactGraphStore
-from src.core.schemas import ArtifactKind, ArtifactRef, FaultInjectionKind, InjectedFault
+from src.core.schemas import (
+    ArtifactKind,
+    ArtifactRef,
+    DependencyRelationKind,
+    FaultInjectionKind,
+    InjectedFault,
+)
 
 
 class UnsupportedInjectionTargetError(ValueError):
@@ -73,6 +94,51 @@ class UnsupportedInjectionTargetError(ValueError):
 
 def _new_fault_id(kind: FaultInjectionKind) -> str:
     return f"fault_{kind.value}_{uuid.uuid4().hex[:8]}"
+
+
+def _carry_forward_inferred_edges(
+    store: ArtifactGraphStore,
+    pre_injection_dependency_ids: Set[str],
+    old_ref: ArtifactRef,
+    new_ref: ArtifactRef,
+) -> None:
+    """Re-register, against ``new_ref``, every INFERRED edge that was live
+    against ``old_ref`` immediately before an injection superseded it.
+
+    ``add_version`` (called just before this, to write the corrupted
+    content) only re-creates EXPLICIT edges, one per ``read_input_versions``
+    entry -- an INFERRED edge lives solely in ``store.edges`` and is never
+    implied by any ``ArtifactRef``, so without this call the moment the
+    injected version becomes current, ``_current_dependents``'s "only live
+    against the current version" filter drops the INFERRED relation
+    entirely, exactly the way the original ``[current.ref]`` self-loop bug
+    dropped EXPLICIT ones.
+
+    Only the ids in ``pre_injection_dependency_ids`` that are NOT already
+    covered by ``new_ref.read_input_versions`` can possibly be INFERRED
+    (``direct_dependencies`` returns both kinds together) -- those are
+    looked up against the actual pre-injection INFERRED edges so the
+    original ``reason`` and exact ``from_artifact`` version are preserved,
+    not fabricated.
+    """
+    declared_ids = {ref.artifact_id for ref in new_ref.read_input_versions}
+    inferred_from_ids = pre_injection_dependency_ids - declared_ids
+    if not inferred_from_ids:
+        return
+    inferred_edges_by_from_id = {
+        edge.from_artifact.artifact_id: edge
+        for edge in store.edges
+        if edge.relation == DependencyRelationKind.INFERRED
+        and edge.to_artifact.artifact_id == old_ref.artifact_id
+        and edge.to_artifact.version == old_ref.version
+    }
+    for from_id in inferred_from_ids:
+        edge = inferred_edges_by_from_id[from_id]
+        store.add_inferred_edge(
+            edge.from_artifact,
+            new_ref,
+            reason=f"carried forward across fault injection: {edge.reason}",
+        )
 
 
 class FaultInjector:
@@ -113,6 +179,7 @@ class FaultInjector:
                 f"'{theorem_ref.artifact_id}'@v{current.ref.version}'s content -- "
                 "an injection must remove something that was actually there."
             )
+        pre_injection_dependency_ids = store.direct_dependencies(theorem_ref.artifact_id)
         corrupted = content.replace(assumption_text, "", 1)
         result = store.add_version(
             theorem_ref.artifact_id,
@@ -121,6 +188,7 @@ class FaultInjector:
             read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
+        _carry_forward_inferred_edges(store, pre_injection_dependency_ids, current.ref, result.ref)
         predicted = sorted(store.impact_candidates(theorem_ref.artifact_id) - {theorem_ref.artifact_id})
         return InjectedFault(
             fault_id=_new_fault_id(FaultInjectionKind.MISSING_ASSUMPTION),
@@ -132,6 +200,9 @@ class FaultInjector:
                 f"'{theorem_ref.artifact_id}'@v{current.ref.version}"
             ),
             predicted_affected_artifact_ids=predicted,
+            pre_injection_dependency_ids_by_artifact={
+                theorem_ref.artifact_id: sorted(pre_injection_dependency_ids)
+            },
         )
 
     def inject_altered_denominator(
@@ -165,6 +236,7 @@ class FaultInjector:
                 f"original_denominator {original_denominator!r} was not found in "
                 f"'{table_ref.artifact_id}'@v{current.ref.version}'s content."
             )
+        pre_injection_dependency_ids = store.direct_dependencies(table_ref.artifact_id)
         corrupted = content.replace(original_denominator, corrupted_denominator, 1)
         result = store.add_version(
             table_ref.artifact_id,
@@ -173,6 +245,7 @@ class FaultInjector:
             read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
+        _carry_forward_inferred_edges(store, pre_injection_dependency_ids, current.ref, result.ref)
         predicted = sorted(store.impact_candidates(table_ref.artifact_id) - {table_ref.artifact_id})
         return InjectedFault(
             fault_id=_new_fault_id(FaultInjectionKind.ALTERED_DENOMINATOR),
@@ -184,6 +257,9 @@ class FaultInjector:
                 f"{original_denominator!r} -> {corrupted_denominator!r}"
             ),
             predicted_affected_artifact_ids=predicted,
+            pre_injection_dependency_ids_by_artifact={
+                table_ref.artifact_id: sorted(pre_injection_dependency_ids)
+            },
         )
 
     def inject_inconsistent_symbol_meaning(
@@ -213,6 +289,8 @@ class FaultInjector:
                 "inject_inconsistent_symbol_meaning requires two distinct sections; "
                 f"got the same artifact_id {section_a_ref.artifact_id!r} twice."
             )
+        pre_injection_dependency_ids_a = store.direct_dependencies(section_a_ref.artifact_id)
+        pre_injection_dependency_ids_b = store.direct_dependencies(section_b_ref.artifact_id)
         content_a = f"{current_a.content or ''}\n{symbol} denotes {meaning_a}."
         content_b = f"{current_b.content or ''}\n{symbol} denotes {meaning_b}."
         result_a = store.add_version(
@@ -222,6 +300,7 @@ class FaultInjector:
             read_input_versions=current_a.ref.read_input_versions,
             produced_by=produced_by,
         )
+        _carry_forward_inferred_edges(store, pre_injection_dependency_ids_a, current_a.ref, result_a.ref)
         result_b = store.add_version(
             section_b_ref.artifact_id,
             current_b.ref.kind,
@@ -229,6 +308,7 @@ class FaultInjector:
             read_input_versions=current_b.ref.read_input_versions,
             produced_by=produced_by,
         )
+        _carry_forward_inferred_edges(store, pre_injection_dependency_ids_b, current_b.ref, result_b.ref)
         predicted = sorted(
             (store.impact_candidates(section_a_ref.artifact_id) | store.impact_candidates(section_b_ref.artifact_id))
             - {section_a_ref.artifact_id, section_b_ref.artifact_id}
@@ -243,6 +323,10 @@ class FaultInjector:
                 f"but {meaning_b!r} in '{section_b_ref.artifact_id}'"
             ),
             predicted_affected_artifact_ids=predicted,
+            pre_injection_dependency_ids_by_artifact={
+                section_a_ref.artifact_id: sorted(pre_injection_dependency_ids_a),
+                section_b_ref.artifact_id: sorted(pre_injection_dependency_ids_b),
+            },
         )
 
     def inject_unsatisfiable_blueprint(
@@ -270,6 +354,7 @@ class FaultInjector:
             raise UnsupportedInjectionTargetError(
                 f"'{document_ref.artifact_id}' has never been stored; cannot inject into it."
             )
+        pre_injection_dependency_ids = store.direct_dependencies(document_ref.artifact_id)
         requirement_block = "\n".join(f"- {req}" for req in contradictory_requirements)
         corrupted = f"{current.content or ''}\n[contradictory requirements]\n{requirement_block}"
         result = store.add_version(
@@ -279,6 +364,7 @@ class FaultInjector:
             read_input_versions=current.ref.read_input_versions,
             produced_by=produced_by,
         )
+        _carry_forward_inferred_edges(store, pre_injection_dependency_ids, current.ref, result.ref)
         predicted = sorted(store.impact_candidates(document_ref.artifact_id) - {document_ref.artifact_id})
         return InjectedFault(
             fault_id=_new_fault_id(FaultInjectionKind.UNSATISFIABLE_BLUEPRINT),
@@ -290,4 +376,7 @@ class FaultInjector:
                 f"contradictory requirements: {contradictory_requirements!r}"
             ),
             predicted_affected_artifact_ids=predicted,
+            pre_injection_dependency_ids_by_artifact={
+                document_ref.artifact_id: sorted(pre_injection_dependency_ids)
+            },
         )
