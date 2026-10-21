@@ -50,6 +50,7 @@ from src.core.schemas import (
     RepairExecutionResult,
     RepairOutcome,
     RepairRound,
+    UnknownReason,
 )
 
 
@@ -404,14 +405,20 @@ class _FakeProducer:
 
 
 class _FakeValidator:
-    def __init__(self, fail_ids: FrozenSet[str] = frozenset()) -> None:
+    def __init__(self, fail_ids: FrozenSet[str] = frozenset(), unknown_ids: FrozenSet[str] = frozenset()) -> None:
         self.fail_ids = set(fail_ids)
+        self.unknown_ids = set(unknown_ids)
         self.config: Dict[str, bool] = {}
 
     def check(
         self, artifact: ArtifactRef, constraints: List[Constraint], context: Optional[Dict[str, Any]] = None
     ) -> List[Evidence]:
-        outcome = CheckOutcome.FAIL if artifact.artifact_id in self.fail_ids else CheckOutcome.PASS
+        if artifact.artifact_id in self.fail_ids:
+            outcome = CheckOutcome.FAIL
+        elif artifact.artifact_id in self.unknown_ids:
+            outcome = CheckOutcome.UNKNOWN
+        else:
+            outcome = CheckOutcome.PASS
         return [
             Evidence(constraint_id=c.constraint_id, outcome=outcome, checked_artifact=artifact, detail="fake")
             for c in constraints
@@ -445,12 +452,28 @@ def _one_constraint_per_artifact(ref: ArtifactRef) -> List[Constraint]:
     return [Constraint(constraint_id=f"c:{ref.artifact_id}", kind=ConstraintKind.SCHEMA_CONTRACT, description="d")]
 
 
+def _record_pass(store: ArtifactGraphStore, ref: ArtifactRef) -> None:
+    """Every fixture artifact gets an explicit, CONFIRMED PASS at
+    creation -- never left merely unchecked. A review caught that
+    _is_confirmed_healthy requires an actual live PASS, not just "not
+    stale, no FAIL": a freshly-created artifact with zero evidence is
+    UNKNOWN/unverified, not healthy, so any fixture that wants an
+    artifact to behave as a genuine pre-existing-healthy baseline must
+    say so explicitly, exactly like a real pipeline would have checked it
+    at least once before now."""
+    store.record_evidence(
+        Evidence(constraint_id=f"c:{ref.artifact_id}", outcome=CheckOutcome.PASS, checked_artifact=ref, detail="baseline")
+    )
+
+
 def _checkpoint_with_sections(*artifact_ids: str):
     store = ArtifactGraphStore()
     refs = {}
     for artifact_id in artifact_ids:
         store.add_version(artifact_id, ArtifactKind.SECTION, content=None)
-        refs[artifact_id] = store.latest(artifact_id).ref
+        ref = store.latest(artifact_id).ref
+        _record_pass(store, ref)
+        refs[artifact_id] = ref
     return store.save_checkpoint(label="pre-repair"), refs
 
 
@@ -458,8 +481,10 @@ def _checkpoint_with_dependency(parent_id: str, child_id: str):
     store = ArtifactGraphStore()
     store.add_version(parent_id, ArtifactKind.SECTION, content=None)
     parent_ref = store.latest(parent_id).ref
+    _record_pass(store, parent_ref)
     store.add_version(child_id, ArtifactKind.SECTION, content=None, read_input_versions=[parent_ref])
     child_ref = store.latest(child_id).ref
+    _record_pass(store, child_ref)
     return store.save_checkpoint(label="pre-repair"), {parent_id: parent_ref, child_id: child_ref}
 
 
@@ -834,6 +859,100 @@ def test_repair_gain_score_already_healthy_untouched_does_not_apply_to_a_genuine
     assert score.gain == 0.5
 
 
+def test_repair_gain_score_unknown_untouched_does_not_count_toward_gain() -> None:
+    """Main repro from a fourth review: "a" fails, "b" starts on a live
+    UNKNOWN (checked, but could not be evaluated either way -- never
+    actually confirmed healthy). A narrow branch repairs only "a" and
+    leaves "b" untouched (still UNKNOWN); a wide sibling branch
+    re-checks "b" too, and the recheck is ALSO UNKNOWN -- an honest
+    INCONCLUSIVE, since neither branch ever confirms "b" is fine.
+    Absence of a FAIL is not confirmation of a PASS: the branch that did
+    LESS (never re-checked "b" at all) must not score better than the
+    one that honestly re-verified and still could not confirm it."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.SECTION, content="orig-b")
+    b_ref = store.latest("b").ref
+    store.record_evidence(
+        Evidence(
+            constraint_id="c:b",
+            outcome=CheckOutcome.UNKNOWN,
+            checked_artifact=b_ref,
+            detail="could not evaluate",
+            unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+        )
+    )
+    checkpoint = store.save_checkpoint()
+    trigger_evidence = [_fail_evidence(a_ref)]
+
+    branch_narrow = _run_branch(checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
+    branch_wide = _run_branch(
+        checkpoint,
+        [a_ref],
+        producer=_FakeProducer(),
+        validator=_FakeValidator(unknown_ids=frozenset({"b"})),
+        policy=_AlsoRegenerate(b_ref),
+    )
+    # Sanity-check the premise: narrow truly never touched "b"; wide did,
+    # and the recheck itself came back inconclusive, not a confirmed pass.
+    assert "b" not in _merge_final_outcomes(branch_narrow)
+    assert _merge_final_outcomes(branch_wide)["b"] == RepairOutcome.INCONCLUSIVE
+
+    comparison = BranchComparisonResult(
+        source_checkpoint_id=checkpoint.checkpoint_id, branches=[branch_narrow, branch_wide]
+    )
+    target_ids = compute_common_target_artifact_ids(comparison, triggering_evidence=trigger_evidence)
+    assert target_ids == {"a", "b"}
+
+    score_narrow = compute_repair_gain_score(
+        checkpoint, branch_narrow, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+    score_wide = compute_repair_gain_score(
+        checkpoint, branch_wide, target_artifact_ids=target_ids, triggering_evidence=trigger_evidence
+    )
+
+    # "b" must land in the same kind of non-success bucket for both --
+    # never ALREADY_HEALTHY_UNTOUCHED, since nobody ever confirmed it.
+    assert score_narrow.outcome_counts == {RepairOutcome.RESOLVED.value: 1, LEFT_STALE_OR_UNRESOLVED: 1}
+    assert score_narrow.gain == 0.5
+    assert score_wide.outcome_counts == {RepairOutcome.RESOLVED.value: 1, RepairOutcome.INCONCLUSIVE.value: 1}
+    assert score_wide.gain == 0.5
+
+
+def test_damage_excludes_an_unconfirmed_artifact_from_the_healthy_before_baseline() -> None:
+    """The damage-side twin of the gain repro above: "b" starts on a live
+    UNKNOWN (never confirmed healthy) and is left completely untouched.
+    It must not be checked for damage at all -- there is no confirmed
+    healthy baseline to preserve -- so it must never appear in
+    newly_broken_artifacts, and the checked denominator must not count
+    it either."""
+    store = ArtifactGraphStore()
+    store.add_version("a", ArtifactKind.SECTION, content="orig-a")
+    a_ref = store.latest("a").ref
+    store.add_version("b", ArtifactKind.SECTION, content="orig-b")
+    b_ref = store.latest("b").ref
+    store.record_evidence(
+        Evidence(
+            constraint_id="c:b",
+            outcome=CheckOutcome.UNKNOWN,
+            checked_artifact=b_ref,
+            detail="could not evaluate",
+            unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+        )
+    )
+    checkpoint = store.save_checkpoint()
+
+    branch = _run_branch(checkpoint, [a_ref], producer=_FakeProducer(), validator=_FakeValidator())
+    score = compute_repair_gain_score(
+        checkpoint, branch, target_artifact_ids={"a"}, triggering_evidence=[_fail_evidence(a_ref)]
+    )
+
+    assert "b" not in score.damage.newly_broken_artifacts
+    assert score.damage.preserved_fraction is None
+    assert score.damage.not_implemented_reason is not None
+
+
 def test_build_candidate_action_record_end_to_end() -> None:
     checkpoint, refs = _checkpoint_with_sections("a", "b")
     branch = _run_single_branch(checkpoint, refs, producer=_FakeProducer(), validator=_FakeValidator())
@@ -994,6 +1113,8 @@ def test_damage_excludes_an_artifact_that_was_already_broken_before_the_repair()
     # genuinely, pre-existingly stale, for a reason unrelated to a's
     # own repair.
     store.add_version("x", ArtifactKind.SECTION, content="x changed", read_input_versions=[])
+    x_ref_2 = store.latest("x").ref
+    _record_pass(store, x_ref_2)  # x itself is confirmed healthy -- only b is pre-broken
     assert store.is_stale("b") is True  # sanity-check the premise is real
 
     before_checkpoint = store.save_checkpoint()

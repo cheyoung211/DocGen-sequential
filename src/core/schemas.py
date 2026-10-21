@@ -1628,6 +1628,22 @@ class RepairGainScore(BaseModel):
     (``failure_dataset._is_broken_in_final_state``), not just trigger
     membership -- see ``failure_dataset._pre_repair_healthy_artifact_ids``
     and ``compute_repair_gain_score``'s own (rewritten) docstring.
+
+    A *fourth* review then caught that "the checkpoint's own ground
+    truth" from the previous paragraph was itself checked the wrong way:
+    both fixes asserted "healthy" from the NEGATION of "confirmed broken"
+    (``not _is_broken_in_final_state(...)``), which silently also matches
+    a target with NO evidence at all, or only live ``UNKNOWN`` entries --
+    genuinely unverified, neither confirmed broken nor confirmed healthy.
+    A target left on UNKNOWN both before and after a repair still counted
+    as ``"already_healthy_untouched"`` for whichever branch happened not
+    to re-check it, scoring a perfect ``gain=1.0`` against a sibling that
+    DID re-check it, honestly got ``INCONCLUSIVE`` again, and was scored
+    worse for being more thorough. Fixed by requiring
+    ``failure_dataset._is_confirmed_healthy`` (an actual live PASS) for
+    both this sentinel and the damage baseline -- "not confirmed broken"
+    and "confirmed healthy" are different claims, and an unverified
+    target satisfies neither.
     """
 
     outcome_counts: Dict[str, int] = Field(default_factory=dict)

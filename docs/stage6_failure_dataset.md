@@ -519,3 +519,45 @@ import하려다 생기는 것으로, 이번 Stage 6 변경과 무관한 훨씬 �
 재현)해 실제로 실패함을 확인한 뒤에야 "수정됨"으로 기록했다.
 
 **아직 하지 않은 것**: §5/§6/§7과 동일, 이번 라운드로 바뀌지 않음.
+
+## 9. 사용자 4차 재검토 후 수정 (2026.10.22)
+
+8절의 3개 수정을 반영한 뒤, 사용자가 다시 검토해 추가 버그 1개를 지적함 — `ALREADY_HEALTHY_UNTOUCHED`
+sentinel과 `_pre_repair_healthy_artifact_ids` 둘 다 "정상"을 `not _is_broken_in_final_state(...)`
+(= stale도 아니고 live FAIL도 없음)로 판정했는데, 이는 "유효한 PASS가 있는가"를 확인하지 않는다.
+따라서 evidence가 전혀 없거나 UNKNOWN만 있는 경우도 "정상"으로 간주됐다.
+
+실제 BranchingRunner로 A=FAIL, B=UNKNOWN(검사했지만 판정 불가)인 checkpoint를 실행한 결과, 좁은
+복구(A만 처리, B는 그대로 UNKNOWN)는 gain=1.0, 넓은 복구(A·B 모두 재검사, B는 재검사도
+UNKNOWN=INCONCLUSIVE)는 gain=0.5가 나왔다 — 두 branch 모두 B의 정상 여부를 확인하지 못했는데도
+B를 건드리지 않은 branch만 완전 해결 점수를 받는 역전 현상. 손상 평가의 "복구 전 정상" 기준
+집합에도 같은 문제가 있었다(UNKNOWN·미검사 artifact가 "건강함"으로 분류돼 보존율 분모에
+포함됨).
+
+**수정** (`failure_dataset.py`): 새 함수 `_is_confirmed_healthy(store, artifact_id)`를
+추가 — `store.live_evidence(artifact_id)`에 실제 PASS가 하나라도 있는지만 확인한다(`_is_broken_in_final_state`의
+부정이 아니다). `_is_broken_in_final_state`(확정 손상)와 `_is_confirmed_healthy`(확정 정상)는
+같은 artifact에 대해 동시에 `False`일 수 있다 — 그것이 바로 "판정 불가" 상태이며, 어느 쪽
+버킷으로도 들어가서는 안 된다. `ALREADY_HEALTHY_UNTOUCHED`의 적용 조건과
+`_pre_repair_healthy_artifact_ids`의 필터를 모두 `_is_confirmed_healthy`로 교체했다 — UNKNOWN이거나
+전혀 검사되지 않은 artifact는 이제 gain의 성공 분자에도, 손상 평가의 정상 기준 집합에도 들어가지
+않고, (분리된 다른 branch 실행이 없다면) `LEFT_STALE_OR_UNRESOLVED`로 떨어지거나 손상 평가
+대상에서 완전히 제외된다.
+
+기존 테스트 fixture(`_checkpoint_with_sections`/`_checkpoint_with_dependency`)는 artifact
+생성 시 evidence를 전혀 기록하지 않았는데, 이는 "검사되지 않음"과 "건강함"을 똑같이 취급하던
+바로 그 가정에 의존하고 있었다. 두 fixture 모두 새 헬퍼 `_record_pass`로 생성 시점에 명시적
+PASS를 기록하도록 수정해, "복구 전부터 확인된 건강한 baseline"이라는 전제를 암묵적 가정이
+아니라 명시적 사실로 만들었다.
+
+회귀 테스트: `test_repair_gain_score_unknown_untouched_does_not_count_toward_gain`(A=FAIL,
+B=UNKNOWN을 실제 BranchingRunner로 재현 — 좁은 복구 gain=0.5, 넓은 복구도 gain=0.5로 동일하게
+나옴을 확인), `test_damage_excludes_an_unconfirmed_artifact_from_the_healthy_before_baseline`
+(UNKNOWN만 있는 artifact가 손상 평가 대상에서 완전히 제외됨을 확인).
+
+**검증**: `test/core/`에 2개 테스트 추가(`test_failure_dataset.py` 32→34). `test/core/`
+343→345개. 전체 저장소 기준 891 passed / 57 failed(기존과 동일). 두 회귀 테스트 모두 수정 전
+코드(stash)에 대해 직접 실행해 실제로 실패함(narrow가 `already_healthy_untouched`로 분류되거나
+damage가 `preserved_fraction=1.0`을 잘못 반환함)을 확인한 뒤에야 "수정됨"으로 기록했다.
+
+**아직 하지 않은 것**: §5/§6/§7/§8과 동일, 이번 라운드로 바뀌지 않음.

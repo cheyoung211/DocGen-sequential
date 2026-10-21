@@ -89,6 +89,24 @@ id -- dropping the INFERRED edge (and the retroactive staleness it alone
 was responsible for) entirely. Fixed in ``fault_injection.py`` by looking
 up INFERRED edges directly by exact ``(artifact_id, version)``, never by
 id-only set subtraction -- see that module's own revised docstring.
+
+**Revised a fourth time after a fourth review found 1 more real bug,
+inside the previous round's own two new mechanisms at once**:
+``ALREADY_HEALTHY_UNTOUCHED`` and ``_pre_repair_healthy_artifact_ids``
+both asserted "healthy" from ``not _is_broken_in_final_state(...)`` --
+i.e. "not confirmed broken" -- which silently also matches a THIRD state
+neither confirmed-broken nor confirmed-healthy covers: no evidence at
+all, or only live ``CheckOutcome.UNKNOWN`` entries. A target left on
+UNKNOWN both before and after (never actually verified by anyone) still
+counted as ``ALREADY_HEALTHY_UNTOUCHED`` for whichever branch happened
+not to re-check it, while its sibling branch that DID re-check it and
+honestly got ``INCONCLUSIVE`` again scored worse for being more thorough.
+Fixed by adding ``_is_confirmed_healthy`` (requires an actual live PASS)
+and using it -- never the negation of ``_is_broken_in_final_state`` --
+everywhere this module asserts an artifact IS healthy; the two predicates
+are allowed to both be ``False`` for the same artifact (unverified is
+neither), and nothing in this module may treat that as a tie-break in
+either direction.
 """
 
 from __future__ import annotations
@@ -323,6 +341,28 @@ def _is_broken_in_final_state(store: ArtifactGraphStore, artifact_id: str) -> bo
     )
 
 
+def _is_confirmed_healthy(store: ArtifactGraphStore, artifact_id: str) -> bool:
+    """An artifact counts as CONFIRMED healthy iff it has at least one live
+    PASS ``Evidence`` -- deliberately NOT the negation of
+    ``_is_broken_in_final_state``. A review caught that treating "not
+    stale and no live FAIL" as "healthy" silently promotes a THIRD,
+    genuinely different state -- no evidence at all, or only live
+    ``CheckOutcome.UNKNOWN`` entries (a constraint that could not be
+    evaluated) -- into a confirmed-fine verdict it never earned. Those two
+    predicates are allowed to both be ``False`` for the same artifact at
+    the same time: unverified is not broken, but it is not healthy
+    either, and must never be silently counted as either one just because
+    it fails to match the other's definition. Used wherever this module
+    needs to assert an artifact IS fine (``ALREADY_HEALTHY_UNTOUCHED``,
+    ``_pre_repair_healthy_artifact_ids``) -- as opposed to
+    ``_is_broken_in_final_state``, used wherever it needs to assert an
+    artifact IS broken (damage's "newly broken" check, the RESOLVED-
+    verdict cross-check); an UNKNOWN/never-checked artifact correctly
+    satisfies neither.
+    """
+    return any(item.outcome == CheckOutcome.PASS for item in store.live_evidence(artifact_id))
+
+
 def _originally_failing_artifact_ids(triggering_evidence: List[Evidence]) -> Set[str]:
     """Every artifact_id that was actually FAILING in ``triggering_evidence``
     -- what every branch being compared started from, before any of them
@@ -340,9 +380,10 @@ def _originally_failing_artifact_ids(triggering_evidence: List[Evidence]) -> Set
 
 def _pre_repair_healthy_artifact_ids(before: Checkpoint, triggering_evidence: List[Evidence]) -> Set[str]:
     """Every artifact_id in ``before`` that is NEITHER part of the original
-    trigger (``_originally_failing_artifact_ids``) NOR already broken in
-    ``before``'s own ground truth (``_is_broken_in_final_state``, read from
-    a store reconstructed from ``before`` itself) -- the only artifacts for
+    trigger (``_originally_failing_artifact_ids``) NOR anything less than
+    CONFIRMED healthy in ``before``'s own ground truth
+    (``_is_confirmed_healthy``, read from a store reconstructed from
+    ``before`` itself: at least one live PASS) -- the only artifacts for
     which a repair starting from this checkpoint can meaningfully be said
     to have caused *new* damage.
 
@@ -355,16 +396,26 @@ def _pre_repair_healthy_artifact_ids(before: Checkpoint, triggering_evidence: Li
     artifact left completely untouched, still exactly as stale as it was
     in ``before``, was reported as "newly broken" purely because
     ``_compute_damage`` never checked whether it had actually ever been
-    healthy to begin with. Only a genuine healthy-before -> broken-after
-    TRANSITION is damage; a pre-existing problem outside this repair's
-    scope is neither this repair's achievement nor its fault.
+    healthy to begin with.
+
+    A *second* review then caught that the fix for that bug (checking
+    ``_is_broken_in_final_state``, i.e. excluding only CONFIRMED-broken
+    artifacts) still silently promoted a THIRD state -- no evidence at
+    all, or only live ``UNKNOWN`` -- into "healthy," since "not confirmed
+    broken" is not the same claim as "confirmed healthy." An artifact
+    whose status was never actually verified is not a safe baseline for
+    "this repair preserved it": there is nothing to preserve if nothing
+    ever confirmed it was fine to begin with. Only a genuine CONFIRMED
+    healthy-before -> broken-after TRANSITION is damage; a pre-existing
+    problem, or a status this stage never verified either way, is neither
+    this repair's achievement nor its fault.
     """
     before_store = ArtifactGraphStore.from_checkpoint(before, branch_id="damage-baseline")
     originally_failing_ids = _originally_failing_artifact_ids(triggering_evidence)
     return {
         artifact_id
         for artifact_id in before.artifacts
-        if artifact_id not in originally_failing_ids and not _is_broken_in_final_state(before_store, artifact_id)
+        if artifact_id not in originally_failing_ids and _is_confirmed_healthy(before_store, artifact_id)
     }
 
 
@@ -505,14 +556,16 @@ def compute_repair_gain_score(
     A target_id this branch's own history never mentions at all is NOT
     automatically ``LEFT_STALE_OR_UNRESOLVED`` either: if it is not part
     of the original trigger (``_originally_failing_artifact_ids``) AND is
-    confirmed non-broken in this branch's own final state, it becomes
-    ``ALREADY_HEALTHY_UNTOUCHED`` instead, and counts toward ``gain``'s
-    numerator alongside ``RESOLVED``. A review's repro had A fail and B
-    already sitting on a valid PASS; a narrow branch correctly repaired
-    only A and left B alone, while a wide sibling branch redundantly
-    regenerated both -- pulling B into the COMMON ``target_artifact_ids``
-    via ``compute_common_target_artifact_ids``'s component (b). Without
-    this sentinel, the narrow branch's own, correct choice to leave an
+    CONFIRMED healthy in this branch's own final state
+    (``_is_confirmed_healthy`` -- at least one live PASS, NOT merely "not
+    confirmed broken"), it becomes ``ALREADY_HEALTHY_UNTOUCHED`` instead,
+    and counts toward ``gain``'s numerator alongside ``RESOLVED``. A
+    review's repro had A fail and B already sitting on a valid PASS; a
+    narrow branch correctly repaired only A and left B alone, while a
+    wide sibling branch redundantly regenerated both -- pulling B into the
+    COMMON ``target_artifact_ids`` via
+    ``compute_common_target_artifact_ids``'s component (b). Without this
+    sentinel, the narrow branch's own, correct choice to leave an
     already-healthy B untouched read as if it had ignored a real problem
     (``gain=0.5`` instead of the deserved ``1.0``) -- a comparison that
     structurally penalizes the MORE selective, MORE efficient repair. This
@@ -523,23 +576,35 @@ def compute_repair_gain_score(
     NEVER actually a problem for this checkpoint at all is eligible for
     the new sentinel.
 
+    A *second* review then caught that requiring merely "not confirmed
+    broken" (``_is_broken_in_final_state``'s negation) for the sentinel
+    above silently admitted a THIRD state: no evidence at all, or only
+    live ``UNKNOWN`` entries (a constraint that could not be evaluated
+    either way). A target B left on UNKNOWN before AND after -- genuinely
+    never verified as healthy by either branch -- still counted as
+    ``ALREADY_HEALTHY_UNTOUCHED`` for whichever branch happened not to
+    touch it, giving that branch a perfect ``gain=1.0`` while its sibling
+    (which DID re-check B, and got UNKNOWN again -- an honest
+    ``INCONCLUSIVE``, never counted toward gain) scored only ``0.5``,
+    even though NEITHER branch ever actually confirmed B was fine. Fixed
+    by requiring ``_is_confirmed_healthy`` (an actual live PASS) for this
+    sentinel, never just the absence of a confirmed FAIL/stale state --
+    unverified is its own, third outcome, counted toward neither bucket.
+
     ``triggering_evidence`` -- the SAME list passed to
     ``compute_common_target_artifact_ids`` for this comparison -- is used
     for two things: the ``ALREADY_HEALTHY_UNTOUCHED`` check above, and to
     derive ``damage``'s evaluation set,
     ``_pre_repair_healthy_artifact_ids(before_checkpoint, triggering_evidence)``
     -- every artifact that both (a) was not part of the original trigger,
-    and (b) was not ALREADY broken in ``before_checkpoint``'s own ground
-    truth for some pre-existing, unrelated reason (a review caught that
-    assuming "not the trigger" alone meant "healthy before" let an
-    already-stale, completely untouched artifact be reported as "newly
-    broken" for simply remaining exactly as broken as it always was).
-    This is deliberately NOT ``target_artifact_ids``'s complement either
-    -- excluding the full common target (which also includes whatever a
-    *sibling* branch's own history later adds) let an artifact THIS
-    branch itself swept into a wide action and broke escape
-    damage-checking, simply because some other branch's history happened
-    to also mention it.
+    and (b) is CONFIRMED healthy (not merely "not confirmed broken," for
+    the identical reason as the previous paragraph) in
+    ``before_checkpoint``'s own ground truth. This is deliberately NOT
+    ``target_artifact_ids``'s complement either -- excluding the full
+    common target (which also includes whatever a *sibling* branch's own
+    history later adds) let an artifact THIS branch itself swept into a
+    wide action and broke escape damage-checking, simply because some
+    other branch's history happened to also mention it.
     """
     final_outcomes = _merge_final_outcomes(branch)
     final_store = ArtifactGraphStore.from_checkpoint(branch.final_checkpoint, branch_id="gain-check")
@@ -558,6 +623,7 @@ def compute_repair_gain_score(
             outcome is None
             and target_id not in originally_failing_ids
             and confirmed_in_final_checkpoint
+            and _is_confirmed_healthy(final_store, target_id)
             and not _is_broken_in_final_state(final_store, target_id)
         ):
             bucket = ALREADY_HEALTHY_UNTOUCHED
