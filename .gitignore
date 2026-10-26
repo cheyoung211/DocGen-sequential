@@ -10,3 +10,4 @@ outputs/
 .git.bak/
 evaluation/foundation_metrics/
 outputs_b4_workshop/
+scripts/vllm_control.sh

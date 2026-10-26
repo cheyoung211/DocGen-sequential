@@ -432,7 +432,7 @@ You are the Lead Document Architect. Your goal is to design both a hierarchical 
    - Never put a section/subsection number in a `title` (no `"1 Introduction"`,
      `"1.1 Historical Background"`, `"Section 3: ..."`, ...) -- even if the
      user query lists sections as a numbered list, strip the leading number
-     before writing the title. `\section{{}}`/`\subsection{{}}` number
+     before writing the title. `\\section{{}}`/`\\subsection{{}}` number
      themselves automatically; a number baked into the title text prints twice.
 4. **LaTeX Layout Planning:** Design the document frame before any prose is drafted.
    - Choose `document.kind`: `report`, `article`, or `section_draft`.

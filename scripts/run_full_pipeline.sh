@@ -60,8 +60,8 @@ python3 scripts/run_full_pipeline.py \
   --planner-model qwen3.6-35b-a3b \
   --text-model qwen3.6-35b-a3b \
   --integrator-model qwen3.6-35b-a3b \
-  --out-dir "outputs/qwen_smoke_test/" \
-  --seed 42
+  --out-dir "outputs/qwen_smoke_test/" #\
+  # --seed 42
 
   # 가능 모델: gemini-*-preview / gemini-*.* (Google) / gpt-* (OpenAI) / qwen3.6-35b-a3b (local vLLM, GPU 3)
 
