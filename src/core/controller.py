@@ -461,11 +461,76 @@ def _invalidated_keys(store: ArtifactGraphStore, evidence: List[Evidence]) -> Se
     }
 
 
-def _aggregate_unresolved(state: ControllerState, store: ArtifactGraphStore) -> Set[str]:
+def _never_checked_required_ids(
+    store: ArtifactGraphStore,
+    tracked_ids: Set[str],
+    constraint_provider: ConstraintProvider,
+) -> Set[str]:
+    """Which of ``tracked_ids`` have at least one constraint that
+    ``constraint_provider`` says is REQUIRED for them, but that has never
+    produced any live Evidence at all -- distinct from every case
+    ``_compute_unresolved`` already covers, all three of which require
+    *some* trace to already exist (a stale flag, a blocked flag, an
+    invalidated-and-pending-recheck pair). A constraint simply never named
+    by any CheckCall for this artifact leaves none of those traces: no
+    Evidence means not stale (nothing moved), not blocked (no production
+    was even attempted), and not in ``needs_recheck_keys`` (that set is
+    for evidence that WAS once valid and got invalidated, not for evidence
+    that never existed in the first place).
+
+    ``required`` comes from the spec (``constraint_provider``), never from
+    ``live_evidence()`` itself -- the same lesson Stage 6's own
+    ``_required_constraint_ids`` already learned the hard way (see memory
+    ``docgen_stage_review_rigor`` pattern #72): a log can only report what
+    ran, never what should have. Skips an artifact not yet stored at all
+    (nothing to ask the provider about) or already stale (``_compute_
+    unresolved`` already covers it; re-deriving the same fact here would
+    just be slower, not more correct).
+    """
+    unresolved: Set[str] = set()
+    for artifact_id in tracked_ids:
+        if store.is_stale(artifact_id):
+            continue
+        stored = store.latest(artifact_id)
+        if stored is None:
+            continue
+        required_ids = {constraint.constraint_id for constraint in constraint_provider(stored.ref)}
+        if not required_ids:
+            continue
+        checked_ids = {evidence.constraint_id for evidence in store.live_evidence(artifact_id)}
+        if required_ids - checked_ids:
+            unresolved.add(artifact_id)
+    return unresolved
+
+
+def _aggregate_unresolved(
+    state: ControllerState,
+    store: ArtifactGraphStore,
+    constraint_provider: Optional[ConstraintProvider] = None,
+) -> Set[str]:
     """The complete "what is still wrong, right now" picture: every
     structurally unresolved id (``_compute_unresolved``) plus every
     artifact_id ``state.current_evidence`` currently reports FAIL or
-    UNKNOWN for, plus the document itself if the last COMPILE failed.
+    UNKNOWN for, plus the document itself if the last COMPILE failed, plus
+    (when ``constraint_provider`` is given) every tracked artifact with at
+    least one REQUIRED constraint that was never checked at all -- see
+    ``_never_checked_required_ids``.
+
+    ``constraint_provider`` is optional, defaulting to ``None`` (old
+    behavior, completely unchanged): most of this function's own call
+    sites are a ``ControllerPolicy``'s own internal, redundant pre-check of
+    its own in-progress decision -- ``ControllerRuntime._controller_node``
+    is the one choke point every ``FinishCall`` is unconditionally
+    re-passed through regardless of which path produced it (this module's
+    own docstring, point 14), so that is the only call site that actually
+    needs to supply it for the never-checked-required guarantee to hold
+    for every ``FinishCall`` this runtime ever returns. Added after a user
+    review found: ``FinishCall.unresolved_artifact_ids`` could read `[]`
+    for a document whose human rubric required a constraint no CheckCall
+    had ever named, because every existing check here is shaped to notice
+    something that *changed* (went stale, failed, got invalidated) --
+    never "was required and simply never attempted."
+
     Added after a second user review found every termination path
     (``ControllerRuntime._controller_node``'s own guard trips, in
     particular) reporting its ``FinishCall.unresolved_artifact_ids`` from
@@ -499,6 +564,8 @@ def _aggregate_unresolved(state: ControllerState, store: ArtifactGraphStore) -> 
     }
     if state.last_compile_failed:
         unresolved.add(state.document_ref.artifact_id)
+    if constraint_provider is not None:
+        unresolved |= _never_checked_required_ids(store, state.tracked_artifact_ids, constraint_provider)
     return unresolved
 
 
@@ -1060,6 +1127,11 @@ class ControllerRuntime:
         self._document_ref = document_ref
         self._max_steps = max_steps
         self._repeat_threshold = repeat_threshold
+        # Kept directly (not just handed to ToolExecutor below) so
+        # _controller_node's one choke-point call to _aggregate_unresolved
+        # can supply it -- see that function's docstring on why this is
+        # the only call site that needs to.
+        self._constraint_provider = constraint_provider
         self._tool_executor = ToolExecutor(
             store,
             checker,
@@ -1261,7 +1333,8 @@ class ControllerRuntime:
             call = call.model_copy(
                 update={
                     "unresolved_artifact_ids": sorted(
-                        set(call.unresolved_artifact_ids) | _aggregate_unresolved(state, self._store)
+                        set(call.unresolved_artifact_ids)
+                        | _aggregate_unresolved(state, self._store, self._constraint_provider)
                     )
                 }
             )

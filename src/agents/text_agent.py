@@ -622,6 +622,11 @@ class TextAgent:
 
         sections_dir = Path(output_dir) / request_id / "sections"
         sections_dir.mkdir(parents=True, exist_ok=True)
+        # A no-op for a genuine first draft (nothing on disk yet); for a
+        # section-level repair call (process_node invoked again on an
+        # already-drafted node), preserves the pre-repair content before
+        # it gets overwritten below -- see _snapshot_before_overwrite.
+        self._snapshot_before_overwrite(sections_dir, node_id)
         graph.update_node_status(node_id, NodeStatus.RUNNING)
 
         tracker = AttemptTracker(
@@ -694,6 +699,11 @@ class TextAgent:
                 f"Block '{block_id}' has no persisted content for section '{node_id}' yet."
             )
 
+        # Preserves the pre-repair content (this is always a repair call,
+        # never a first draft -- _read_persisted_output above already
+        # raised if nothing was drafted yet) before _run_generation_loop
+        # overwrites it on success -- see _snapshot_before_overwrite.
+        self._snapshot_before_overwrite(sections_dir, node_id)
         graph.update_node_status(node_id, NodeStatus.RUNNING)
         tracker = AttemptTracker(
             event_logger,
@@ -843,6 +853,44 @@ class TextAgent:
                 "regenerate_blocks() requires the section to already be drafted."
             )
         return TextAgentOutput.model_validate(json.loads(blocks_path.read_text(encoding="utf-8")))
+
+    @staticmethod
+    def _snapshot_before_overwrite(sections_dir: Path, node_id: str) -> None:
+        """Preserve ``node_id``'s current on-disk output before a repair
+        call (``regenerate_blocks``, or ``process_node`` called again on
+        an already-drafted node) overwrites it via
+        ``_write_semantic_artifacts``/``draft_path.write_text`` in
+        ``_run_generation_loop``.
+
+        Revision (Additional verifiers) Stage 0 / P2: without this, the
+        content that actually failed verification/compile and triggered
+        the repair is gone the instant the repaired version is written --
+        ``{node_id}.blocks.json``/``.draft.tex`` are single, fixed paths
+        that the next successful ``_run_generation_loop`` pass simply
+        overwrites in place. ``ArtifactGraphStore.save_checkpoint()``
+        exists for exactly this purpose, but is not wired into this
+        pipeline at all (``scripts/run_full_pipeline.py`` never references
+        ``src.core``) -- see ``docs/av_stage0_scope_and_contracts.md``.
+        This is a smaller, local fix that doesn't require that wiring: a
+        sequentially-numbered snapshot per repair attempt, written
+        alongside the real files.
+
+        No-op if ``node_id`` has never been drafted yet -- nothing to
+        preserve for a first draft.
+        """
+        blocks_path = sections_dir / f"{node_id}.blocks.json"
+        if not blocks_path.is_file():
+            return
+        existing_snapshots = list(sections_dir.glob(f"{node_id}.pre_repair_*.blocks.json"))
+        next_index = len(existing_snapshots) + 1
+        (sections_dir / f"{node_id}.pre_repair_{next_index}.blocks.json").write_text(
+            blocks_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        draft_path = sections_dir / f"{node_id}.draft.tex"
+        if draft_path.is_file():
+            (sections_dir / f"{node_id}.pre_repair_{next_index}.draft.tex").write_text(
+                draft_path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
 
     def _build_prompt_from_node(
         self,

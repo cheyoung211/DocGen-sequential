@@ -97,14 +97,25 @@ class SchemaRoundTripTest(unittest.TestCase):
         self.assertFalse(metadata.math_verifier_enabled)
         self.assertFalse(metadata.dependency_verifier_enabled)
         self.assertIsNone(metadata.code_commit)
-        self.assertIsNone(metadata.rubric_version)
+        self.assertIsNone(metadata.git_dirty)
+        self.assertIsNone(metadata.text_agent_prompt_hash)
+        self.assertEqual(metadata.enabled_validators_snapshot, {})
+        # rubric_version defaults to the CURRENT Gold Labeling draft's own
+        # identifier, not None -- "no rubric_version" would wrongly read as
+        # "no rubric exists at all" when a real (if unfinalized) one does.
+        self.assertEqual(metadata.rubric_version, "gold_labeling_draft_2026-10-26")
+        self.assertFalse(metadata.rubric_finalized)
         self.assertEqual(_round_trip(metadata), metadata)
 
     def test_additional_verifier_run_metadata_full_shape_round_trips(self) -> None:
         metadata = AdditionalVerifierRunMetadata(
             markdown_emphasis_enabled=True,
             code_commit="278e7488a5ecc6c91ffc3fb4e7ce091e9f5df63b",
+            git_dirty=True,
+            text_agent_prompt_hash="abc123def4567890",
+            enabled_validators_snapshot={"forbidden_environment": True, "table_columns": False},
             rubric_version="gold_labeling_2026-10-26",
+            rubric_finalized=True,
         )
         self.assertEqual(_round_trip(metadata), metadata)
 

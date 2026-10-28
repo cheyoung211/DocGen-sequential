@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import subprocess
 import time
@@ -18,7 +19,7 @@ sys.path.append(str(REPO_ROOT))
 from src.common.state import DocumentGraph, NodeStatus, NodeType, DocumentNode
 from src.common.schemas import PlannerInput, TemplateSpec
 from src.agents.planner import DEFAULT_ENABLED_PLANNER_VALIDATORS, PlannerAgent
-from src.agents.text_agent import DEFAULT_ENABLED_VALIDATORS, TextAgent
+from src.agents.text_agent import DEFAULT_ENABLED_VALIDATORS, SYSTEM_PROMPT, TextAgent
 from src.agents.image_agent import ImageAgent
 from src.agents.latex_assembler import DEFAULT_ENABLED_ASSEMBLER_VALIDATORS, LatexAssembler
 from src.agents.latex_compiler import LatexCompiler
@@ -84,6 +85,42 @@ def _current_code_commit() -> Optional[str]:
         return None
 
 
+@lru_cache(maxsize=1)
+def _git_is_dirty() -> Optional[bool]:
+    """Whether the working tree has uncommitted changes, for
+    ``AdditionalVerifierRunMetadata.git_dirty`` -- ``code_commit`` alone
+    is misleading when this is true, since it only names what was
+    committed, not what is actually on disk (e.g. mid-iteration on a
+    prompt edit that was never committed). Cached per-process for the
+    same reason as ``_current_code_commit``; ``None`` (not ``False``)
+    when git itself is unavailable, so "known clean" and "unknown" stay
+    distinguishable.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return bool(result.stdout.strip())
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _text_agent_prompt_hash() -> str:
+    """Short content hash of the live ``TextAgent.SYSTEM_PROMPT`` string,
+    for ``AdditionalVerifierRunMetadata.text_agent_prompt_hash``.
+    Independent of git state entirely -- identifies the prompt actually
+    in effect for this run even when ``_git_is_dirty()`` is True (or
+    unknown), which ``code_commit`` alone cannot.
+    """
+    return hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:16]
+
+
 def _build_run_result(
     *,
     request_id: str,
@@ -96,6 +133,7 @@ def _build_run_result(
     producer_models: Optional[Dict[str, str]],
     project_dir: Path,
     seed: Optional[int] = None,
+    enabled_validators: Optional[Dict[str, bool]] = None,
 ) -> RunResult:
     """Assemble the full evaluation-layer RunResult for one request.
 
@@ -124,7 +162,10 @@ def _build_run_result(
         producer_models=producer_models or {},
         seed=seed,
         additional_verifier_metadata=AdditionalVerifierRunMetadata(
-            code_commit=_current_code_commit()
+            code_commit=_current_code_commit(),
+            git_dirty=_git_is_dirty(),
+            text_agent_prompt_hash=_text_agent_prompt_hash(),
+            enabled_validators_snapshot=dict(enabled_validators or {}),
         ),
         completed=(status == "success"),
         status=status,
@@ -155,6 +196,7 @@ def _write_run_log(
     benchmark_item: Optional[BenchmarkItem] = None,
     producer_models: Optional[Dict[str, str]] = None,
     seed: Optional[int] = None,
+    enabled_validators: Optional[Dict[str, bool]] = None,
 ) -> None:
     """Persist one request's outcome to ``<project_dir>/run_result.json``.
 
@@ -180,7 +222,7 @@ def _write_run_log(
                 request_id=request_id, status=status, error=error, event_logger=event_logger,
                 start_time=start_time, token_usage_records=token_usage_records,
                 benchmark_item=benchmark_item, producer_models=producer_models,
-                project_dir=project_dir, seed=seed,
+                project_dir=project_dir, seed=seed, enabled_validators=enabled_validators,
             )
             project_dir.mkdir(parents=True, exist_ok=True)
             (project_dir / "run_result.json").write_text(
@@ -343,6 +385,7 @@ class DocGenPipeline:
                 project_dir, request_id, status=status, error=error, compile_log_path=compile_log_path,
                 event_logger=event_logger, start_time=start_time, token_usage_records=token_usage_records,
                 benchmark_item=benchmark_item, producer_models=producer_models, seed=self.seed,
+                enabled_validators=dict(self.text_agent.enabled_validators),
             )
 
         # 1. Initialize Shared Document Graph via Planner

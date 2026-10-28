@@ -246,6 +246,27 @@ class AdditionalVerifierRunMetadata(BaseModel):
     actually implemented and wired in; this schema exists now so every
     future stage writes into the same shape rather than each inventing
     its own.
+
+    ``code_commit`` alone is not a reliable prompt/config identifier: it
+    only pins what was committed, not what is actually on disk if the
+    working tree has uncommitted edits (a very real case while iterating
+    on a prompt). ``git_dirty`` makes that distinction checkable instead
+    of silently assumed, and ``text_agent_prompt_hash`` identifies the
+    *actual* live ``TextAgent.SYSTEM_PROMPT`` content independent of git
+    state entirely. ``enabled_validators_snapshot`` is the real per-run
+    ``TextAgent.enabled_validators`` dict (not the static
+    ``DEFAULT_ENABLED_VALIDATORS``) -- ablation runs legitimately override
+    this per instance (``TextAgent(enabled_validators={...})``), so the
+    static default would misreport exactly the runs this field exists to
+    describe.
+
+    ``rubric_version`` defaults to the Gold Labeling page's own last-edited
+    date as of this writing, not ``None`` -- a concrete, currently-true
+    identifier for which human-judgment draft is in effect, distinct from
+    "no rubric exists." ``rubric_finalized`` makes the draft-vs-final
+    state a checkable fact instead of something only encoded by convention
+    in the version string: it stays ``False`` until Stage 5 (G1) assigns a
+    real versioning scheme.
     """
 
     markdown_emphasis_enabled: bool = False
@@ -253,7 +274,11 @@ class AdditionalVerifierRunMetadata(BaseModel):
     dependency_verifier_enabled: bool = False
     plan_doc_version: str = "2026-10-28"
     code_commit: Optional[str] = None
-    rubric_version: Optional[str] = None
+    git_dirty: Optional[bool] = None
+    text_agent_prompt_hash: Optional[str] = None
+    enabled_validators_snapshot: Dict[str, bool] = Field(default_factory=dict)
+    rubric_version: Optional[str] = "gold_labeling_draft_2026-10-26"
+    rubric_finalized: bool = False
 
 
 class RunResult(BaseModel):

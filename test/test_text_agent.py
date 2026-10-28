@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from pathlib import Path
 from typing import List, Optional
 
 from src.agents.text_agent import TextAgent
@@ -140,6 +141,110 @@ class TextAgentRetryRecoveryTest(unittest.TestCase):
         self.assertEqual(len(event_logger.recovery_events), 2)
         self.assertTrue(all(not r.success for r in event_logger.recovery_events))
         self.assertEqual(graph.nodes["sec_intro"].status, NodeStatus.ERROR)
+
+
+class TextAgentPreRepairSnapshotTest(unittest.TestCase):
+    """Revision (Additional verifiers) Stage 0 / P2 repro: draft.tex alone
+    does not preserve pre-repair content -- it is a single, fixed path
+    that the next successful _run_generation_loop pass overwrites in
+    place. _snapshot_before_overwrite closes that gap locally, without
+    needing ArtifactGraphStore.save_checkpoint() wired into this pipeline
+    (it isn't -- see docs/av_stage0_scope_and_contracts.md)."""
+
+    @staticmethod
+    def _response_for(content: str) -> str:
+        return json.dumps({
+            "content_blocks": [{"block_id": "p1", "type": "paragraph", "content": content}],
+            "tool_requests": [],
+        })
+
+    def test_first_draft_creates_no_pre_repair_snapshot(self) -> None:
+        graph = _single_block_graph()
+        llm = ScriptedLLMClient([self._response_for("Hello world.")])
+        agent = TextAgent(llm_client=llm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent.process_node("sec_intro", graph, "req_test", output_dir=tmp)
+            sections_dir = Path(tmp) / "req_test" / "sections"
+            self.assertEqual(list(sections_dir.glob("sec_intro.pre_repair_*")), [])
+
+    def test_process_node_called_again_preserves_the_prior_draft(self) -> None:
+        """Simulates run_full_pipeline.py's section-level compile-repair
+        branch, which calls process_node a second time on an already-
+        drafted node (see this module's DocGenPipeline._repair_and_
+        recompile -- distinct from the block-level regenerate_blocks
+        branch covered below)."""
+        graph = _single_block_graph()
+        llm = ScriptedLLMClient([
+            self._response_for("Hello world."),
+            self._response_for("Repaired hello world."),
+        ])
+        agent = TextAgent(llm_client=llm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent.process_node("sec_intro", graph, "req_test", output_dir=tmp)
+            agent.process_node("sec_intro", graph, "req_test", output_dir=tmp)
+
+            sections_dir = Path(tmp) / "req_test" / "sections"
+            snapshots = sorted(sections_dir.glob("sec_intro.pre_repair_*.blocks.json"))
+            self.assertEqual(len(snapshots), 1)
+            preserved = json.loads(snapshots[0].read_text(encoding="utf-8"))
+            self.assertEqual(preserved["blocks"][0]["content"], "Hello world.")
+
+            current = json.loads((sections_dir / "sec_intro.blocks.json").read_text(encoding="utf-8"))
+            self.assertEqual(current["blocks"][0]["content"], "Repaired hello world.")
+
+            preserved_draft = (sections_dir / "sec_intro.pre_repair_1.draft.tex").read_text(encoding="utf-8")
+            self.assertIn("Hello world.", preserved_draft)
+
+    def test_regenerate_blocks_preserves_the_pre_repair_content(self) -> None:
+        graph = _single_block_graph()
+        llm = ScriptedLLMClient([
+            self._response_for("Hello world."),
+            self._response_for("Fixed hello world."),
+        ])
+        agent = TextAgent(llm_client=llm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent.process_node("sec_intro", graph, "req_test", output_dir=tmp)
+            agent.regenerate_blocks(
+                "sec_intro", "p1", "compiler said: boom", graph, "req_test", output_dir=tmp
+            )
+
+            sections_dir = Path(tmp) / "req_test" / "sections"
+            snapshots = sorted(sections_dir.glob("sec_intro.pre_repair_*.blocks.json"))
+            self.assertEqual(len(snapshots), 1)
+            preserved = json.loads(snapshots[0].read_text(encoding="utf-8"))
+            self.assertEqual(preserved["blocks"][0]["content"], "Hello world.")
+
+            current = json.loads((sections_dir / "sec_intro.blocks.json").read_text(encoding="utf-8"))
+            self.assertEqual(current["blocks"][0]["content"], "Fixed hello world.")
+
+    def test_two_repair_rounds_create_two_sequentially_numbered_snapshots(self) -> None:
+        graph = _single_block_graph()
+        llm = ScriptedLLMClient([
+            self._response_for("v1"),
+            self._response_for("v2"),
+            self._response_for("v3"),
+        ])
+        agent = TextAgent(llm_client=llm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent.process_node("sec_intro", graph, "req_test", output_dir=tmp)
+            agent.regenerate_blocks("sec_intro", "p1", "err1", graph, "req_test", output_dir=tmp)
+            agent.regenerate_blocks("sec_intro", "p1", "err2", graph, "req_test", output_dir=tmp)
+
+            sections_dir = Path(tmp) / "req_test" / "sections"
+            snap1 = json.loads(
+                (sections_dir / "sec_intro.pre_repair_1.blocks.json").read_text(encoding="utf-8")
+            )
+            snap2 = json.loads(
+                (sections_dir / "sec_intro.pre_repair_2.blocks.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(snap1["blocks"][0]["content"], "v1")
+            self.assertEqual(snap2["blocks"][0]["content"], "v2")
+            current = json.loads((sections_dir / "sec_intro.blocks.json").read_text(encoding="utf-8"))
+            self.assertEqual(current["blocks"][0]["content"], "v3")
 
 
 if __name__ == "__main__":

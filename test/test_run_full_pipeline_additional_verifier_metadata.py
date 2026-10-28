@@ -12,6 +12,7 @@ not touched here, out of this stage's scope.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 import unittest
@@ -46,6 +47,28 @@ class CurrentCodeCommitTest(unittest.TestCase):
         self.assertIs(rfp._current_code_commit(), rfp._current_code_commit())
 
 
+class GitIsDirtyTest(unittest.TestCase):
+    def test_matches_real_git_status(self) -> None:
+        expected = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        )
+        self.assertEqual(rfp._git_is_dirty(), expected)
+
+
+class TextAgentPromptHashTest(unittest.TestCase):
+    def test_matches_a_direct_hash_of_the_live_system_prompt(self) -> None:
+        from src.agents.text_agent import SYSTEM_PROMPT
+
+        expected = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:16]
+        self.assertEqual(rfp._text_agent_prompt_hash(), expected)
+
+
 class BuildRunResultAdditionalVerifierMetadataTest(unittest.TestCase):
     def test_populates_metadata_with_real_commit_and_honest_disabled_flags(self) -> None:
         event_logger = EventLogger(run_id="test_run_stage0")
@@ -59,14 +82,38 @@ class BuildRunResultAdditionalVerifierMetadataTest(unittest.TestCase):
             benchmark_item=None,
             producer_models={"text": "gpt-4o-mini"},
             project_dir=REPO_ROOT,
+            enabled_validators={"forbidden_environment": True, "table_columns": False},
         )
         metadata = result.additional_verifier_metadata
         self.assertEqual(metadata.code_commit, rfp._current_code_commit())
+        self.assertEqual(metadata.git_dirty, rfp._git_is_dirty())
+        self.assertEqual(metadata.text_agent_prompt_hash, rfp._text_agent_prompt_hash())
+        self.assertEqual(
+            metadata.enabled_validators_snapshot,
+            {"forbidden_environment": True, "table_columns": False},
+        )
         # None of Fix A/B/C exist yet (Stage 0) -- every flag must stay
         # honestly False, never a placeholder True for an unbuilt verifier.
         self.assertFalse(metadata.markdown_emphasis_enabled)
         self.assertFalse(metadata.math_verifier_enabled)
         self.assertFalse(metadata.dependency_verifier_enabled)
+
+    def test_defaults_enabled_validators_snapshot_to_empty_when_not_supplied(self) -> None:
+        # Every pre-Stage-0 call shape (none exist yet, but the parameter
+        # is optional) must not crash -- an empty snapshot, not an error.
+        event_logger = EventLogger(run_id="test_run_stage0_no_validators")
+        result = rfp._build_run_result(
+            request_id="test_run_stage0_no_validators",
+            status="success",
+            error=None,
+            event_logger=event_logger,
+            start_time=None,
+            token_usage_records=None,
+            benchmark_item=None,
+            producer_models={"text": "gpt-4o-mini"},
+            project_dir=REPO_ROOT,
+        )
+        self.assertEqual(result.additional_verifier_metadata.enabled_validators_snapshot, {})
 
 
 if __name__ == "__main__":

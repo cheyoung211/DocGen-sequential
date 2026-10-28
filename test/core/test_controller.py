@@ -21,9 +21,11 @@ from src.core.controller import (
     ControllerRuntime,
     LLMController,
     RuleBasedController,
+    _aggregate_unresolved,
     _compute_unresolved,
     _describe_observation,
     _merge_evidence,
+    _never_checked_required_ids,
     _prune_invalidated_evidence,
     compute_ready_artifacts,
 )
@@ -40,6 +42,7 @@ from src.core.schemas import (
     ControllerStopReason,
     CompileCall,
     Evidence,
+    FinishCall,
     PatchCall,
     ProductionResult,
     ProductionStatus,
@@ -1143,6 +1146,103 @@ def test_llm_chosen_finish_call_still_gets_the_full_unresolved_aggregate() -> No
     call = updates["pending_tool_call"]
     assert call.reason == "cannot_repair"  # the model's own reason is preserved
     assert call.unresolved_artifact_ids == ["doc"]  # but the real unresolved picture is enforced regardless
+
+
+def test_never_checked_required_ids_ignores_artifacts_with_no_required_constraints() -> None:
+    """A tracked artifact with an empty required set from the provider
+    (not the shared _constraint_provider fake, which always requires
+    "c0") must never be flagged -- "nothing required" is not "something
+    required and missing."."""
+    store = ArtifactGraphStore()
+    store.add_version("doc", ArtifactKind.DOCUMENT, content="v1")
+    assert _never_checked_required_ids(store, {"doc"}, lambda ref: []) == set()
+
+
+def test_never_checked_required_ids_flags_a_required_constraint_with_zero_evidence() -> None:
+    """Revision (Additional verifiers) Stage 0 / P3 repro: a constraint
+    the provider says is REQUIRED, but that no CheckCall has ever named
+    for this artifact, leaves no trace in is_stale()/blocked/needs_
+    recheck_keys at all -- those three all require something to have
+    already happened (a dependency moved, a production attempt failed, a
+    once-valid verdict got invalidated). "Never attempted" is a fourth,
+    distinct case none of them catches."""
+    store = ArtifactGraphStore()
+    store.add_version("doc", ArtifactKind.DOCUMENT, content="v1")
+    assert _never_checked_required_ids(store, {"doc"}, _constraint_provider) == {"doc"}
+
+
+def test_never_checked_required_ids_is_satisfied_by_live_evidence() -> None:
+    """Once "c0" actually has live evidence for "doc" (PASS or FAIL --
+    either counts as "attempted"), it is no longer "never checked"."""
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    store.record_evidence(Evidence(constraint_id="c0", outcome=CheckOutcome.PASS, checked_artifact=doc_ref))
+    assert _never_checked_required_ids(store, {"doc"}, _constraint_provider) == set()
+
+
+def test_never_checked_required_ids_skips_already_stale_artifacts() -> None:
+    """Already covered by _compute_unresolved's own is_stale() check --
+    re-flagging it here would just be a slower way to state the same
+    fact, not a new one."""
+    store = ArtifactGraphStore()
+    a_ref = store.add_version("a", ArtifactKind.DEFINITION, content="v1").ref
+    store.add_version("b", ArtifactKind.SECTION, content="v1", read_input_versions=[a_ref])
+    store.add_version("a", ArtifactKind.DEFINITION, content="v2")  # staleness propagates to "b"
+    assert store.is_stale("b")
+    assert _never_checked_required_ids(store, {"b"}, _constraint_provider) == set()
+
+
+def test_aggregate_unresolved_without_constraint_provider_is_unchanged() -> None:
+    """constraint_provider=None (every one of this function's existing
+    call sites before this fix) must behave exactly as before -- the new
+    check is additive, not a default-on behavior change for callers that
+    don't supply a provider."""
+    store = ArtifactGraphStore()
+    store.add_version("doc", ArtifactKind.DOCUMENT, content="v1")
+    state = ControllerState(
+        document_ref=ArtifactRef(artifact_id="doc", version=1, kind=ArtifactKind.DOCUMENT),
+        checkpoint=store.save_checkpoint(),
+        budget=Budget(cap=1000.0),
+        tracked_artifact_ids={"doc"},
+    )
+    assert _aggregate_unresolved(state, store) == set()
+    assert _aggregate_unresolved(state, store, constraint_provider=None) == set()
+
+
+def test_finish_call_includes_artifact_with_a_required_but_never_checked_constraint() -> None:
+    """End-to-end repro of the same P3 gap through the real choke point:
+    "doc" is tracked but was never named by any CheckCall. A policy that
+    decides to finish with its own (wrong) empty unresolved_artifact_ids
+    must still have "doc" added by ControllerRuntime._controller_node,
+    the one place every FinishCall is unconditionally re-passed through
+    _aggregate_unresolved -- this is what actually makes the guarantee
+    hold regardless of which ControllerPolicy produced the FinishCall."""
+
+    class _AlwaysFinishPolicy:
+        def decide(self, state: ControllerState, store: ArtifactGraphStore, tool_executor: ToolExecutor) -> Any:
+            return FinishCall(reason="done", unresolved_artifact_ids=[])
+
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    runtime = ControllerRuntime(
+        store,
+        _AlwaysFinishPolicy(),
+        _AlwaysFailValidator(),
+        {ArtifactKind.DOCUMENT: _FakeProducer()},
+        _constraint_provider,
+        document_ref=doc_ref,
+        budget=Budget(cap=1000.0),
+    )
+    state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        tracked_artifact_ids={"doc"},
+    )
+    updates = runtime._controller_node(state)
+    call = updates["pending_tool_call"]
+    assert call.reason == "done"
+    assert call.unresolved_artifact_ids == ["doc"]
 
 
 # -- Anti-infinite-loop / repeated-fix guard ---------------------------------
