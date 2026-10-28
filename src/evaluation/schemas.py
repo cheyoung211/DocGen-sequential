@@ -233,6 +233,29 @@ class VerificationConfigSnapshot(BaseModel):
     compiler_recovery: bool = False
 
 
+class AdditionalVerifierRunMetadata(BaseModel):
+    """Which Revision-(Additional verifiers) checks were active for this
+    run, and the versions needed to interpret its Evidence later.
+
+    Unlike ``VerificationConfigSnapshot`` above, every field here is
+    actually set from real state at run time (see
+    ``run_full_pipeline.py::_build_run_result``) -- never a hardcoded
+    default standing in for a toggle that doesn't exist yet. All three
+    ``*_enabled`` flags are honestly ``False`` until the corresponding
+    verifier (Fix A/B/C in the Revision (Additional verifiers) plan) is
+    actually implemented and wired in; this schema exists now so every
+    future stage writes into the same shape rather than each inventing
+    its own.
+    """
+
+    markdown_emphasis_enabled: bool = False
+    math_verifier_enabled: bool = False
+    dependency_verifier_enabled: bool = False
+    plan_doc_version: str = "2026-10-28"
+    code_commit: Optional[str] = None
+    rubric_version: Optional[str] = None
+
+
 class RunResult(BaseModel):
     """Everything the Foundation metrics need about one pipeline run.
 
@@ -259,6 +282,9 @@ class RunResult(BaseModel):
     config_name: str = DEFAULT_CONFIG_NAME
     verification_config: VerificationConfigSnapshot = Field(
         default_factory=VerificationConfigSnapshot
+    )
+    additional_verifier_metadata: AdditionalVerifierRunMetadata = Field(
+        default_factory=AdditionalVerifierRunMetadata
     )
     completed: bool
     # More granular than `completed`: which of run_full_pipeline.py's 4

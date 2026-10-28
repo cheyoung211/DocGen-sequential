@@ -1,8 +1,10 @@
 import argparse
 import json
+import subprocess
 import time
 import sys
 import traceback
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
@@ -24,7 +26,13 @@ from src.dataset.schemas import BenchmarkItem
 from src.evaluation.compile_log_parser import classify_recovery_action, extract_error_locations
 from src.evaluation.event_logger import AttemptTracker, EventLogger
 from src.evaluation.metrics.contract_satisfaction import evaluate_contract
-from src.evaluation.schemas import RecoveryAction, RunResult, Stage, TokenUsage
+from src.evaluation.schemas import (
+    AdditionalVerifierRunMetadata,
+    RecoveryAction,
+    RunResult,
+    Stage,
+    TokenUsage,
+)
 from llm_client import DEFAULT_MODEL, LLMClient
 from src.helpers.image_generator_sdxl import SDXLGenerator
 from src.helpers.image_generator_flux import FluxGenerator
@@ -51,6 +59,30 @@ def build_user_query(item: Dict[str, Any]) -> str:
         f"Overview: {overview}",
         f"Instruction: {instruction}",
     ])
+
+@lru_cache(maxsize=1)
+def _current_code_commit() -> Optional[str]:
+    """Best-effort git HEAD SHA for ``AdditionalVerifierRunMetadata.code_commit``.
+
+    Cached per-process -- a batch run over many benchmark items shouldn't
+    shell out to git once per sample for a value that cannot change
+    mid-run. Never raises: returns None if git or the repo itself is
+    unavailable, since a pipeline run must not fail over a provenance
+    field.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return result.stdout.strip() or None
+    except Exception:
+        return None
+
 
 def _build_run_result(
     *,
@@ -91,6 +123,9 @@ def _build_run_result(
         producer_model=(producer_models or {}).get("text", "unknown"),
         producer_models=producer_models or {},
         seed=seed,
+        additional_verifier_metadata=AdditionalVerifierRunMetadata(
+            code_commit=_current_code_commit()
+        ),
         completed=(status == "success"),
         status=status,
         error_type=type(error).__name__ if error is not None else None,

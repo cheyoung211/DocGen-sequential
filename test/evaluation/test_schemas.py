@@ -4,9 +4,11 @@ single-run mode hits."""
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from src.evaluation.schemas import (
+    AdditionalVerifierRunMetadata,
     CompileResult,
     ContractCategoryDetail,
     ContractResult,
@@ -84,6 +86,45 @@ class SchemaRoundTripTest(unittest.TestCase):
         self.assertIsNone(restored.elapsed_time)
         self.assertEqual(restored.verification_events, [])
         self.assertEqual(restored.config_name, "always_on_v1")
+        self.assertEqual(restored.additional_verifier_metadata, AdditionalVerifierRunMetadata())
+
+    def test_additional_verifier_run_metadata_defaults_are_all_disabled(self) -> None:
+        # Revision (Additional verifiers) Stage 0: none of Fix A/B/C exist
+        # yet, so every *_enabled flag must honestly default to False --
+        # never a placeholder True standing in for an unbuilt verifier.
+        metadata = AdditionalVerifierRunMetadata()
+        self.assertFalse(metadata.markdown_emphasis_enabled)
+        self.assertFalse(metadata.math_verifier_enabled)
+        self.assertFalse(metadata.dependency_verifier_enabled)
+        self.assertIsNone(metadata.code_commit)
+        self.assertIsNone(metadata.rubric_version)
+        self.assertEqual(_round_trip(metadata), metadata)
+
+    def test_additional_verifier_run_metadata_full_shape_round_trips(self) -> None:
+        metadata = AdditionalVerifierRunMetadata(
+            markdown_emphasis_enabled=True,
+            code_commit="278e7488a5ecc6c91ffc3fb4e7ce091e9f5df63b",
+            rubric_version="gold_labeling_2026-10-26",
+        )
+        self.assertEqual(_round_trip(metadata), metadata)
+
+    def test_run_result_without_additional_verifier_metadata_key_still_loads(self) -> None:
+        # Simulates a run_result.json written before this field existed:
+        # the key is entirely absent, not null. A new field must not break
+        # old on-disk data -- see docgen_stage_review_rigor's "copy vs
+        # live reference"/backward-compatibility lessons.
+        result = RunResult(
+            run_id="req_pre_additional_verifiers",
+            producer_model="gpt-4o-mini",
+            completed=True,
+            compile_success=True,
+        )
+        data = json.loads(result.model_dump_json())
+        del data["additional_verifier_metadata"]
+        self.assertNotIn("additional_verifier_metadata", data)
+
+        restored = RunResult.model_validate(data)
+        self.assertEqual(restored.additional_verifier_metadata, AdditionalVerifierRunMetadata())
 
     def test_run_result_full_shape(self) -> None:
         result = RunResult(
