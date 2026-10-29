@@ -251,14 +251,22 @@ class AdditionalVerifierRunMetadata(BaseModel):
     only pins what was committed, not what is actually on disk if the
     working tree has uncommitted edits (a very real case while iterating
     on a prompt). ``git_dirty`` makes that distinction checkable instead
-    of silently assumed, and ``text_agent_prompt_hash`` identifies the
-    *actual* live ``TextAgent.SYSTEM_PROMPT`` content independent of git
-    state entirely. ``enabled_validators_snapshot`` is the real per-run
-    ``TextAgent.enabled_validators`` dict (not the static
-    ``DEFAULT_ENABLED_VALIDATORS``) -- ablation runs legitimately override
-    this per instance (``TextAgent(enabled_validators={...})``), so the
-    static default would misreport exactly the runs this field exists to
-    describe.
+    of silently assumed.
+
+    A run actually involves (up to) three independently-promptable/
+    configurable agents -- Planner, TextAgent, and the LaTeX assembler --
+    not just TextAgent; a round-2 user review correctly pointed out the
+    first pass only ever captured TextAgent's own slice. ``*_prompt_hash``
+    identifies each agent's *actual* live prompt-template content,
+    independent of git state entirely (``LatexAssembler`` has no
+    ``SYSTEM_PROMPT``-style module constant in this codebase today, so
+    there is deliberately no ``assembler_prompt_hash`` field -- adding one
+    would hash nothing and silently imply a prompt that doesn't exist).
+    ``*_enabled_validators_snapshot`` is each agent's real per-run
+    ``.enabled_validators`` dict (not the static ``DEFAULT_ENABLED_*``) --
+    ablation runs legitimately override this per instance
+    (``TextAgent(enabled_validators={...})``), so the static default would
+    misreport exactly the runs these fields exist to describe.
 
     ``rubric_version`` defaults to the Gold Labeling page's own last-edited
     date as of this writing, not ``None`` -- a concrete, currently-true
@@ -276,7 +284,10 @@ class AdditionalVerifierRunMetadata(BaseModel):
     code_commit: Optional[str] = None
     git_dirty: Optional[bool] = None
     text_agent_prompt_hash: Optional[str] = None
-    enabled_validators_snapshot: Dict[str, bool] = Field(default_factory=dict)
+    planner_prompt_hash: Optional[str] = None
+    text_agent_enabled_validators_snapshot: Dict[str, bool] = Field(default_factory=dict)
+    planner_enabled_validators_snapshot: Dict[str, bool] = Field(default_factory=dict)
+    assembler_enabled_validators_snapshot: Dict[str, bool] = Field(default_factory=dict)
     rubric_version: Optional[str] = "gold_labeling_draft_2026-10-26"
     rubric_finalized: bool = False
 

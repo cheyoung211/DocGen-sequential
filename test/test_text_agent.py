@@ -247,5 +247,86 @@ class TextAgentPreRepairSnapshotTest(unittest.TestCase):
             self.assertEqual(current["blocks"][0]["content"], "v3")
 
 
+class TextAgentFailedAttemptPreservationTest(unittest.TestCase):
+    """Revision (Additional verifiers) Stage 0 / P2, round 2 repro:
+    _snapshot_before_overwrite only preserves content ACROSS separate
+    process_node/regenerate_blocks calls -- a FAILED attempt inside one
+    call's own internal retry loop (including a node's very FIRST
+    attempt) was never written to disk anywhere. _persist_failed_attempt
+    closes that gap."""
+
+    def test_generic_failure_on_the_very_first_attempt_is_preserved(self) -> None:
+        graph = _single_block_graph()
+        llm = ScriptedLLMClient([
+            "{}",  # attempt 1: no content_blocks key -> generic Exception
+            json.dumps({
+                "content_blocks": [{"block_id": "p1", "type": "paragraph", "content": "Hello world."}],
+                "tool_requests": [],
+            }),
+        ])
+        agent = TextAgent(llm_client=llm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = agent.process_node("sec_intro", graph, "req_test", output_dir=tmp)
+
+            self.assertIsNotNone(output)
+            sections_dir = Path(tmp) / "req_test" / "sections"
+            failed = json.loads(
+                (sections_dir / "sec_intro.failed_attempt_1.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(failed["attempt_within_call"], 1)
+            self.assertEqual(failed["raw_response"], "{}")
+            self.assertEqual(failed["failing_blocks"], [])
+            self.assertIn("content_blocks", failed["error_message"])
+            # Only the failed attempt gets a record -- the eventual success
+            # does not (it's already in sec_intro.blocks.json).
+            self.assertEqual(len(list(sections_dir.glob("sec_intro.failed_attempt_*.json"))), 1)
+
+    def test_rejected_block_content_from_a_semantic_block_error_is_preserved(self) -> None:
+        graph = _single_block_graph()
+        llm = ScriptedLLMClient([
+            json.dumps({  # attempt 1: wrong type for "p1" -> SemanticBlockErrors
+                "content_blocks": [{"block_id": "p1", "type": "equation", "content": "x = 1"}],
+                "tool_requests": [],
+            }),
+            json.dumps({  # attempt 2: succeeds
+                "content_blocks": [{"block_id": "p1", "type": "paragraph", "content": "Fixed."}],
+                "tool_requests": [],
+            }),
+        ])
+        agent = TextAgent(llm_client=llm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = agent.process_node("sec_intro", graph, "req_test", output_dir=tmp)
+
+            self.assertIsNotNone(output)
+            sections_dir = Path(tmp) / "req_test" / "sections"
+            failed = json.loads(
+                (sections_dir / "sec_intro.failed_attempt_1.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(failed["failing_blocks"]), 1)
+            self.assertEqual(failed["failing_blocks"][0]["content"], "x = 1")
+            self.assertIn("must use type", failed["error_message"])
+
+            current = json.loads((sections_dir / "sec_intro.blocks.json").read_text(encoding="utf-8"))
+            self.assertEqual(current["blocks"][0]["content"], "Fixed.")
+
+    def test_every_exhausted_attempt_gets_its_own_preserved_record(self) -> None:
+        graph = _single_block_graph()
+        llm = ScriptedLLMClient(["{}", "{}", "{}"])
+        agent = TextAgent(llm_client=llm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = agent.process_node("sec_intro", graph, "req_test", output_dir=tmp, max_attempts=3)
+
+            self.assertIsNone(output)  # node ends ERROR -- still, every attempt is preserved
+            sections_dir = Path(tmp) / "req_test" / "sections"
+            records = sorted(sections_dir.glob("sec_intro.failed_attempt_*.json"))
+            self.assertEqual(len(records), 3)
+            for index, record_path in enumerate(records, start=1):
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                self.assertEqual(record["attempt_within_call"], index)
+
+
 if __name__ == "__main__":
     unittest.main()

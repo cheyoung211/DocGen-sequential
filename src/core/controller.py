@@ -1320,7 +1320,25 @@ class ControllerRuntime:
         guarantee instead of a convention every current and future
         ``ControllerPolicy`` has to remember to uphold on its own -- the
         guard branches below now pass an empty list for exactly this
-        reason, relying entirely on this one union to fill it in."""
+        reason, relying entirely on this one union to fill it in.
+
+        A fourth user review (Revision (Additional verifiers) Stage 0 /
+        P3, round 2) found this union, once it started being able to add
+        something the deciding path never itself checked for (a required-
+        but-never-checked constraint, see ``_never_checked_required_ids``),
+        could produce ``FinishCall(reason="resolved", unresolved_artifact_
+        ids=["doc"])`` -- a direct contradiction. ``"resolved"`` is the
+        only reason string in this module's vocabulary that claims
+        nothing is wrong (``RuleBasedController.decide()``'s own final
+        branch, hardcoded with an empty list); every other reason already
+        admits a live problem, so only this one can become a lie. Fixed
+        by overriding ``reason`` to the vocabulary's own existing
+        ``"unresolved_remaining"`` (not a new string) whenever the
+        enriched list ends up non-empty under a ``"resolved"`` reason --
+        both already map to the same generic ``ControllerStopReason.
+        FINISHED`` in ``_FINISH_REASON_MAP``, so this changes nothing
+        about how ``_tool_node`` records the stop reason, only the
+        ``FinishCall.reason`` string itself."""
         if state.done:
             return {}
         if state.step_count >= self._max_steps:
@@ -1330,12 +1348,17 @@ class ControllerRuntime:
         else:
             call = self._policy.decide(state, self._store, self._tool_executor)
         if isinstance(call, FinishCall):
+            unresolved_ids = sorted(
+                set(call.unresolved_artifact_ids)
+                | _aggregate_unresolved(state, self._store, self._constraint_provider)
+            )
+            reason = call.reason
+            if reason == "resolved" and unresolved_ids:
+                reason = "unresolved_remaining"
             call = call.model_copy(
                 update={
-                    "unresolved_artifact_ids": sorted(
-                        set(call.unresolved_artifact_ids)
-                        | _aggregate_unresolved(state, self._store, self._constraint_provider)
-                    )
+                    "reason": reason,
+                    "unresolved_artifact_ids": unresolved_ids,
                 }
             )
         return {

@@ -99,7 +99,10 @@ class SchemaRoundTripTest(unittest.TestCase):
         self.assertIsNone(metadata.code_commit)
         self.assertIsNone(metadata.git_dirty)
         self.assertIsNone(metadata.text_agent_prompt_hash)
-        self.assertEqual(metadata.enabled_validators_snapshot, {})
+        self.assertIsNone(metadata.planner_prompt_hash)
+        self.assertEqual(metadata.text_agent_enabled_validators_snapshot, {})
+        self.assertEqual(metadata.planner_enabled_validators_snapshot, {})
+        self.assertEqual(metadata.assembler_enabled_validators_snapshot, {})
         # rubric_version defaults to the CURRENT Gold Labeling draft's own
         # identifier, not None -- "no rubric_version" would wrongly read as
         # "no rubric exists at all" when a real (if unfinalized) one does.
@@ -113,7 +116,10 @@ class SchemaRoundTripTest(unittest.TestCase):
             code_commit="278e7488a5ecc6c91ffc3fb4e7ce091e9f5df63b",
             git_dirty=True,
             text_agent_prompt_hash="abc123def4567890",
-            enabled_validators_snapshot={"forbidden_environment": True, "table_columns": False},
+            planner_prompt_hash="fed0987654321cba",
+            text_agent_enabled_validators_snapshot={"forbidden_environment": True, "table_columns": False},
+            planner_enabled_validators_snapshot={"plain_title": True},
+            assembler_enabled_validators_snapshot={"layout_policy": False},
             rubric_version="gold_labeling_2026-10-26",
             rubric_finalized=True,
         )

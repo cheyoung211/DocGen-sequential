@@ -1245,6 +1245,78 @@ def test_finish_call_includes_artifact_with_a_required_but_never_checked_constra
     assert call.unresolved_artifact_ids == ["doc"]
 
 
+def test_resolved_reason_is_corrected_when_the_enriched_union_is_not_actually_empty() -> None:
+    """Revision (Additional verifiers) Stage 0 / P3, round 2 repro:
+    "resolved" is the only reason string in this module's vocabulary that
+    claims nothing is wrong (RuleBasedController's own final branch,
+    hardcoded with unresolved_artifact_ids=[]). Once the choke point's
+    union can add something the deciding policy never itself checked for
+    (a required-but-never-checked constraint), a policy voluntarily
+    choosing reason="resolved" can end up with a non-empty unresolved
+    list attached to it -- a direct contradiction. The fix reuses this
+    module's own existing "unresolved_remaining" reason rather than
+    inventing a new string."""
+
+    class _AlwaysResolvedPolicy:
+        def decide(self, state: ControllerState, store: ArtifactGraphStore, tool_executor: ToolExecutor) -> Any:
+            return FinishCall(reason="resolved", unresolved_artifact_ids=[])
+
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    runtime = ControllerRuntime(
+        store,
+        _AlwaysResolvedPolicy(),
+        _AlwaysFailValidator(),
+        {ArtifactKind.DOCUMENT: _FakeProducer()},
+        _constraint_provider,  # always requires "c0" -- never actually checked below
+        document_ref=doc_ref,
+        budget=Budget(cap=1000.0),
+    )
+    state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        tracked_artifact_ids={"doc"},
+    )
+    updates = runtime._controller_node(state)
+    call = updates["pending_tool_call"]
+    assert call.reason == "unresolved_remaining"  # not "resolved" -- that would contradict the list below
+    assert call.unresolved_artifact_ids == ["doc"]
+
+
+def test_resolved_reason_is_left_alone_when_the_union_is_genuinely_empty() -> None:
+    """The override must not fire just because reason=="resolved" -- only
+    when the enriched list is actually non-empty. A constraint_provider
+    that requires nothing leaves "resolved" + [] exactly as the policy
+    supplied it."""
+
+    class _AlwaysResolvedPolicy:
+        def decide(self, state: ControllerState, store: ArtifactGraphStore, tool_executor: ToolExecutor) -> Any:
+            return FinishCall(reason="resolved", unresolved_artifact_ids=[])
+
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="v1").ref
+    runtime = ControllerRuntime(
+        store,
+        _AlwaysResolvedPolicy(),
+        _AlwaysFailValidator(),
+        {ArtifactKind.DOCUMENT: _FakeProducer()},
+        lambda ref: [],  # requires nothing -- genuinely resolved
+        document_ref=doc_ref,
+        budget=Budget(cap=1000.0),
+    )
+    state = ControllerState(
+        document_ref=doc_ref,
+        checkpoint=store.save_checkpoint(),
+        budget=runtime._tool_executor.budget,
+        tracked_artifact_ids={"doc"},
+    )
+    updates = runtime._controller_node(state)
+    call = updates["pending_tool_call"]
+    assert call.reason == "resolved"
+    assert call.unresolved_artifact_ids == []
+
+
 # -- Anti-infinite-loop / repeated-fix guard ---------------------------------
 
 

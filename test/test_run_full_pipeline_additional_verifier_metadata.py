@@ -69,6 +69,30 @@ class TextAgentPromptHashTest(unittest.TestCase):
         self.assertEqual(rfp._text_agent_prompt_hash(), expected)
 
 
+class PlannerPromptHashTest(unittest.TestCase):
+    def test_matches_a_direct_hash_of_the_live_planner_templates(self) -> None:
+        from src.agents.planner import (
+            PLANNER_LEGACY_OUTPUT_FORMAT_PROMPT,
+            PLANNER_NO_IMAGES_PROMPT,
+            PLANNER_REQUIRED_SECTIONS_PROMPT,
+            PLANNER_STRATEGY_PROMPT,
+        )
+
+        combined = (
+            PLANNER_STRATEGY_PROMPT
+            + PLANNER_NO_IMAGES_PROMPT
+            + PLANNER_REQUIRED_SECTIONS_PROMPT
+            + PLANNER_LEGACY_OUTPUT_FORMAT_PROMPT
+        )
+        expected = hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+        self.assertEqual(rfp._planner_prompt_hash(), expected)
+
+    def test_differs_from_the_text_agent_prompt_hash(self) -> None:
+        # Sanity check against the trivial bug of accidentally hashing the
+        # same string for both agents.
+        self.assertNotEqual(rfp._planner_prompt_hash(), rfp._text_agent_prompt_hash())
+
+
 class BuildRunResultAdditionalVerifierMetadataTest(unittest.TestCase):
     def test_populates_metadata_with_real_commit_and_honest_disabled_flags(self) -> None:
         event_logger = EventLogger(run_id="test_run_stage0")
@@ -82,25 +106,31 @@ class BuildRunResultAdditionalVerifierMetadataTest(unittest.TestCase):
             benchmark_item=None,
             producer_models={"text": "gpt-4o-mini"},
             project_dir=REPO_ROOT,
-            enabled_validators={"forbidden_environment": True, "table_columns": False},
+            text_agent_enabled_validators={"forbidden_environment": True, "table_columns": False},
+            planner_enabled_validators={"plain_title": True},
+            assembler_enabled_validators={"layout_policy": False},
         )
         metadata = result.additional_verifier_metadata
         self.assertEqual(metadata.code_commit, rfp._current_code_commit())
         self.assertEqual(metadata.git_dirty, rfp._git_is_dirty())
         self.assertEqual(metadata.text_agent_prompt_hash, rfp._text_agent_prompt_hash())
+        self.assertEqual(metadata.planner_prompt_hash, rfp._planner_prompt_hash())
         self.assertEqual(
-            metadata.enabled_validators_snapshot,
+            metadata.text_agent_enabled_validators_snapshot,
             {"forbidden_environment": True, "table_columns": False},
         )
+        self.assertEqual(metadata.planner_enabled_validators_snapshot, {"plain_title": True})
+        self.assertEqual(metadata.assembler_enabled_validators_snapshot, {"layout_policy": False})
         # None of Fix A/B/C exist yet (Stage 0) -- every flag must stay
         # honestly False, never a placeholder True for an unbuilt verifier.
         self.assertFalse(metadata.markdown_emphasis_enabled)
         self.assertFalse(metadata.math_verifier_enabled)
         self.assertFalse(metadata.dependency_verifier_enabled)
 
-    def test_defaults_enabled_validators_snapshot_to_empty_when_not_supplied(self) -> None:
-        # Every pre-Stage-0 call shape (none exist yet, but the parameter
-        # is optional) must not crash -- an empty snapshot, not an error.
+    def test_defaults_all_three_snapshots_to_empty_when_not_supplied(self) -> None:
+        # Every pre-Stage-0 call shape (none exist yet, but the
+        # parameters are optional) must not crash -- empty snapshots, not
+        # an error.
         event_logger = EventLogger(run_id="test_run_stage0_no_validators")
         result = rfp._build_run_result(
             request_id="test_run_stage0_no_validators",
@@ -113,7 +143,10 @@ class BuildRunResultAdditionalVerifierMetadataTest(unittest.TestCase):
             producer_models={"text": "gpt-4o-mini"},
             project_dir=REPO_ROOT,
         )
-        self.assertEqual(result.additional_verifier_metadata.enabled_validators_snapshot, {})
+        metadata = result.additional_verifier_metadata
+        self.assertEqual(metadata.text_agent_enabled_validators_snapshot, {})
+        self.assertEqual(metadata.planner_enabled_validators_snapshot, {})
+        self.assertEqual(metadata.assembler_enabled_validators_snapshot, {})
 
 
 if __name__ == "__main__":

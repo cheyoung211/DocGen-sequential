@@ -22,6 +22,12 @@ commit [`278e748`](https://github.com/cheyoung211/DocGen-sequential/commit/278e7
 > 실제로 연결되어 있다"와 혼동한 것 — 바로 이 프로젝트의 리뷰 역사([[docgen_stage_review_rigor]])가 반복해서
 > 경고하는 패턴이다.
 
+> **2026-10-29 수정 (2차 리뷰)**: 10-28 수정 자체도 **완전하지 않았다** — P1은 TextAgent 한 agent만
+> 식별했고(Planner·Assembler 누락), P2는 호출 간(cross-call) 보존만 다뤄 **같은 호출 내부의 실패한
+> attempt**(특히 첫 attempt)는 여전히 안 남았고, P3의 고침 자체가 `FinishCall(reason="resolved")`에
+> 비해 있는 `unresolved_artifact_ids`를 만들 수 있는 새 모순을 **만들어냈다**. 세 건 모두 실제 코드로
+> 고쳤다 (아래 각 절).
+
 ## P1. 범위·버전 기록
 
 - **기존 결과 보존**: `outputs/`, `outputs_b4_workshop/`, Notion "Gold Labeling" 페이지는 전혀 건드리지
@@ -39,10 +45,20 @@ commit [`278e748`](https://github.com/cheyoung211/DocGen-sequential/commit/278e7
   - **`text_agent_prompt_hash`** *(수정 후 추가)*: 실제 `TextAgent.SYSTEM_PROMPT` 문자열의 SHA-256 앞
     16자 (`_text_agent_prompt_hash`). git 상태와 독립적으로 "실제 사용한 prompt"를 식별한다 — working
     tree가 dirty여도 이 값은 정확하다.
-  - **`enabled_validators_snapshot`** *(수정 후 추가)*: 그 실행에서 실제로 쓰인
-    `TextAgent.enabled_validators` 딕셔너리 (static `DEFAULT_ENABLED_VALIDATORS`가 아니라, ablation 실행이
-    `TextAgent(enabled_validators={...})`로 override한 실제 인스턴스 값). `DocGenPipeline.run()`의
-    `_write_log` 클로저가 `self.text_agent.enabled_validators`를 그대로 전달한다
+  - **`planner_prompt_hash`** *(2차 리뷰 후 추가)*: 2차 리뷰가 지적한 대로, 10-28 수정은 TextAgent 한
+    agent만 식별했다 — Planner는 `PLANNER_STRATEGY_PROMPT` + 조건부 3개 조각(`PLANNER_NO_IMAGES_PROMPT`/
+    `PLANNER_REQUIRED_SECTIONS_PROMPT`/`PLANNER_LEGACY_OUTPUT_FORMAT_PROMPT`)을 매 호출마다 다르게
+    조합하므로(`allow_figures`/`required_sections` 플래그에 따라), 단일 `SYSTEM_PROMPT`가 없다. 4개 고정
+    템플릿 문자열을 이어붙여 해싱(`_planner_prompt_hash`)해 "planner 프롬프트의 코드 버전"을 식별한다 —
+    TextAgent 쪽도 호출별 user prompt는 해싱하지 않는 것과 동일한 범위. **`LatexAssembler`는 이 코드베이스에
+    `SYSTEM_PROMPT` 같은 모듈 상수가 전혀 없어** (`grep`으로 확인) `assembler_prompt_hash` 필드를 의도적으로
+    만들지 않았다 — 없는 것을 해싱해서 있는 것처럼 보이게 하지 않는다.
+  - **`text_agent_enabled_validators_snapshot` / `planner_enabled_validators_snapshot` /
+    `assembler_enabled_validators_snapshot`** *(2차 리뷰 후 세 필드로 분리)*: 원래 `enabled_validators_
+    snapshot` 하나로 TextAgent만 담았던 것을, 세 agent 각각의 실제 인스턴스 `.enabled_validators` 딕셔너리로
+    분리했다 (static `DEFAULT_ENABLED_*`가 아니라, ablation 실행이 `TextAgent(enabled_validators={...})`
+    등으로 override한 실제 값). `DocGenPipeline.run()`의 `_write_log` 클로저가
+    `self.text_agent`/`self.planner`/`self.assembler` 각각의 `.enabled_validators`를 전달한다
     (`scripts/run_full_pipeline.py`).
   - `plan_doc_version`: `"2026-10-28"` (이 코드가 기준으로 한 계획 작성일).
   - **`rubric_version`** *(수정)*: 기본값을 `None`에서 `"gold_labeling_draft_2026-10-26"`로 바꿈 — Gold
@@ -80,6 +96,25 @@ commit [`278e748`](https://github.com/cheyoung211/DocGen-sequential/commit/278e7
 재호출/`regenerate_blocks` 모두 이전 내용을 정확히 보존, 2회 연속 복구가 `pre_repair_1`/`pre_repair_2`로
 분리됨을 확인).
 
+**2차 리뷰가 지적한 부분 (2026-10-29)**: 위 수정은 **호출 간**(cross-call) 보존만 다룬다 — `process_node`/
+`regenerate_blocks`가 다시 호출되기 *전에* 이미 디스크에 있던 내용만 보존한다. 하지만 **같은 호출 내부**,
+즉 `_run_generation_loop`의 attempt 루프 안에서 검증에 실패한 attempt(특히 그 node의 **첫 attempt**)는
+어디에도 기록되지 않았다 — 성공한 마지막 attempt만 `_write_semantic_artifacts`로 디스크에 쓰인다. 실패
+원인 분석에는 바로 이 실패한 attempt의 실제 내용(어떤 블록이 왜 거부됐는지)이 필요하다.
+
+**실제 수정**: 새 `TextAgent._persist_failed_attempt(sections_dir, node_id, attempt=..., error_message=...,
+failing_blocks=..., raw_response=...)`를 `_run_generation_loop`의 `SemanticBlockErrors`/일반 `Exception`
+두 분기 모두에서 호출한다. `SemanticBlockErrors`의 경우 실제로 거부된 블록 내용(`exc.blocks`를
+`failing_ids`로 필터링)까지 보존하고, 일반 예외의 경우 raw LLM 응답(획득했다면)과 에러 메시지를 보존한다.
+파일명은 `{node_id}.failed_attempt_{k}.json`이며 `k`는 (루프의 `attempt` 번호가 호출마다 1로 리셋되는 것과
+달리) 디스크에 이미 있는 `failed_attempt_*` 개수로 매번 새로 스캔해 결정 — 같은 node에 대한 서로 다른 호출의
+실패 기록이 서로 덮어쓰지 않는다. `raw_response`는 루프 반복마다 맨 앞에서 `None`으로 리셋한다 —
+`self.llm.generate()` 자체가 실패하면 이전 attempt의 값이 새어 들어가는 걸 막는다.
+
+테스트: `test/test_text_agent.py::TextAgentFailedAttemptPreservationTest` (첫 attempt 일반 실패 보존,
+`SemanticBlockErrors`의 실제 거부 내용 보존, 3회 모두 실패해 ERROR로 끝나는 경우도 3개 전부 보존·순서대로
+번호 매겨짐을 확인).
+
 ## P3. 미해결 상태의 종료 시 보고
 
 **원래 설명이 틀렸던 부분**: "`_aggregate_unresolved`가 이미 미해결을 전부 집계한다"고 썼으나, 사용자
@@ -109,6 +144,25 @@ docstring(point 14)이 이미 확립한 설계대로, `_controller_node`는 **�
 (`test_finish_call_includes_artifact_with_a_required_but_never_checked_constraint`). 기존
 36개 테스트 전부 변경 없이 통과 (42개 전체 통과).
 
+**2차 리뷰가 지적한 부분 (2026-10-29)**: 위 수정이 **새 모순을 만들었다**. `RuleBasedController.decide()`는
+모든 게 해결됐다고 판단하면 `FinishCall(reason="resolved", unresolved_artifact_ids=[])`를 **하드코딩**으로
+반환한다 (이 판정은 `_compute_unresolved`만 보고 내려지며, `_never_checked_required_ids`가 잡는 "요구되지만
+한 번도 안 검사됨" 케이스는 이 판정에 전혀 반영되지 않는다). choke point가 이 호출 뒤에 enriched
+`unresolved_artifact_ids`를 union하면서, `reason="resolved"`인데 `unresolved_artifact_ids`가 비어있지 않은
+**직접적인 모순 상태**가 새로 도달 가능해졌다 — 이 모듈의 reason 어휘 중 "아무 문제 없음"을 주장하는 건
+`"resolved"` 하나뿐이고, 나머지(`"unresolved_remaining"`, `"evidence_inconclusive"`, `"compile_failed"`,
+`"cannot_repair"`, 두 guard reason)는 이미 문제를 인정하는 문구라 이 모순이 발생하지 않는다.
+
+**실제 수정**: `_controller_node`에서 enriched `unresolved_artifact_ids`를 계산한 뒤, `call.reason ==
+"resolved"`이면서 그 목록이 비어있지 않으면 reason을 새 문자열을 만들지 않고 이미 존재하는
+`"unresolved_remaining"`으로 바꾼다. `_FINISH_REASON_MAP`에서 `"resolved"`와 `"unresolved_remaining"`
+둘 다 이미 동일한 `ControllerStopReason.FINISHED`로 매핑되므로, `_tool_node`가 기록하는 stop_reason에는
+영향이 없다 — `FinishCall.reason` 문자열만 바뀐다.
+
+테스트: `test_resolved_reason_is_corrected_when_the_enriched_union_is_not_actually_empty`(모순 상황에서
+`"unresolved_remaining"`으로 교정됨 확인), `test_resolved_reason_is_left_alone_when_the_union_is_genuinely_
+empty`(진짜 해결된 경우 `"resolved"`가 그대로 유지됨 확인 — 과교정 방지).
+
 ## P4. 비용·조건 분리
 
 **원래 설명의 빠진 부분**: "`CostTrackingProducer`가 비용을 집계한다"는 맞지만, 사용자가 물은 "결정적
@@ -136,13 +190,17 @@ A/B/C가 실제로 구현되는 1~4단계에서 값이 채워지는 **구조 고
 
 | 조건 | prompt 버전 | 정규화 | 활성 검사 | feedback | 복구 범위 | 비용 기록 경로 |
 | --- | --- | --- | --- | --- | --- | --- |
-| baseline (현재, additional verifiers 없음) | `text_agent_prompt_hash` (현재 커밋 기준 고정) | 없음 (markdown 강조 규제 미적용) | `DEFAULT_ENABLED_VALIDATORS`만 (`enabled_validators_snapshot`으로 기록됨) | `TextAgent.process_node`의 내부 재시도 피드백만 (always-on, 끌 수 없음) | 기존 `_repair_and_recompile` (block/section) | LLM: `token_usage_records`; 결정적 검사: 없음 |
+| baseline (현재, additional verifiers 없음) | `text_agent_prompt_hash`/`planner_prompt_hash` (현재 커밋 기준 고정) | 없음 (markdown 강조 규제 미적용) | 각 agent의 `DEFAULT_ENABLED_*`만 (`{text_agent,planner,assembler}_enabled_validators_snapshot`으로 기록됨) | `TextAgent.process_node`의 내부 재시도 피드백만 (always-on, 끌 수 없음) | 기존 `_repair_and_recompile` (block/section) | LLM: `token_usage_records`; 결정적 검사: 없음 |
 | +Fix A (markdown_emphasis) | TBD (1단계에서 SYSTEM_PROMPT 수정 시 새 hash) | TBD: 평문 강조만 제한적 변환, 모호한 경우는 block 복구로 | `markdown_emphasis_enabled=True` 추가 | TBD (A3에서 결정) | TBD (A3) | TBD — 4단계 전까지는 real pipeline에 새 경로 직접 추가 필요 |
 | +Fix A+C (reference/order) | TBD | TBD | +`dependency_verifier_enabled=True` | TBD | TBD | TBD |
 | +Fix A+B+C (전체) | TBD | TBD | 전부 `True` | TBD | TBD | TBD |
 
 이 표의 "TBD" 행은 각 단계 설계 문서(`docs/av_stage1_*.md` 등)에서 구체적 값으로 채워져야 완료된다 — 0단계는
 표의 **열 구조와 베이스라인 행**을 고정하는 것까지다.
+
+**2차 리뷰 확인 (2026-10-29)**: 2차 리뷰는 이 "TBD" 행들과 "결정적 검사 비용 기록 경로 없음"이 여전히
+그대로라고 짚었다 — 맞다, 둘 다 이미 위에서 **의도적으로** 1~4단계로 이연한 것이다 (A/B/C 자체가 없는데
+그 조건의 정규화·feedback·복구 범위를 지금 확정할 수는 없다). 이번 라운드에서 추가 조치는 하지 않았다.
 
 ## 발견된 공백 — 0단계에서 풀지 않고 이후 단계로 이연
 
@@ -177,6 +235,8 @@ A/B/C가 실제로 구현되는 1~4단계에서 값이 채워지는 **구조 고
   아직 없으므로 (A/B/C 미구현) 실제 추적은 1단계에서 처음 end-to-end로 검증된다.
 - [x] 기존 결과 보존 확인 (outputs/, Gold Labeling 불변).
 - [x] 검사 범위와 로그 계약 확정: P1-P4 각각이 가리키는 기존/신규 메커니즘, 그리고 P4의 비교 조건 표 구조.
-- [x] 4건의 리뷰 지적 모두 반영 완료, 회귀 테스트 추가 (controller.py 5개, text_agent.py 4개, schemas.py
-  갱신), 전체 테스트 스위트 변경 없이 통과 (사전 존재하던 57건의 무관한 실패는 이 세션 변경 전/후 동일함을
-  `git stash`로 확인).
+- [x] 1차 리뷰(2026-10-28) 4건, 2차 리뷰(2026-10-29) 3건 모두 반영 완료. 2차 리뷰 반영: P1에 planner
+  prompt hash + 3-agent validator snapshot 분리, P2에 호출-내부 실패 attempt 보존
+  (`_persist_failed_attempt`), P3의 `reason="resolved"`/비어있지 않은 unresolved 모순 교정. 회귀 테스트
+  총 24개 추가 (controller.py 7개, text_agent.py 7개, schemas/wiring 테스트 갱신), 전체 테스트 스위트
+  변경 없이 통과 (사전 존재하던 57건의 무관한 실패는 이 세션 변경 전/후 동일함을 `git stash`로 확인).

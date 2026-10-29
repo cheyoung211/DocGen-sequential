@@ -763,6 +763,11 @@ class TextAgent:
 
         for attempt in range(1, max_attempts + 1):
             pending_layout_blocks = [block for block in layout_blocks if block.id in pending_ids]
+            # Reset every iteration -- if self.llm.generate() itself raises
+            # below, this must read None for THIS attempt, never silently
+            # carry over a previous attempt's response (Revision
+            # (Additional verifiers) Stage 0 / P2, round 2).
+            raw_response: Optional[str] = None
             try:
                 raw_response = self.llm.generate(
                     system_prompt=SYSTEM_PROMPT,
@@ -796,6 +801,14 @@ class TextAgent:
                 pending_ids = failing_ids
                 last_error = str(exc)
                 tracker.record_failure(attempt, _classify_generation_error(exc), str(exc))
+                self._persist_failed_attempt(
+                    sections_dir,
+                    node_id,
+                    attempt=attempt,
+                    error_message=str(exc),
+                    failing_blocks=[block for block in exc.blocks if block.block_id in failing_ids],
+                    raw_response=raw_response,
+                )
                 print(
                     f"[TextAgent] Attempt {attempt}/{max_attempts} for '{node_id}': "
                     f"{len(failing_ids)} block(s) still failing: {sorted(failing_ids)}"
@@ -807,6 +820,14 @@ class TextAgent:
                 last_error = str(exc)
                 block_errors = {}
                 tracker.record_failure(attempt, _classify_generation_error(exc), str(exc))
+                self._persist_failed_attempt(
+                    sections_dir,
+                    node_id,
+                    attempt=attempt,
+                    error_message=str(exc),
+                    failing_blocks=[],
+                    raw_response=raw_response,
+                )
                 print(f"[TextAgent] Attempt {attempt}/{max_attempts} failed for '{node_id}': {exc}")
 
             if not pending_ids:
@@ -876,7 +897,11 @@ class TextAgent:
         alongside the real files.
 
         No-op if ``node_id`` has never been drafted yet -- nothing to
-        preserve for a first draft.
+        preserve for a first draft. Covers cross-CALL preservation only
+        (a second ``process_node``/``regenerate_blocks`` call overwriting
+        a first one's accepted output); a FAILED attempt inside the SAME
+        call's own internal retry loop is a different gap -- see
+        ``_persist_failed_attempt`` below.
         """
         blocks_path = sections_dir / f"{node_id}.blocks.json"
         if not blocks_path.is_file():
@@ -891,6 +916,52 @@ class TextAgent:
             (sections_dir / f"{node_id}.pre_repair_{next_index}.draft.tex").write_text(
                 draft_path.read_text(encoding="utf-8"), encoding="utf-8"
             )
+
+    @staticmethod
+    def _persist_failed_attempt(
+        sections_dir: Path,
+        node_id: str,
+        *,
+        attempt: int,
+        error_message: str,
+        failing_blocks: List[ContentBlock],
+        raw_response: Optional[str],
+    ) -> None:
+        """Preserve one FAILED generation attempt's actual content, for
+        failure-cause analysis.
+
+        Revision (Additional verifiers) Stage 0 / P2, round 2: a user
+        review found that ``_snapshot_before_overwrite`` only preserves
+        content ACROSS separate ``process_node``/``regenerate_blocks``
+        calls -- it does nothing for a FAILED attempt inside this same
+        call's own internal retry loop, which ``_run_generation_loop``
+        never wrote to disk at all before this fix. A node whose very
+        first attempt fails and whose second attempt succeeds previously
+        left zero record of what the rejected first attempt actually
+        contained -- exactly the case most useful for understanding WHY
+        generation failed in the first place, as opposed to merely THAT
+        it failed (``AttemptTracker``/``EventLogger`` already record the
+        latter).
+
+        Unlike ``_snapshot_before_overwrite``, there is no "nothing to
+        preserve" case to no-op on -- a failed attempt, by definition,
+        has content (or a raw response, or at least an error) that
+        exists nowhere else. File naming uses its own, separately-scanned
+        sequence (not ``attempt``, which resets to 1 on every fresh
+        ``_run_generation_loop`` call) so failures from different calls on
+        the same node never collide.
+        """
+        existing = list(sections_dir.glob(f"{node_id}.failed_attempt_*.json"))
+        next_index = len(existing) + 1
+        record = {
+            "node_id": node_id,
+            "attempt_within_call": attempt,
+            "error_message": error_message,
+            "failing_blocks": [block.model_dump(mode="json") for block in failing_blocks],
+            "raw_response": raw_response,
+        }
+        path = sections_dir / f"{node_id}.failed_attempt_{next_index}.json"
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _build_prompt_from_node(
         self,
