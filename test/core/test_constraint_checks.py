@@ -460,6 +460,130 @@ class TestRecomputeFromSource:
         assert evidence[0].input_versions == [source_ref]
 
 
+class TestDependencyConstraint:
+    """Coverage for ConstraintKind.DEPENDENCY (Fix C, checklist item C4) --
+    _check_dependency adapts dependency_verifier's own must_reference/
+    must_precede decision logic into this module's Evidence vocabulary."""
+
+    def _store_with_source_and_target(self) -> "tuple[ArtifactGraphStore, ArtifactRef, ArtifactRef]":
+        store = ArtifactGraphStore()
+        store.add_version("intro", ArtifactKind.SECTION, content="intro content")
+        store.add_version("summary", ArtifactKind.SECTION, content="\\Cref{sec:intro} ties back.")
+        return store, store.latest("intro").ref, store.latest("summary").ref
+
+    def test_must_reference_passes_on_a_real_citation(self) -> None:
+        store, source_ref, target_ref = self._store_with_source_and_target()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {"relation": "must_reference", "allowed_labels": ["sec:intro"]}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+        assert evidence[0].input_versions == [source_ref]
+
+    def test_must_reference_fails_without_a_real_citation(self) -> None:
+        store = ArtifactGraphStore()
+        store.add_version("intro", ArtifactKind.SECTION, content="intro content")
+        store.add_version("summary", ArtifactKind.SECTION, content="the analysis section covers this")
+        source_ref = store.latest("intro").ref
+        target_ref = store.latest("summary").ref
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {"relation": "must_reference", "allowed_labels": ["sec:intro"]}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.FAIL
+
+    def test_must_precede_passes_on_an_increasing_order_hint(self) -> None:
+        store, source_ref, target_ref = self._store_with_source_and_target()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {"relation": "must_precede", "order_hint": [0, 3]}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+
+    def test_must_precede_fails_on_a_non_increasing_order_hint(self) -> None:
+        store, source_ref, target_ref = self._store_with_source_and_target()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {"relation": "must_precede", "order_hint": [3, 0]}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.FAIL
+
+    def test_must_reuse_is_unknown_not_representable_not_passed(self) -> None:
+        store, source_ref, target_ref = self._store_with_source_and_target()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint], context={"dependency": {"d1": {"relation": "must_reuse"}}}
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_missing_source_is_unknown_missing_dependency(self) -> None:
+        store = ArtifactGraphStore()
+        store.add_version("summary", ArtifactKind.SECTION, content="\\Cref{sec:intro}")
+        target_ref = store.latest("summary").ref
+        ghost_ref = ArtifactRef(artifact_id="intro", version=1, kind=ArtifactKind.SECTION)
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[ghost_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {"relation": "must_reference", "allowed_labels": ["sec:intro"]}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.MISSING_DEPENDENCY
+        assert evidence[0].missing_inputs == [ghost_ref]
+
+    def test_no_context_values_is_unknown_not_checked(self) -> None:
+        store, source_ref, target_ref = self._store_with_source_and_target()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(target_ref, [constraint], context={})
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_CHECKED
+
+    def test_a_regenerated_source_invalidates_the_prior_evidence(self) -> None:
+        # The whole point of putting the source in applies_to: once it
+        # moves to a new version, live_evidence() must stop reading the
+        # old verdict as current -- no dependency-specific invalidation
+        # code needed, this is the store's existing generic mechanism.
+        store, source_ref, target_ref = self._store_with_source_and_target()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {"relation": "must_reference", "allowed_labels": ["sec:intro"]}}},
+        )[0]
+        store.record_evidence(evidence)
+        assert len(store.live_evidence("summary")) == 1
+
+        store.add_version("intro", ArtifactKind.SECTION, content="revised intro content")
+        assert store.live_evidence("summary") == []
+
+
 def test_check_answers_every_requested_constraint_not_a_subset() -> None:
     """Validator.check()'s contract (interfaces.py): never silently drop a
     requested constraint. A mixed batch -- one of each kind -- must come

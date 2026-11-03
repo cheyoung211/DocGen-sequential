@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, validator
 from enum import Enum
 
 from src.common.state import DocumentBlueprint
-from src.dataset.schemas import RequiredSection
+from src.dataset.schemas import CrossSectionDependency, RequiredSection
 
 # Some LLM responses double-escape backslashes when they emit a JSON string
 # whose value itself contains a markdown/LaTeX newline, so json.loads() leaves
@@ -167,6 +167,16 @@ class PlannerInput(BaseModel):
     # planner is prompted to cover each one and _validate_blueprint checks
     # that coverage (see DEFAULT_ENABLED_PLANNER_VALIDATORS["required_sections"]).
     required_sections: List[RequiredSection] = Field(default_factory=list)
+    # Populated from BenchmarkItem.cross_section_dependencies when the
+    # request comes from a benchmark dataset item; empty otherwise.
+    # PlannerAgent._validate_blueprint resolves each dependency's
+    # source_section/target_sections (RequiredSection.section_id values)
+    # onto the actual generated node ids and writes them into the target
+    # node's `dependencies` + `spec["dependency_notes"]` -- see that
+    # method's docstring. Wiring data onto the plan, not a QA gate, so it
+    # is not behind an enabled_validators toggle the way required_sections
+    # coverage checking is.
+    cross_section_dependencies: List[CrossSectionDependency] = Field(default_factory=list)
 
 class SectionSpec(BaseModel):
     """state.py의 DocumentNode 내 spec 필드에 들어갈 상세 지침"""

@@ -126,6 +126,41 @@ class CrossSectionDependencyWiringTest(unittest.TestCase):
         nodes_by_id = self._nodes_by_id(plan)
         self.assertNotIn("dependencies", nodes_by_id["intro"])
 
+    def test_must_reference_gets_dependency_notes_but_not_a_readiness_gate(self) -> None:
+        # must_reference only needs the source's label (always available
+        # from the blueprint, even before drafting) -- it must not force a
+        # forward reference to wait on the source being drafted.
+        agent = PlannerAgent(llm_client=_STUB_LLM_CLIENT)
+        plan = _plan(["intro", "results"])
+        reference_dep = CrossSectionDependency(
+            dependency_id="dep_ref", source_section="intro", target_sections=["results"],
+            relation=DependencyRelation.MUST_REFERENCE, description="Results must cite the introduction.",
+        )
+        agent._validate_blueprint(
+            plan, required_sections=self.required, cross_section_dependencies=[reference_dep]
+        )
+        nodes_by_id = self._nodes_by_id(plan)
+        self.assertNotIn("dependencies", nodes_by_id["results"])
+        notes = nodes_by_id["results"]["spec"]["dependency_notes"]
+        self.assertEqual(notes[0]["relation"], "must_reference")
+
+    def test_must_precede_is_not_wired_at_all(self) -> None:
+        # must_precede is pure document/assembly ordering (C1's order_hint
+        # is where it belongs) -- it must not appear as a generation-input
+        # dependency or even as a dependency_notes prompt entry.
+        agent = PlannerAgent(llm_client=_STUB_LLM_CLIENT)
+        plan = _plan(["intro", "results"])
+        precede_dep = CrossSectionDependency(
+            dependency_id="dep_order", source_section="intro", target_sections=["results"],
+            relation=DependencyRelation.MUST_PRECEDE, description="Intro must come before results.",
+        )
+        agent._validate_blueprint(
+            plan, required_sections=self.required, cross_section_dependencies=[precede_dep]
+        )
+        nodes_by_id = self._nodes_by_id(plan)
+        self.assertNotIn("dependencies", nodes_by_id["results"])
+        self.assertNotIn("spec", nodes_by_id["results"])
+
     def test_wiring_is_independent_of_the_required_sections_qa_toggle(self) -> None:
         # Disabling the required_sections *coverage check* must not disable
         # dependency wiring -- it's data enrichment, not a QA gate.

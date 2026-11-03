@@ -85,6 +85,27 @@ class DependencyContextPromptTest(unittest.TestCase):
         self.assertIn("(none)", prompt)
         self.assertNotIn("We classify volatility regimes", prompt)
 
+    def test_drafted_dependency_records_the_input_version_actually_used(self) -> None:
+        graph = _graph_with(intro_status=NodeStatus.DRAFTED)
+        graph.nodes["sec_intro"].attempt_count = 2
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        agent._build_prompt_from_node(graph.nodes["sec_results"], graph, layout_blocks=[])
+
+        versions_used = graph.nodes["sec_results"].spec["dependency_versions_used"]
+        self.assertEqual(len(versions_used), 1)
+        self.assertEqual(versions_used[0]["depends_on"], "sec_intro")
+        self.assertEqual(versions_used[0]["attempt_count"], 2)
+        self.assertEqual(
+            versions_used[0]["last_updated"], graph.nodes["sec_intro"].last_updated.isoformat()
+        )
+
+    def test_undrafted_dependency_records_no_version_used(self) -> None:
+        graph = _graph_with(intro_status=NodeStatus.PENDING)
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        agent._build_prompt_from_node(graph.nodes["sec_results"], graph, layout_blocks=[])
+
+        self.assertEqual(graph.nodes["sec_results"].spec["dependency_versions_used"], [])
+
     def test_excerpt_is_condensed_for_long_content(self) -> None:
         graph = _graph_with(intro_status=NodeStatus.DRAFTED)
         graph.nodes["sec_intro"].content = "word " * 400  # far longer than the 500-char cap
@@ -93,6 +114,49 @@ class DependencyContextPromptTest(unittest.TestCase):
 
         self.assertIn("[…]", prompt)
         self.assertNotIn("word " * 400, prompt)
+
+    def test_must_reference_is_surfaced_even_when_source_is_undrafted(self) -> None:
+        # must_reference only needs the source's label (valid before
+        # drafting) -- a legitimate forward reference must not be dropped
+        # just because the source hasn't been drafted yet.
+        graph = _graph_with(intro_status=NodeStatus.PENDING)
+        graph.nodes["sec_results"].spec["dependency_notes"] = [
+            {
+                "depends_on": "sec_intro",
+                "relation": "must_reference",
+                "description": "Results must cite the introduction's key result.",
+            }
+        ]
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        prompt = agent._build_prompt_from_node(graph.nodes["sec_results"], graph, layout_blocks=[])
+
+        self.assertIn("must_reference", prompt)
+        self.assertIn("Results must cite the introduction's key result.", prompt)
+        self.assertNotIn("We classify volatility regimes", prompt)  # no content excerpt, source undrafted
+        # must_reference never needs drafted content, so it must not count
+        # as an input version actually read.
+        self.assertEqual(graph.nodes["sec_results"].spec["dependency_versions_used"], [])
+
+    def test_must_reference_excerpt_omitted_even_when_source_is_drafted(self) -> None:
+        # Deliberately no content excerpt for must_reference even once the
+        # source IS drafted -- the obligation is "cite the label", and the
+        # label itself is already listed under "Available cross-reference
+        # labels"; a content excerpt here would blur this relation with
+        # must_reuse/must_be_consistent_with's genuinely different need.
+        graph = _graph_with(intro_status=NodeStatus.DRAFTED)
+        graph.nodes["sec_results"].spec["dependency_notes"] = [
+            {
+                "depends_on": "sec_intro",
+                "relation": "must_reference",
+                "description": "Results must cite the introduction's key result.",
+            }
+        ]
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        prompt = agent._build_prompt_from_node(graph.nodes["sec_results"], graph, layout_blocks=[])
+
+        self.assertIn("must_reference", prompt)
+        self.assertNotIn("We classify volatility regimes", prompt)
+        self.assertEqual(graph.nodes["sec_results"].spec["dependency_versions_used"], [])
 
 
 if __name__ == "__main__":

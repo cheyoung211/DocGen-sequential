@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 import re
-from typing import Dict, List, Literal, Optional, TypeAlias
+from typing import Dict, List, Literal, Optional, Set, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -12,7 +12,7 @@ from src.agents.latex_assembler import (
 )
 from src.common.schemas import PlannerInput, PlannerOutput
 from src.common.state import DocumentKind, DocumentBlueprint, LatexComponent, LayoutBlockKind, NodeType, SAFE_IDENTIFIER
-from src.dataset.schemas import RequiredSection
+from src.dataset.schemas import CrossSectionDependency, DependencyRelation, RequiredSection
 from src.evaluation.event_logger import AttemptTracker, EventLogger
 # Reused as-is from the evaluation layer rather than reimplemented here, so
 # the planner's live "is this required section covered" gate and
@@ -703,6 +703,7 @@ class PlannerAgent:
                     plan,
                     allow_figures=planner_input.allow_figures,
                     required_sections=planner_input.required_sections,
+                    cross_section_dependencies=planner_input.cross_section_dependencies,
                 )
                 tracker.record_success(attempt)
                 return plan
@@ -721,6 +722,7 @@ class PlannerAgent:
         plan: PlannerOutput,
         allow_figures: bool = True,
         required_sections: Optional[List[RequiredSection]] = None,
+        cross_section_dependencies: Optional[List[CrossSectionDependency]] = None,
     ) -> None:
         """Reject graph/layout contracts that cannot be composed safely.
 
@@ -895,6 +897,127 @@ class PlannerAgent:
             if unmatched:
                 raise ValueError(
                     "Blueprint is missing required section(s): " + "; ".join(unmatched)
+                )
+
+        if cross_section_dependencies:
+            # Deliberately NOT gated behind self.enabled_validators -- this
+            # writes data onto the plan (dependencies/dependency_notes) for
+            # TextAgent to read later, it is not a QA gate that can be
+            # toggled off the way required_sections coverage checking is
+            # (see test_wiring_is_independent_of_the_required_sections_qa_toggle).
+            self._wire_cross_section_dependencies(
+                plan, blueprint, required_sections or [], cross_section_dependencies
+            )
+
+    def _wire_cross_section_dependencies(
+        self,
+        plan: PlannerOutput,
+        blueprint: DocumentBlueprint,
+        required_sections: List[RequiredSection],
+        cross_section_dependencies: List[CrossSectionDependency],
+    ) -> None:
+        """Resolves each ``CrossSectionDependency``'s ``source_section``/
+        ``target_sections`` (``RequiredSection.section_id`` values, per the
+        benchmark's own vocabulary -- never the Planner's own generated node
+        ids) onto the real generated node ids, via the same matcher the
+        required_sections coverage check above uses
+        (``_match_required_section``, reused not reimplemented), and writes
+        the result onto the target node: ``node["dependencies"]`` (plain
+        node-id list, for ``compute_ready_artifacts``-style readiness/
+        ordering use) and/or ``node["spec"]["dependency_notes"]`` (the
+        relation/description TextAgent surfaces as prompt context -- see
+        ``TextAgent._build_prompt_from_node``) -- which of the two depends
+        on the relation (see the per-relation split below), per the plan's
+        own instruction to "distinguish forward reference and document-order
+        requirements from generation-input relations" (C2):
+
+        - ``MUST_REUSE``/``MUST_BE_CONSISTENT_WITH`` genuinely need the
+          source's drafted *content* (reuse a value, stay consistent with
+          it) -- these get both ``dependencies`` (gates generation order/
+          readiness) and ``dependency_notes``.
+        - ``MUST_REFERENCE`` only needs the source's *label* to exist, which
+          ``DocumentGraph.label_registry`` already makes available for
+          every section the instant the blueprint is set, before any
+          section is drafted (see that registry's own docstring) -- citing
+          it can legitimately be a forward reference. Gets
+          ``dependency_notes`` only (the obligation + description text),
+          never ``dependencies``: gating generation order on something
+          that doesn't need the source's content would wrongly forbid a
+          forward reference the plan explicitly wants preserved.
+        - ``MUST_PRECEDE`` is pure document/assembly ordering ("blueprint/
+          조립 순서 확인; 생성 순서와 별도 관리" -- the plan's own table) --
+          it is skipped here entirely, neither field. C1's
+          ``CrossSectionObligation.order_hint`` (``src/core/
+          dependency_mapping.py``) is where this relation's structural
+          check belongs, against the blueprint's own section order, not
+          generation input.
+
+        A dependency whose source or target doesn't resolve -- not declared
+        in ``required_sections`` at all, or declared but never matched
+        against the real blueprint -- is skipped silently, exactly like the
+        required_sections coverage check's own unmatched case, rather than
+        raising: this is best-effort enrichment, not a hard contract (C1's
+        ``src/core/dependency_mapping.py`` is where an unmapped dependency
+        gets reported explicitly for evaluation purposes; this method's job
+        is only to feed what *did* resolve into generation).
+
+        Each benchmark section_id is resolved at most once across every
+        dependency that references it (cached in ``resolved``), sharing one
+        ``claimed_ids`` set -- calling ``_match_required_section`` again for
+        the same ``RequiredSection`` would see its own first match already
+        claimed and could fail or pick a different node the second time.
+        """
+        content_read_relations = {
+            DependencyRelation.MUST_REUSE,
+            DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        }
+        required_by_id = {r.section_id: r for r in required_sections}
+        topic_keywords = _keywords(blueprint.document.title or "")
+        claimed_ids: Set[str] = set()
+        resolved: Dict[str, Optional[str]] = {}
+
+        def resolve(section_id: str) -> Optional[str]:
+            if section_id in resolved:
+                return resolved[section_id]
+            required_section = required_by_id.get(section_id)
+            if required_section is None:
+                resolved[section_id] = None
+                return None
+            matched, _matched_via = _match_required_section(
+                required_section, blueprint, claimed_ids, topic_keywords
+            )
+            matched_id = matched.section_id if matched is not None else None
+            if matched_id is not None:
+                claimed_ids.add(matched_id)
+            resolved[section_id] = matched_id
+            return matched_id
+
+        nodes_by_id: Dict[str, Dict] = {
+            node["id"]: node for node in plan.nodes_to_create if node.get("id")
+        }
+        for dependency in cross_section_dependencies:
+            if dependency.relation == DependencyRelation.MUST_PRECEDE:
+                continue
+            source_node_id = resolve(dependency.source_section)
+            if source_node_id is None:
+                continue
+            for target_section_id in dependency.target_sections:
+                target_node_id = resolve(target_section_id)
+                if target_node_id is None:
+                    continue
+                target_node = nodes_by_id.get(target_node_id)
+                if target_node is None:
+                    continue
+                if dependency.relation in content_read_relations:
+                    target_dependencies = target_node.setdefault("dependencies", [])
+                    if source_node_id not in target_dependencies:
+                        target_dependencies.append(source_node_id)
+                target_node.setdefault("spec", {}).setdefault("dependency_notes", []).append(
+                    {
+                        "depends_on": source_node_id,
+                        "relation": dependency.relation.value,
+                        "description": dependency.description,
+                    }
                 )
 
     def _build_detailed_user_prompt(

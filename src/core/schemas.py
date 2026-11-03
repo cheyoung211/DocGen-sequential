@@ -168,12 +168,18 @@ class UnknownReason(str, Enum):
 
 class ConstraintKind(str, Enum):
     """The four checkable-constraint families from revision direction 3's
-    table (schema contract / CSP-SMT / recompute / symbolic)."""
+    table (schema contract / CSP-SMT / recompute / symbolic), plus
+    ``DEPENDENCY`` -- added for the separate "Revision (Additional
+    verifiers)" plan's Fix C (cross-section dependency relations:
+    must_reference/must_reuse/must_be_consistent_with/must_precede), not
+    one of the original four. See ``constraint_checks.BasicConstraintChecker
+    ._check_dependency`` and ``src/core/dependency_constraint_provider.py``."""
 
     SCHEMA_CONTRACT = "schema_contract"
     CSP_SMT = "csp_smt"
     RECOMPUTE = "recompute"
     SYMBOLIC = "symbolic"
+    DEPENDENCY = "dependency"
 
 
 class Constraint(BaseModel):

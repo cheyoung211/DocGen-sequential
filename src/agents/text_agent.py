@@ -29,6 +29,7 @@ from src.common.schemas import (
     ToolResponse,
 )
 from src.common.state import DocumentGraph, LayoutBlock, LayoutBlockKind, NodeStatus, SectionLayout
+from src.dataset.schemas import DependencyRelation
 from src.evaluation.event_logger import AttemptTracker, EventLogger
 from src.helpers.tools import pandas_csv_to_latex_table
 
@@ -989,6 +990,100 @@ class TextAgent:
         path = sections_dir / f"{node_id}.failed_attempt_{next_index}.json"
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    #: Character cap for a dependency source's content excerpt in the
+    #: prompt -- generous enough for a real "what did that section actually
+    #: say" check, small enough that one long upstream section can't crowd
+    #: out this section's own instructions. See _build_dependency_context.
+    _DEPENDENCY_EXCERPT_CHAR_CAP = 500
+
+    def _build_dependency_context(self, node: Any, graph: DocumentGraph) -> str:
+        """Surfaces, for a node's ``spec["dependency_notes"]`` (written by
+        ``PlannerAgent._wire_cross_section_dependencies``), what each
+        already-drafted dependency actually said -- the real content and
+        key_points of the upstream section, not just its id -- so this
+        section can genuinely reuse/reference/stay consistent with it
+        instead of guessing.
+
+        A ``must_reuse``/``must_be_consistent_with`` note whose source node
+        isn't drafted yet (same "drafted" status set ``DocumentGraph.
+        get_full_context`` already uses: DRAFTED/REVIEWED/VALIDATED) is
+        omitted entirely here, never represented with a placeholder -- there
+        is nothing real to show, and a placeholder invites the model to
+        invent content for a section that doesn't exist yet. A
+        ``must_reference`` note is the one exception -- per
+        ``PlannerAgent._wire_cross_section_dependencies``'s own docstring,
+        it only ever needs the source's *label* (already valid before
+        drafting), so it is always surfaced regardless of draft status,
+        without a content excerpt (there may not be one yet) -- this is
+        what keeps a legitimate forward reference from being silently
+        dropped the way an unmet content dependency correctly is. Returns
+        the literal string ``"(none)"`` when nothing at all is surfaced, so
+        the prompt's own instruction text ("an undrafted source is simply
+        omitted here") is never left dangling with an empty body.
+
+        Also records, onto ``node.spec["dependency_versions_used"]``, which
+        actual state of each surfaced source this call read --
+        ``attempt_count``/``last_updated``, the only version-like fields a
+        legacy ``DocumentNode`` has (it carries no ``ArtifactRef``/version
+        number; that belongs to the separate, not-yet-wired-to-this-pipeline
+        ``src/core/artifact_graph.py`` system -- see Stage 0's "Known gap"
+        in ``docs/av_stage0_scope_and_contracts.md``). This is the C2
+        checklist's "실제 사용한 입력 버전을 기록한다" at the only
+        granularity this legacy graph can honestly offer today; overwritten
+        fresh on every call (what THIS prompt build actually read), never
+        accumulated -- mirroring how ``dependency_notes`` itself is a
+        snapshot, not a log.
+        """
+        notes = node.spec.get("dependency_notes") or []
+        drafted_statuses = {NodeStatus.DRAFTED, NodeStatus.REVIEWED, NodeStatus.VALIDATED}
+        lines: List[str] = []
+        versions_used: List[Dict[str, Any]] = []
+        for note in notes:
+            source_id = note.get("depends_on")
+            source_node = graph.nodes.get(source_id)
+            if source_node is None:
+                continue
+            is_drafted = source_node.status in drafted_statuses
+            relation = note.get("relation")
+
+            if relation == DependencyRelation.MUST_REFERENCE.value:
+                # Only needs the source's label (already listed above under
+                # "Available cross-reference labels", valid before drafting)
+                # -- surfaced regardless of draft status so a legitimate
+                # forward reference is never silently dropped the way a
+                # genuine content-read dependency's unmet excerpt is.
+                lines.append(
+                    f"- {source_id} ({source_node.title}) [{relation}]: {note.get('description')}"
+                )
+                continue
+
+            if not is_drafted:
+                # must_reuse/must_be_consistent_with genuinely need the
+                # source's actual drafted content -- nothing real to show
+                # yet, so omit entirely rather than inventing a placeholder.
+                continue
+
+            content = source_node.content.strip()
+            if len(content) > self._DEPENDENCY_EXCERPT_CHAR_CAP:
+                excerpt = content[: self._DEPENDENCY_EXCERPT_CHAR_CAP].rstrip() + " […]"
+            else:
+                excerpt = content
+            key_points = source_node.spec.get("key_points", [])
+            lines.append(
+                f"- {source_id} ({source_node.title}) [{relation}]: {note.get('description')}\n"
+                f"  Key points: {json.dumps(key_points, ensure_ascii=False)}\n"
+                f"  Excerpt: {excerpt}"
+            )
+            versions_used.append(
+                {
+                    "depends_on": source_id,
+                    "attempt_count": source_node.attempt_count,
+                    "last_updated": source_node.last_updated.isoformat(),
+                }
+            )
+        node.spec["dependency_versions_used"] = versions_used
+        return "\n".join(lines) if lines else "(none)"
+
     def _build_prompt_from_node(
         self,
         node: Any,
@@ -1040,6 +1135,8 @@ class TextAgent:
             for label, entry in graph.label_registry.items()
             if entry.kind != "figure"
         ]
+
+        dependency_context = self._build_dependency_context(node, graph)
 
         if block_errors:
             # Attributable failures: each block gets its own error text plus
@@ -1107,6 +1204,11 @@ what you want to cite isn't here, it doesn't exist and can't be cited):
 
 Figures owned by this section; refer to these only when relevant:
 {json.dumps(figure_context, ensure_ascii=False, indent=2)}
+
+Cross-section dependencies this section MUST reuse/reference/stay consistent with
+(per relation below; an undrafted source is simply omitted here -- wait for it
+rather than guessing its content):
+{dependency_context}
 """.strip()
 
     def _validate_blocks_against_layout(

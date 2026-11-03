@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -470,3 +470,125 @@ class DocumentGraph(BaseModel):
             if content:
                 parts.append(f"[{context_node.id}: {context_node.title}]\n{content}")
         return "\n\n".join(parts)
+
+    def compute_ready_sections(self, candidate_ids: Iterable[str]) -> Set[str]:
+        """Which of ``candidate_ids`` are ready to generate right now: not
+        yet drafted, and every content-read dependency it declares
+        (``DocumentNode.dependencies``, wired by ``PlannerAgent.
+        _wire_cross_section_dependencies`` only for ``must_reuse``/
+        ``must_be_consistent_with`` -- never ``must_reference``, a
+        legitimate forward reference, or ``must_precede``, pure document
+        order, see that method's own docstring) is itself already drafted.
+
+        Mirrors ``src/core/controller.py::compute_ready_artifacts``'s
+        "stale AND every live input not stale" definition, for this
+        legacy, single-version graph -- deliberately not called anywhere
+        in ``run_full_pipeline.py``'s own generation loop (today strictly
+        sequential, blueprint order), the same deliberate "define and test
+        the concept now, wire real concurrent dispatch later" choice that
+        function's own docstring describes for Stage 5's artifact graph.
+
+        A dependency naming a node id that doesn't exist counts as unmet
+        (not vacuously satisfied) -- this can only happen from a bug
+        upstream, and silently treating it as "nothing to wait for" would
+        hide exactly that.
+        """
+        drafted_statuses = {NodeStatus.DRAFTED, NodeStatus.REVIEWED, NodeStatus.VALIDATED}
+        ready: Set[str] = set()
+        for node_id in candidate_ids:
+            node = self.nodes.get(node_id)
+            if node is None or node.status in drafted_statuses:
+                continue
+            if all(
+                dep_id in self.nodes and self.nodes[dep_id].status in drafted_statuses
+                for dep_id in node.dependencies
+            ):
+                ready.add(node_id)
+        return ready
+
+    def find_dependency_cycles(self, candidate_ids: Optional[Iterable[str]] = None) -> List[List[str]]:
+        """Detects cycles in the content-read dependency graph
+        (``DocumentNode.dependencies``), restricted to ``candidate_ids``
+        (default: every node) -- a real data problem (e.g. two
+        ``cross_section_dependencies`` whose ``must_reuse``/``must_be_
+        consistent_with`` relations point at each other), distinct from a
+        node simply not being ready *yet*: no amount of waiting resolves a
+        cycle, since each member requires another member to be drafted
+        first. ``compute_ready_sections`` alone cannot distinguish "not
+        ready yet" from "can never become ready" -- this is the explicit
+        check for the second case the C2 checklist asks for ("순환을
+        처리한다").
+
+        Returns each distinct cycle found as a list of node ids in cycle
+        order (last element repeats the first, closing the loop) -- a
+        plain DFS, not a full SCC algorithm: this graph is one document's
+        sections, checked at most once per generation attempt, so there is
+        no case here that needs more than the straightforward approach.
+        """
+        ids = set(candidate_ids) if candidate_ids is not None else set(self.nodes)
+        cycles: List[List[str]] = []
+        visited: Set[str] = set()
+
+        def visit(node_id: str, path: List[str], on_path: Set[str]) -> None:
+            visited.add(node_id)
+            path.append(node_id)
+            on_path.add(node_id)
+            node = self.nodes.get(node_id)
+            for dep_id in (node.dependencies if node is not None else []):
+                if dep_id not in ids:
+                    continue
+                if dep_id in on_path:
+                    cycle_start = path.index(dep_id)
+                    cycles.append(path[cycle_start:] + [dep_id])
+                elif dep_id not in visited:
+                    visit(dep_id, path, on_path)
+            path.pop()
+            on_path.discard(node_id)
+
+        for node_id in sorted(ids):
+            if node_id not in visited:
+                visit(node_id, [], set())
+        return cycles
+
+    def find_stale_dependents(self, candidate_ids: Iterable[str]) -> Set[str]:
+        """Which of ``candidate_ids`` were generated from a dependency
+        snapshot (``spec["dependency_versions_used"]``, recorded by
+        ``TextAgent._build_dependency_context`` -- see that method's own
+        docstring) that no longer matches the source node's *current*
+        ``attempt_count``/``last_updated``. A mismatch means the source was
+        regenerated (e.g. by a repair) after this node already read it, so
+        this node's own content may now be reusing/citing an outdated
+        version of what it depended on -- the C2 checklist's "stale
+        입력... 처리" at the same granularity ``dependency_versions_used``
+        itself records (see that field's own docstring for why
+        attempt_count/last_updated, not a real ``ArtifactRef`` version, is
+        what a legacy ``DocumentNode`` can honestly offer).
+
+        A node with no recorded ``dependency_versions_used`` at all (never
+        built through ``TextAgent._build_dependency_context``, or had no
+        dependencies to record) is never reported stale -- there is
+        nothing to compare against, a different fact from "confirmed still
+        current". A dependency whose source node has since disappeared
+        entirely also counts as stale -- there is no way the node's
+        content still reflects something that no longer exists.
+        """
+        stale: Set[str] = set()
+        for node_id in candidate_ids:
+            node = self.nodes.get(node_id)
+            if node is None:
+                continue
+            recorded = node.spec.get("dependency_versions_used")
+            if not recorded:
+                continue
+            for entry in recorded:
+                source_node = self.nodes.get(entry.get("depends_on"))
+                if source_node is None:
+                    stale.add(node_id)
+                    break
+                if (
+                    source_node.attempt_count != entry.get("attempt_count")
+                    or source_node.last_updated.isoformat() != entry.get("last_updated")
+                ):
+                    stale.add(node_id)
+                    break
+        return stale

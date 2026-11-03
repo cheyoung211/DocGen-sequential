@@ -93,6 +93,8 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.artifact_graph import ArtifactGraphStore
+from src.core.dependency_mapping import CrossSectionObligation, MappingStatus
+from src.core.dependency_verifier import _verify_must_precede, _verify_must_reference
 from src.core.schemas import (
     ArtifactRef,
     CheckOutcome,
@@ -101,6 +103,7 @@ from src.core.schemas import (
     Evidence,
     UnknownReason,
 )
+from src.dataset.schemas import DependencyRelation
 
 # The one recompute operation this checker actually implements -- "숫자
 # 재계산부터 구현하고" (checklist item 2) is satisfied by one concrete,
@@ -109,12 +112,23 @@ from src.core.schemas import (
 # is UNKNOWN/NOT_REPRESENTABLE, exactly like an unimplemented ConstraintKind.
 _RECOMPUTE_OPERATIONS = {"sum": sum}
 
-# The two constraint kinds this checker can actually evaluate; the other two
-# (CSP_SMT, SYMBOLIC) always fall through to the final "not implemented"
+# The three constraint kinds this checker can actually evaluate; CSP_SMT
+# and SYMBOLIC still always fall through to the final "not implemented"
 # branch in ``check()``. Kept as an explicit set (not an if/elif chain
 # spread across the method) so the one place that decides "do we have a
 # narrow-enough mechanism for this kind at all" is unambiguous.
-_IMPLEMENTED_KINDS = frozenset({ConstraintKind.SCHEMA_CONTRACT, ConstraintKind.RECOMPUTE})
+#
+# DEPENDENCY itself only has a REAL mechanism for two of the four
+# DependencyRelation values (must_reference/must_precede, see
+# ``_check_dependency``) -- must_reuse/must_be_consistent_with resolve to
+# UNKNOWN/NOT_REPRESENTABLE inside that method, the same "kind recognized,
+# no checker for this specific case yet" pattern CSP_SMT/SYMBOLIC already
+# use at the whole-kind level, just one level more granular (per relation,
+# not per kind) because this one kind covers four genuinely different
+# relations instead of one.
+_IMPLEMENTED_KINDS = frozenset(
+    {ConstraintKind.SCHEMA_CONTRACT, ConstraintKind.RECOMPUTE, ConstraintKind.DEPENDENCY}
+)
 
 
 class BasicConstraintChecker:
@@ -135,6 +149,7 @@ class BasicConstraintChecker:
         self._enabled: Dict[str, bool] = {
             ConstraintKind.SCHEMA_CONTRACT.value: True,
             ConstraintKind.RECOMPUTE.value: True,
+            ConstraintKind.DEPENDENCY.value: True,
         }
 
     @property
@@ -166,6 +181,7 @@ class BasicConstraintChecker:
         of actually re-checking)."""
         context = context or {}
         recompute_inputs: Dict[str, Dict[str, Any]] = context.get("recompute", {})
+        dependency_inputs: Dict[str, Dict[str, Any]] = context.get("dependency", {})
 
         evidence: List[Evidence] = []
         for constraint in constraints:
@@ -177,9 +193,8 @@ class BasicConstraintChecker:
                         checked_artifact=artifact,
                         detail=(
                             f"constraint kind {constraint.kind.value!r} has no solver-backed "
-                            "checker implemented yet (Stage 3 scope: only schema_contract and "
-                            "recompute are implemented; csp_smt/symbolic are tracked as "
-                            "follow-up work)"
+                            "checker implemented yet (schema_contract, recompute, and dependency "
+                            "are implemented; csp_smt/symbolic are tracked as follow-up work)"
                         ),
                         unknown_reason=UnknownReason.NOT_REPRESENTABLE,
                     )
@@ -200,9 +215,13 @@ class BasicConstraintChecker:
 
             if constraint.kind == ConstraintKind.SCHEMA_CONTRACT:
                 evidence.append(self._check_schema_contract(constraint, artifact))
-            else:
+            elif constraint.kind == ConstraintKind.RECOMPUTE:
                 evidence.append(
                     self._check_recompute(constraint, artifact, recompute_inputs.get(constraint.constraint_id))
+                )
+            else:
+                evidence.append(
+                    self._check_dependency(constraint, artifact, dependency_inputs.get(constraint.constraint_id))
                 )
 
         return evidence
@@ -493,6 +512,118 @@ class BasicConstraintChecker:
                 f"observed={observed} does not match expected={expected} ({mode}) "
                 f"(|diff|={diff} > tolerance={tolerance})"
             ),
+            input_versions=input_versions,
+            missing_inputs=missing_inputs,
+        )
+
+    def _check_dependency(
+        self, constraint: Constraint, artifact: ArtifactRef, values: Optional[Dict[str, Any]]
+    ) -> Evidence:
+        """DEPENDENCY constraint check -- Fix C (the separate "Revision
+        (Additional verifiers)" plan), checklist item C4's "dependency
+        위반 evidence를 기존 check·patch·replan에 연결한다".
+
+        Caller supplies the relation-specific parameters via
+        ``context["dependency"][constraint.constraint_id]`` -- the same
+        extension-point convention ``_check_recompute`` already established
+        for ``context["recompute"][...]`` (see this module's own
+        docstring). Expected keys: ``relation`` (a ``DependencyRelation``
+        value), ``allowed_labels`` (``List[str]``, for ``must_reference``),
+        ``order_hint`` (``[source_index, target_index]`` or ``None``, for
+        ``must_precede``). ``constraint.applies_to`` must name the source
+        artifact -- resolved via ``_resolve_input_refs`` exactly like every
+        other kind here, so a since-moved or still-missing source
+        correctly invalidates/holds back this verdict through the same
+        ``Evidence.input_versions``/``missing_inputs`` mechanism, no
+        dependency-specific invalidation logic needed.
+
+        This method is a thin **adapter**, not a second implementation of
+        the actual decision: it builds one ``dependency_mapping.
+        CrossSectionObligation`` from ``values`` + the resolved source ref,
+        and delegates the real must_reference/must_precede verdict to
+        ``dependency_verifier``'s own functions (the same ones
+        ``dependency_verifier.verify_cross_section_obligations`` uses for
+        whole-document reporting) -- see
+        ``docs/av_stage2_dependency_mapping.md`` §... for why reusing,
+        rather than reimplementing, that decision is the point: this
+        checker and the whole-document report must never be able to
+        disagree about the same fact.
+
+        ``must_reuse``/``must_be_consistent_with`` stay UNKNOWN/
+        NOT_REPRESENTABLE -- Fix B's shared-value registry does not exist
+        on this branch yet (see this module's own ``_IMPLEMENTED_KINDS``
+        comment).
+        """
+        if not values or "relation" not in values:
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=(
+                    "no dependency parameters supplied in "
+                    f"context['dependency'][{constraint.constraint_id!r}]"
+                ),
+                unknown_reason=UnknownReason.NOT_CHECKED,
+            )
+
+        relation = DependencyRelation(values["relation"])
+        input_versions, missing_inputs = self._resolve_input_refs(constraint, [])
+        if missing_inputs:
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=f"source artifact(s) not found: {[r.artifact_id for r in missing_inputs]}",
+                unknown_reason=UnknownReason.MISSING_DEPENDENCY,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
+
+        source_section_id = constraint.applies_to[0].artifact_id if constraint.applies_to else None
+        order_hint = values.get("order_hint")
+        obligation = CrossSectionObligation(
+            dependency_id=constraint.constraint_id,
+            relation=relation,
+            description=constraint.description,
+            source_section_id=source_section_id or artifact.artifact_id,
+            target_section_id=artifact.artifact_id,
+            status=MappingStatus.MATCHED,
+            matched_source_section_id=source_section_id,
+            matched_target_section_id=artifact.artifact_id,
+            allowed_labels=values.get("allowed_labels", []),
+            order_hint=tuple(order_hint) if order_hint is not None else None,
+        )
+
+        if relation == DependencyRelation.MUST_REFERENCE:
+            stored_target = self._store.get_version(artifact.artifact_id, artifact.version)
+            rendered = (
+                {artifact.artifact_id: stored_target.content}
+                if stored_target is not None and stored_target.content is not None
+                else {}
+            )
+            record = _verify_must_reference(obligation, rendered)
+        elif relation == DependencyRelation.MUST_PRECEDE:
+            record = _verify_must_precede(obligation)
+        else:
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=(
+                    f"{relation.value} verification is deferred to Fix B's shared-value "
+                    "registry/recompute checks, not implemented on this branch yet."
+                ),
+                unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
+
+        return Evidence(
+            constraint_id=constraint.constraint_id,
+            outcome=record.outcome,
+            checked_artifact=artifact,
+            detail=record.detail,
+            unknown_reason=record.unknown_reason,
             input_versions=input_versions,
             missing_inputs=missing_inputs,
         )
