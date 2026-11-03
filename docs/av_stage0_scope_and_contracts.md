@@ -28,6 +28,12 @@ commit [`278e748`](https://github.com/cheyoung211/DocGen-sequential/commit/278e7
 > 비해 있는 `unresolved_artifact_ids`를 만들 수 있는 새 모순을 **만들어냈다**. 세 건 모두 실제 코드로
 > 고쳤다 (아래 각 절).
 
+> **2026-11-03 수정 (3차 확인)**: P4의 비교 조건 표가 "지금 못 박을 수 없는 리터럴 값"과 "그 값을
+> 결정하는 설계 원칙"을 구분하지 못한 채 전부 TBD로 뭉뚱그렸다 — 설계 원칙 자체는 Fix A/B/C 코드가 없어도
+> 지금 고정할 수 있는데 안 한 것. P4 절에 설계 원칙 1(공통 적용 vs 조건별)·2(비교당 바뀌는 축은
+> trigger뿐)·3(비용 기록 명명 규칙)을 추가하고 표를 그 원칙에 따라 다시 채웠다. 문서 수정만, 코드 변경
+> 없음.
+
 ## P1. 범위·버전 기록
 
 - **기존 결과 보존**: `outputs/`, `outputs_b4_workshop/`, Notion "Gold Labeling" 페이지는 전혀 건드리지
@@ -185,22 +191,82 @@ empty`(진짜 해결된 경우 `"resolved"`가 그대로 유지됨 확인 — �
 직접 끼워 넣으면 **새 비용 기록 경로가 필요하다** — 이것도 4단계(I1, 실행 경로 연결)의 일이지 0단계에서
 풀 수 있는 범위가 아니다.
 
-**비교 조건 표** (사용자가 요청한 "표로 고정"): 지금 결정 가능한 것은 베이스라인 한 줄뿐이다 — 나머지는
-A/B/C가 실제로 구현되는 1~4단계에서 값이 채워지는 **구조 고정**이다.
+**3차 확인 (2026-11-03)이 지적한 부분**: "비교 조건별 trigger/feedback/복구 범위를 표로 고정하라"는 애초
+요청을 "베이스라인 한 줄만 고정하고 나머지는 전부 TBD"로 축소 해석했다 — TBD인 게 틀린 건 아니지만
+(Fix A/B/C 자체가 없으니 *값*은 당연히 못 고정한다), **값과 별개로 "그 값을 무엇이 결정하는가"라는 설계
+원칙 자체는 지금 고정할 수 있는데 그걸 안 했다**. 아래 세 원칙을 고정한다 — 이미 `docs/
+stage1_experiment_design.md` §0(trigger/feedback/scope 세 독립 축)·§4(비용 단위)가 다른 revision에서
+확립한 틀을 그대로 재사용한다(새 틀을 발명하지 않는다).
+
+**설계 원칙 1 — 수정된 prompt·Markdown 정규화는 모든 비교군에 공통 적용되는가, 비교 조건의 일부인가**:
+**조건의 일부다.** 모든 비교군에 공통으로 깔면 "Fix A 적용 전/후"를 비교할 방법이 없어진다 — 이 revision의
+존재 이유 자체가 그 비교이므로, 공통 적용은 불가능한 선택지다. 따라서: baseline 행은 현재
+`TextAgent.SYSTEM_PROMPT`/`PLANNER_*_PROMPT` 원문 + 정규화 없음 + `markdown_emphasis_enabled=False`로
+고정, `+Fix A` 이상 행은 (수정된 prompt + 정규화 활성 + `markdown_emphasis_enabled=True`)를 **하나의
+단위로** 함께 켠다. "prompt 수정만 단독으로 켰을 때"·"정규화만 단독으로 켰을 때"의 분리 ablation은 Fix A
+자체 설계(1단계)에서 필요하다고 판단되면 추가하는 **별도의** 비교이지, 이 표의 기본 행 진행이 요구하는
+것은 아니다 — 지금 그 분리까지 미리 약속하면 1단계 설계를 선점하게 된다.
+
+**설계 원칙 2 — 어떤 비교에서 trigger·feedback·복구 범위 중 무엇만 바꾸는가**: 이 표의 baseline→+A→+A+C→
++A+B+C 행 진행은 **trigger 축만** 바꾼다(어떤 verifier가 켜져 있는가) — feedback(내부 재시도 피드백만,
+always-on)과 복구 범위(기존 `_repair_and_recompile`의 block/section 규칙)는 네 행 모두 baseline과 동일하게
+**고정**한다. 이게 `docs/stage1_experiment_design.md`가 이미 확립한 "한 번에 한 축만 바꿔야 그 축의 효과를
+그 비교에 귀속시킬 수 있다"는 원칙을 그대로 따르는 것이다 — feedback·복구 범위까지 같이 바뀌면 그 비교가
+"verifier를 추가한 효과"인지 "복구 방식을 바꾼 효과"인지 분리할 수 없어진다. **예외 경고**: 이 "복구
+범위 불변" 가정은 Fix C에는 안 맞을 수 있다 — `must_reference`/`must_reuse` 위반은 보통 citing 쪽
+block/section을 고치면 되지만, cited 쪽 자체가 바뀌어야 하는 경우도 있다(예: sample_005처럼 summary가
+analysis를 인용 안 하는 게 아니라 analysis 쪽 수치 자체가 바뀌어 인용이 깨지는 경우). 이 예외가 실제로
+발생하면 그 비교 행은 "복구 범위도 같이 바뀐 비교"로 **명시적으로 재분류**해야 한다 — 이건 Fix C 자체
+설계(2~3단계)가 내릴 결정이고, 0단계는 "기본값은 불변, 예외는 Fix C 설계가 명시적으로 밝히고 깨도 된다"는
+규칙만 고정한다.
+
+**설계 원칙 3 — 검사·변환·실패한 재시도·재계산 비용을 어떤 항목·단위로 기록하는가**: `docs/
+stage1_experiment_design.md` §4의 기존 원칙(단위=토큰 수를 비교군 간 공통 축으로, 로컬 vLLM 등은
+`latency_s`/`gpu_seconds`를 별도 축으로 병기, `succeeded=False` 레코드도 `Budget.spent`에 포함)을 그대로
+적용한다:
+- **결정적 검사**(markdown_emphasis 탐지, 수치 재계산, dependency 참조 조회): 토큰 0, `CostRecord(stage=
+  "check:<fix이름>", succeeded=...)`로 latency_s만 기록 — 이미 확인된 `ToolExecutor._execute_inner`의
+  `"tool_executor:{action}"` 명명 관례를 fix별로 세분화한 것.
+- **변환**(markdown→LaTeX 정규화 같은 silent transform): 결정적 검사와 동일하게 토큰 0,
+  `CostRecord(stage="transform:<이름>", succeeded=...)` — 정규화가 모호해 block 복구로 넘어가는 경우도
+  `succeeded=False`로 기록해야 한다(조용히 빠지면 비용이 과소 집계된다).
+- **실패한 재시도**: P2의 `_persist_failed_attempt`(디스크에 실패 내용 보존)와 비용 레코드는 **서로 다른
+  관심사**다 — 전자는 디버깅·내용 비교용, 후자는 예산 집계용. 토큰을 쓴 실패 attempt는 여전히
+  `CostTrackingProducer` 경로로 `CostRecord(succeeded=False)`가 남아야 하며, `_persist_failed_attempt`가
+  파일을 썼다는 사실이 비용 기록을 대신하지 않는다.
+- **재계산**(Fix B의 수치 재검증): 결정적 재계산 자체는 토큰 0 (`CostRecord(stage="recompute:numeric",
+  succeeded=...)`), 단 후속(B6)의 LLM-assisted 논리 검토는 일반 `CostTrackingProducer` 토큰 경로를 쓴다 —
+  "Fix B"라는 하나의 이름 아래 두 개의 다른 비용 경로가 공존한다는 점을 여기서 명시한다.
+
+이 세 원칙 모두 **지금 실행되는 코드가 없다** (Fix A/B/C 자체가 미구현이므로) — P4의 나머지 공백(결정적
+검사 비용 기록 경로가 real pipeline에 전혀 없음)과 동일한 이유로, 위 원칙은 "그 코드가 생길 때 반드시
+따라야 하는 규칙"으로 지금 고정하는 것이고, 실제 배선은 1~4단계의 일이다.
+
+**비교 조건 표** (설계 원칙 1·2·3을 반영, 열별로 "지금 고정되는 규칙"과 "아직 못 박을 수 없는 리터럴 값"을
+구분):
 
 | 조건 | prompt 버전 | 정규화 | 활성 검사 | feedback | 복구 범위 | 비용 기록 경로 |
 | --- | --- | --- | --- | --- | --- | --- |
-| baseline (현재, additional verifiers 없음) | `text_agent_prompt_hash`/`planner_prompt_hash` (현재 커밋 기준 고정) | 없음 (markdown 강조 규제 미적용) | 각 agent의 `DEFAULT_ENABLED_*`만 (`{text_agent,planner,assembler}_enabled_validators_snapshot`으로 기록됨) | `TextAgent.process_node`의 내부 재시도 피드백만 (always-on, 끌 수 없음) | 기존 `_repair_and_recompile` (block/section) | LLM: `token_usage_records`; 결정적 검사: 없음 |
-| +Fix A (markdown_emphasis) | TBD (1단계에서 SYSTEM_PROMPT 수정 시 새 hash) | TBD: 평문 강조만 제한적 변환, 모호한 경우는 block 복구로 | `markdown_emphasis_enabled=True` 추가 | TBD (A3에서 결정) | TBD (A3) | TBD — 4단계 전까지는 real pipeline에 새 경로 직접 추가 필요 |
-| +Fix A+C (reference/order) | TBD | TBD | +`dependency_verifier_enabled=True` | TBD | TBD | TBD |
-| +Fix A+B+C (전체) | TBD | TBD | 전부 `True` | TBD | TBD | TBD |
+| baseline (현재, additional verifiers 없음) | `text_agent_prompt_hash`/`planner_prompt_hash` (현재 커밋 기준 고정) | 없음 (markdown 강조 규제 미적용) | 각 agent의 `DEFAULT_ENABLED_*`만 (`{text_agent,planner,assembler}_enabled_validators_snapshot`으로 기록됨) | 내부 재시도 피드백만 (always-on, 끌 수 없음) — 네 행 공통 고정 (원칙 2) | 기존 `_repair_and_recompile` (block/section) — 네 행 공통 고정 (원칙 2) | LLM: `token_usage_records`; 결정적 검사: 없음 |
+| +Fix A (markdown_emphasis) | baseline과 **다른 해시** — 수정 prompt는 Fix A 조건의 일부로 함께 켠다(원칙 1). 리터럴 값은 1단계에서 SYSTEM_PROMPT를 실제로 고쳐야 나옴 | **활성** (원칙 1에 따라 prompt 수정과 한 단위) — 평문 강조 제한적 변환, 모호하면 block 복구로. 세부 규칙은 1단계 | `markdown_emphasis_enabled=True` 추가 | baseline과 동일 (원칙 2) | baseline과 동일 (원칙 2) | `check:markdown_emphasis`/`transform:markdown_normalize`, latency_s만 (원칙 3). 실제 호출 경로는 아직 없음 — 1단계 구현 시 반드시 이 명명 규칙을 따를 것 |
+| +Fix A+C (reference/order) | Fix A와 동일 규칙 (Fix C는 prompt를 바꾸지 않는 순수 verifier) | Fix A와 동일 | +`dependency_verifier_enabled=True` | baseline과 동일 (원칙 2) | **기본값은 baseline과 동일, 단 원칙 2의 예외 경고 적용** — Fix C 설계(2~3단계)가 명시적으로 깨도 됨 | `check:dependency_reference`, latency_s만 (원칙 3) |
+| +Fix A+B+C (전체) | Fix A와 동일 규칙 (B6 LLM 후속까지 가면 별도 user prompt가 생길 수 있으나 그건 follow-up 범위) | Fix A와 동일 | 전부 `True` | baseline과 동일 (원칙 2) — 수치 재계산 자체는 결정적이라 "feedback" 개념이 없음 | +Fix A+C와 동일한 예외 경고, Fix B의 공유 값 불일치는 "어느 섹션이 틀렸는가"가 모호해 범위가 하나로 안 고정될 수 있음 — 3단계로 이연 | `recompute:numeric`(latency_s만) + B6은 일반 토큰 경로(원칙 3) |
 
-이 표의 "TBD" 행은 각 단계 설계 문서(`docs/av_stage1_*.md` 등)에서 구체적 값으로 채워져야 완료된다 — 0단계는
-표의 **열 구조와 베이스라인 행**을 고정하는 것까지다.
+이 표에서 **지금 고정된 것**: 열 구조, baseline 행 전체, 그리고 모든 행의 feedback·복구 범위가 따르는
+"원칙 2"의 규칙(과 그 예외 처리 방식), 비용 기록의 명명 규칙(원칙 3). **아직 못 박지 않은 것**: prompt
+해시·정규화 세부 규칙의 리터럴 값(1단계 코드가 생겨야 나옴), Fix C/B의 복구 범위가 예외를 실제로 타는지
+여부(2~3단계 설계가 결정) — 이 둘은 코드가 없는데 억지로 값을 채우면 선점(앞질러 단정)이 되므로 의도적으로
+비워 둔다.
 
 **2차 리뷰 확인 (2026-10-29)**: 2차 리뷰는 이 "TBD" 행들과 "결정적 검사 비용 기록 경로 없음"이 여전히
 그대로라고 짚었다 — 맞다, 둘 다 이미 위에서 **의도적으로** 1~4단계로 이연한 것이다 (A/B/C 자체가 없는데
 그 조건의 정규화·feedback·복구 범위를 지금 확정할 수는 없다). 이번 라운드에서 추가 조치는 하지 않았다.
+
+**3차 확인 (2026-11-03) 반영**: 위 "의도적으로 이연"이라는 답은 *무엇을 정할 수 없는지*는 맞게 짚었지만
+*왜 그런지, 무엇은 지금 정할 수 있는지*를 설명하지 않았다 — 설계 원칙 1·2·3을 추가해 "리터럴 값"과
+"그 값을 결정하는 규칙"을 분리했고, 표의 feedback·복구 범위·비용 기록 열을 그 규칙에 따라 다시 채웠다.
+코드 변경은 없다 — Fix A/B/C 자체가 없는 상태에서 실행 경로를 만드는 건 범위 밖이고(이미 위에서 확인),
+이번 라운드는 **설계 계약의 명시성**만 고친다.
 
 ## 발견된 공백 — 0단계에서 풀지 않고 이후 단계로 이연
 
@@ -234,9 +300,15 @@ A/B/C가 실제로 구현되는 1~4단계에서 값이 채워지는 **구조 고
   미해결 집계가 서로 다른 세 가지를 각각 책임지고, 셋 다 이제 실제로 연결되어 있다. 추적할 "검사" 자체는
   아직 없으므로 (A/B/C 미구현) 실제 추적은 1단계에서 처음 end-to-end로 검증된다.
 - [x] 기존 결과 보존 확인 (outputs/, Gold Labeling 불변).
-- [x] 검사 범위와 로그 계약 확정: P1-P4 각각이 가리키는 기존/신규 메커니즘, 그리고 P4의 비교 조건 표 구조.
-- [x] 1차 리뷰(2026-10-28) 4건, 2차 리뷰(2026-10-29) 3건 모두 반영 완료. 2차 리뷰 반영: P1에 planner
-  prompt hash + 3-agent validator snapshot 분리, P2에 호출-내부 실패 attempt 보존
-  (`_persist_failed_attempt`), P3의 `reason="resolved"`/비어있지 않은 unresolved 모순 교정. 회귀 테스트
-  총 24개 추가 (controller.py 7개, text_agent.py 7개, schemas/wiring 테스트 갱신), 전체 테스트 스위트
-  변경 없이 통과 (사전 존재하던 57건의 무관한 실패는 이 세션 변경 전/후 동일함을 `git stash`로 확인).
+- [x] 검사 범위와 로그 계약 확정: P1-P4 각각이 가리키는 기존/신규 메커니즘, 그리고 P4의 비교 조건 표
+  구조와 그 표를 채우는 세 가지 설계 원칙(공통 적용 여부/비교당 단일 축/비용 명명 규칙).
+- [x] 1차 리뷰(2026-10-28) 4건, 2차 리뷰(2026-10-29) 3건, 3차 확인(2026-11-03) 1건 모두 반영 완료.
+  2차 리뷰 반영: P1에 planner prompt hash + 3-agent validator snapshot 분리, P2에 호출-내부 실패
+  attempt 보존(`_persist_failed_attempt`), P3의 `reason="resolved"`/비어있지 않은 unresolved 모순 교정.
+  회귀 테스트 총 24개 추가 (controller.py 7개, text_agent.py 7개, schemas/wiring 테스트 갱신), 전체
+  테스트 스위트 변경 없이 통과 (사전 존재하던 57건의 무관한 실패는 이 세션 변경 전/후 동일함을 `git
+  stash`로 확인). 3차 확인 반영: P4의 비교 조건 표 TBD 칸이 "리터럴 값"과 "그 값을 정하는 규칙"을
+  구분하지 않았던 문제를 설계 원칙 1(prompt·정규화는 조건의 일부, 공통 적용 아님)·2(행 진행은 trigger
+  축만 바꾸고 feedback·복구 범위는 고정 — Fix C 예외는 명시적 경고로 남김)·3(check/transform/실패한
+  retry/recompute의 비용 기록 명명 규칙, `stage1_experiment_design.md` §4 재사용)으로 고정 — 문서만
+  수정, 코드 변경 없음(Fix A/B/C 자체가 미구현이라 실제 배선은 범위 밖).
