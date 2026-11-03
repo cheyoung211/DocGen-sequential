@@ -30,9 +30,16 @@ commit [`278e748`](https://github.com/cheyoung211/DocGen-sequential/commit/278e7
 
 > **2026-11-03 수정 (3차 확인)**: P4의 비교 조건 표가 "지금 못 박을 수 없는 리터럴 값"과 "그 값을
 > 결정하는 설계 원칙"을 구분하지 못한 채 전부 TBD로 뭉뚱그렸다 — 설계 원칙 자체는 Fix A/B/C 코드가 없어도
-> 지금 고정할 수 있는데 안 한 것. P4 절에 설계 원칙 1(공통 적용 vs 조건별)·2(비교당 바뀌는 축은
-> trigger뿐)·3(비용 기록 명명 규칙)을 추가하고 표를 그 원칙에 따라 다시 채웠다. 문서 수정만, 코드 변경
-> 없음.
+> 지금 고정할 수 있는데 안 한 것. P4 절에 설계 원칙 1(공통 적용 vs 조건별)·2(비교당 바뀌는 축)·3(비용
+> 기록 명명 규칙)을 추가하고 표를 그 원칙에 따라 다시 채웠다. 문서 수정만, 코드 변경 없음.
+
+> **2026-11-03 수정 (4차 확인)**: 3차 확인 자체에 두 가지 오류가 있었다 — (1) 원칙 2가 "+Fix A 행은
+> prompt·정규화·검사 활성화를 한 묶음으로 켠다"(원칙 1)면서 동시에 그 행 진행을 "trigger 축만 바꾼
+> 비교"라고 불러 **자기모순**이었다. (2) Fix C를 "prompt를 바꾸지 않는 순수 verifier"라고 적었는데,
+> Notion 계획 C2는 Fix C가 target prompt에 source 문맥·수식·가정·참조 의무를 주입하도록 요구해 실제로는
+> producer 생성 input을 바꾸는 부분을 포함한다. 원칙 2를 "기본 비교=기능 묶음 누적 효과, trigger 단독
+> 효과는 별도 비교"로 재정의했고, Fix C의 "전체 적용 효과 vs 검사기 단독 효과" 두 비교 대상을 명시했다.
+> 문서 수정만, 코드 변경 없음.
 
 ## P1. 범위·버전 기록
 
@@ -207,18 +214,50 @@ stage1_experiment_design.md` §0(trigger/feedback/scope 세 독립 축)·§4(비
 자체 설계(1단계)에서 필요하다고 판단되면 추가하는 **별도의** 비교이지, 이 표의 기본 행 진행이 요구하는
 것은 아니다 — 지금 그 분리까지 미리 약속하면 1단계 설계를 선점하게 된다.
 
-**설계 원칙 2 — 어떤 비교에서 trigger·feedback·복구 범위 중 무엇만 바꾸는가**: 이 표의 baseline→+A→+A+C→
-+A+B+C 행 진행은 **trigger 축만** 바꾼다(어떤 verifier가 켜져 있는가) — feedback(내부 재시도 피드백만,
-always-on)과 복구 범위(기존 `_repair_and_recompile`의 block/section 규칙)는 네 행 모두 baseline과 동일하게
-**고정**한다. 이게 `docs/stage1_experiment_design.md`가 이미 확립한 "한 번에 한 축만 바꿔야 그 축의 효과를
-그 비교에 귀속시킬 수 있다"는 원칙을 그대로 따르는 것이다 — feedback·복구 범위까지 같이 바뀌면 그 비교가
-"verifier를 추가한 효과"인지 "복구 방식을 바꾼 효과"인지 분리할 수 없어진다. **예외 경고**: 이 "복구
-범위 불변" 가정은 Fix C에는 안 맞을 수 있다 — `must_reference`/`must_reuse` 위반은 보통 citing 쪽
-block/section을 고치면 되지만, cited 쪽 자체가 바뀌어야 하는 경우도 있다(예: sample_005처럼 summary가
-analysis를 인용 안 하는 게 아니라 analysis 쪽 수치 자체가 바뀌어 인용이 깨지는 경우). 이 예외가 실제로
-발생하면 그 비교 행은 "복구 범위도 같이 바뀐 비교"로 **명시적으로 재분류**해야 한다 — 이건 Fix C 자체
-설계(2~3단계)가 내릴 결정이고, 0단계는 "기본값은 불변, 예외는 Fix C 설계가 명시적으로 밝히고 깨도 된다"는
-규칙만 고정한다.
+**설계 원칙 2 (4차 확인 후 재정의) — 기본 비교가 측정하는 것과 trigger 단독 효과의 분리**: 처음 쓴 원칙
+2는 이 표의 행 진행을 "trigger 축만 바꾼 비교"라고 불렀는데, 이는 원칙 1과 **모순**이다 — `+Fix A` 행은
+prompt 수정·정규화·검사 활성화 세 가지를 **하나의 단위**로 묶어 켠다고(원칙 1) 이미 정해놓았으니, 이 행
+진행에서 바뀌는 건 trigger 하나가 아니라 세 가지 묶음 전체다. 여러 기능을 묶어 비교하는 설계 자체는
+적절하다(Fix A/B/C는 원래 "기능 묶음"으로 계획됐다) — 틀린 건 그 비교가 측정하는 대상을 "trigger 효과"라고
+잘못 부른 것.
+
+다시 정의한다:
+- baseline→+A→+A+C→+A+B+C 행 진행은 **Fix A/B/C의 기능 묶음을 순차적으로 추가한 누적 효과**를 측정하는
+  기본 비교다. feedback·복구 정책은 네 행 모두 동일하게 고정하지만(이 부분은 그대로 유지), prompt·정규화
+  (Fix A)나 source 문맥 제공(Fix C — 아래 별도 설명)은 검사 활성화와 **함께** 바뀌므로, **이 비교로
+  "검사 활성화만의 효과"는 주장하지 않는다** — 묶음 전체의 효과만 주장한다.
+- 검사 활성화(trigger) 자체의 효과를 보려면 **별도의 비교**를 쓴다: 두 arm에서 prompt·정규화·source
+  문맥 제공·생성 순서·feedback·복구 정책을 **전부 동일하게 고정**하고, 해당 Fix의 `*_enabled` 플래그만
+  다르게 설정한다. 원칙 1이 이미 "분리 ablation은 Fix 자체 설계가 결정할 별도 비교"라고 이연해둔 자리이며,
+  여기서 그 비교를 **"trigger 단독 효과 비교"**로 명시적으로 이름 붙인다 — 아래 기본 비교 표에는 들어가지
+  않는다.
+
+**복구 범위 예외 경고** (그대로 유지): 기본 비교에서 복구 범위를 baseline과 동일하게 고정한다는 기본값은
+Fix C에는 안 맞을 수 있다 — `must_reference`/`must_reuse` 위반은 보통 citing 쪽 block/section을 고치면
+되지만, cited 쪽 자체가 바뀌어야 하는 경우도 있다(예: sample_005처럼 summary가 analysis를 인용 안 하는 게
+아니라 analysis 쪽 수치 자체가 바뀌어 인용이 깨지는 경우). 이 예외가 실제로 발생하면 그 비교 행은 "복구
+범위도 같이 바뀐 비교"로 **명시적으로 재분류**해야 한다 — 이건 Fix C 자체 설계(2~3단계)가 내릴 결정이고,
+0단계는 "기본값은 불변, 예외는 Fix C 설계가 명시적으로 밝히고 깨도 된다"는 규칙만 고정한다.
+
+**Fix C는 "prompt를 안 바꾸는 순수 verifier"가 아니다 (4차 확인)**: 이전 버전의 표는 Fix C를 "prompt를
+바꾸지 않는 순수 verifier"라고 적었는데, Notion 계획의 **C2는 Fix C가 target prompt에 source 내용·수식·
+가정·참조 의무를 제공하고 생성 준비 상태에도 연결하도록 요구한다** — 즉 Fix C는 검사기만이 아니라
+**producer의 생성 input 자체를 바꾸는 부분**도 포함한다. `text_agent_prompt_hash`/`planner_prompt_hash`는
+**고정된 템플릿 상수**만 해싱하므로(호출별 user prompt는 원래부터 해싱 대상이 아님 — P1 참고) 이 해시
+값만 보면 Fix C로 안 바뀔 수 있지만, 그렇다고 "prompt가 그대로"라고 쓰면 틀린 설명이다 — 실제로 매
+호출마다 투입되는 생성 input(이 해시가 포착하지 못하는 영역)이 source 문맥 주입으로 달라진다. "순수
+verifier"라는 표현은 이 input 변경 자체를 숨긴다.
+
+따라서 Fix C를 포함하는 비교는 **무엇을 비교하는지 반드시 명시**한다:
+
+| 비교 대상 | 문서에 명시할 내용 |
+| --- | --- |
+| Fix C 전체 적용 효과 — 현재 계획(C2)에 적합한 기본 비교 | source 문맥·수식·가정·참조 의무 주입 + 생성 순서 조정 + 검사 활성화를 **포함한 기능 묶음**의 효과 |
+| C의 검사기 활성화 효과 (trigger 단독, 별도 비교) | source 문맥 제공과 생성 순서는 두 arm에 **동일하게** 적용하고, `dependency_verifier_enabled`만 다르게 설정 |
+
+아래 비교 조건 표의 "+Fix A+C"/"+Fix A+B+C" 행은 **왼쪽 행(전체 적용 효과)**을 가리킨다 — 지금 Notion
+계획(C2)이 요구하는 기본 비교와 일치한다. "C의 검사기 활성화 효과" 행은 필요하다고 판단되면 Fix C 자체
+설계(2~3단계)에서 별도로 추가한다.
 
 **설계 원칙 3 — 검사·변환·실패한 재시도·재계산 비용을 어떤 항목·단위로 기록하는가**: `docs/
 stage1_experiment_design.md` §4의 기존 원칙(단위=토큰 수를 비교군 간 공통 축으로, 로컬 vLLM 등은
@@ -245,18 +284,24 @@ stage1_experiment_design.md` §4의 기존 원칙(단위=토큰 수를 비교군
 **비교 조건 표** (설계 원칙 1·2·3을 반영, 열별로 "지금 고정되는 규칙"과 "아직 못 박을 수 없는 리터럴 값"을
 구분):
 
-| 조건 | prompt 버전 | 정규화 | 활성 검사 | feedback | 복구 범위 | 비용 기록 경로 |
+| 조건 | prompt·생성 input | 정규화 | 활성 검사 | feedback | 복구 범위 | 비용 기록 경로 |
 | --- | --- | --- | --- | --- | --- | --- |
-| baseline (현재, additional verifiers 없음) | `text_agent_prompt_hash`/`planner_prompt_hash` (현재 커밋 기준 고정) | 없음 (markdown 강조 규제 미적용) | 각 agent의 `DEFAULT_ENABLED_*`만 (`{text_agent,planner,assembler}_enabled_validators_snapshot`으로 기록됨) | 내부 재시도 피드백만 (always-on, 끌 수 없음) — 네 행 공통 고정 (원칙 2) | 기존 `_repair_and_recompile` (block/section) — 네 행 공통 고정 (원칙 2) | LLM: `token_usage_records`; 결정적 검사: 없음 |
-| +Fix A (markdown_emphasis) | baseline과 **다른 해시** — 수정 prompt는 Fix A 조건의 일부로 함께 켠다(원칙 1). 리터럴 값은 1단계에서 SYSTEM_PROMPT를 실제로 고쳐야 나옴 | **활성** (원칙 1에 따라 prompt 수정과 한 단위) — 평문 강조 제한적 변환, 모호하면 block 복구로. 세부 규칙은 1단계 | `markdown_emphasis_enabled=True` 추가 | baseline과 동일 (원칙 2) | baseline과 동일 (원칙 2) | `check:markdown_emphasis`/`transform:markdown_normalize`, latency_s만 (원칙 3). 실제 호출 경로는 아직 없음 — 1단계 구현 시 반드시 이 명명 규칙을 따를 것 |
-| +Fix A+C (reference/order) | Fix A와 동일 규칙 (Fix C는 prompt를 바꾸지 않는 순수 verifier) | Fix A와 동일 | +`dependency_verifier_enabled=True` | baseline과 동일 (원칙 2) | **기본값은 baseline과 동일, 단 원칙 2의 예외 경고 적용** — Fix C 설계(2~3단계)가 명시적으로 깨도 됨 | `check:dependency_reference`, latency_s만 (원칙 3) |
-| +Fix A+B+C (전체) | Fix A와 동일 규칙 (B6 LLM 후속까지 가면 별도 user prompt가 생길 수 있으나 그건 follow-up 범위) | Fix A와 동일 | 전부 `True` | baseline과 동일 (원칙 2) — 수치 재계산 자체는 결정적이라 "feedback" 개념이 없음 | +Fix A+C와 동일한 예외 경고, Fix B의 공유 값 불일치는 "어느 섹션이 틀렸는가"가 모호해 범위가 하나로 안 고정될 수 있음 — 3단계로 이연 | `recompute:numeric`(latency_s만) + B6은 일반 토큰 경로(원칙 3) |
+| baseline (현재, additional verifiers 없음) | `text_agent_prompt_hash`/`planner_prompt_hash` (현재 커밋 기준 고정), source 문맥 주입 없음 | 없음 (markdown 강조 규제 미적용) | 각 agent의 `DEFAULT_ENABLED_*`만 (`{text_agent,planner,assembler}_enabled_validators_snapshot`으로 기록됨) | 내부 재시도 피드백만 (always-on, 끌 수 없음) — 네 행 공통 고정 (원칙 2) | 기존 `_repair_and_recompile` (block/section) — 네 행 공통 고정 (원칙 2) | LLM: `token_usage_records`; 결정적 검사: 없음 |
+| +Fix A (markdown_emphasis) | baseline과 **다른 템플릿 해시** — 수정 prompt는 Fix A 묶음의 일부로 함께 켠다(원칙 1). 리터럴 값은 1단계에서 SYSTEM_PROMPT를 실제로 고쳐야 나옴 | **활성** (원칙 1에 따라 prompt 수정과 한 단위) — 평문 강조 제한적 변환, 모호하면 block 복구로. 세부 규칙은 1단계 | `markdown_emphasis_enabled=True` 추가 | baseline과 동일 (원칙 2) | baseline과 동일 (원칙 2) | `check:markdown_emphasis`/`transform:markdown_normalize`, latency_s만 (원칙 3). 실제 호출 경로는 아직 없음 — 1단계 구현 시 반드시 이 명명 규칙을 따를 것 |
+| +Fix A+C (reference/order, **전체 적용 효과** 행 — trigger 단독 비교는 위 두 비교 대상 표를 따로 참고) | Fix A와 동일 템플릿 해시 **+ C2에 따른 호출별 source 문맥·수식·가정·참조 의무 주입** (템플릿 해시가 포착하지 못하는 영역 — "prompt 그대로"가 아님, 위 Fix C 설명 참고) | Fix A와 동일 | +`dependency_verifier_enabled=True` | baseline과 동일 (원칙 2) | **기본값은 baseline과 동일, 단 원칙 2의 예외 경고 적용** — Fix C 설계(2~3단계)가 명시적으로 깨도 됨 | `check:dependency_reference`, latency_s만 (원칙 3) |
+| +Fix A+B+C (전체, **전체 적용 효과** 행) | Fix A+C 행과 동일 (source 문맥 주입 포함) — B6 LLM 후속까지 가면 별도 user prompt가 생길 수 있으나 그건 follow-up 범위 | Fix A와 동일 | 전부 `True` | baseline과 동일 (원칙 2) — 수치 재계산 자체는 결정적이라 "feedback" 개념이 없음 | +Fix A+C와 동일한 예외 경고, Fix B의 공유 값 불일치는 "어느 섹션이 틀렸는가"가 모호해 범위가 하나로 안 고정될 수 있음 — 3단계로 이연 | `recompute:numeric`(latency_s만) + B6은 일반 토큰 경로(원칙 3) |
 
-이 표에서 **지금 고정된 것**: 열 구조, baseline 행 전체, 그리고 모든 행의 feedback·복구 범위가 따르는
-"원칙 2"의 규칙(과 그 예외 처리 방식), 비용 기록의 명명 규칙(원칙 3). **아직 못 박지 않은 것**: prompt
-해시·정규화 세부 규칙의 리터럴 값(1단계 코드가 생겨야 나옴), Fix C/B의 복구 범위가 예외를 실제로 타는지
-여부(2~3단계 설계가 결정) — 이 둘은 코드가 없는데 억지로 값을 채우면 선점(앞질러 단정)이 되므로 의도적으로
-비워 둔다.
+이 표의 모든 "+Fix" 행은 **원칙 2가 정의한 "기능 묶음 누적 효과" 비교**다 — 검사 활성화(trigger)만의
+효과는 이 표에서 주장하지 않는다. trigger 단독 효과를 보는 별도 비교(원칙 2, Fix C의 두 비교 대상 표)는
+이 표에 없고, 필요한 시점에 해당 Fix 자체 설계 단계에서 추가한다.
+
+이 표에서 **지금 고정된 것**: 열 구조, baseline 행 전체, 모든 "+Fix" 행이 "기능 묶음 누적 효과"를
+측정한다는 것(원칙 2)과 그게 "trigger만의 효과"가 아니라는 구분, 모든 행의 feedback·복구 범위가 따르는
+규칙(과 그 예외 처리 방식), 비용 기록의 명명 규칙(원칙 3), Fix C의 prompt 열이 "템플릿 불변"과 "호출별
+input 변경"을 구분해야 한다는 것. **아직 못 박지 않은 것**: prompt 해시·정규화·source 문맥 주입 세부
+규칙의 리터럴 값(1~3단계 코드가 생겨야 나옴), Fix C/B의 복구 범위가 예외를 실제로 타는지 여부(2~3단계
+설계가 결정), trigger 단독 효과 비교를 실제로 추가할지 여부(각 Fix 설계가 결정) — 이들은 코드가 없는데
+억지로 값을 채우면 선점(앞질러 단정)이 되므로 의도적으로 비워 둔다.
 
 **2차 리뷰 확인 (2026-10-29)**: 2차 리뷰는 이 "TBD" 행들과 "결정적 검사 비용 기록 경로 없음"이 여전히
 그대로라고 짚었다 — 맞다, 둘 다 이미 위에서 **의도적으로** 1~4단계로 이연한 것이다 (A/B/C 자체가 없는데
@@ -267,6 +312,16 @@ stage1_experiment_design.md` §4의 기존 원칙(단위=토큰 수를 비교군
 "그 값을 결정하는 규칙"을 분리했고, 표의 feedback·복구 범위·비용 기록 열을 그 규칙에 따라 다시 채웠다.
 코드 변경은 없다 — Fix A/B/C 자체가 없는 상태에서 실행 경로를 만드는 건 범위 밖이고(이미 위에서 확인),
 이번 라운드는 **설계 계약의 명시성**만 고친다.
+
+**4차 확인 (2026-11-03) 반영**: 3차 확인의 원칙 2·표가 두 가지를 틀리게 적었다 — (1) `+Fix A` 행이
+prompt·정규화·검사 활성화를 한 묶음으로 켠다(원칙 1)면서, 그 행 진행을 "trigger 축만 바꾼 비교"라고
+부른 **자기모순**(원칙 1과 원칙 2가 서로 다른 말을 함), (2) Fix C를 "prompt를 바꾸지 않는 순수
+verifier"라고 적은 것 — Notion C2는 Fix C가 target prompt에 source 문맥·수식·가정·참조 의무를 주입하고
+생성 준비 상태에도 연결하도록 요구하므로 틀렸다. 원칙 2를 "기본 비교=Fix 묶음의 누적 효과(검사 활성화만의
+효과는 주장하지 않음), trigger 단독 효과는 모든 축을 동일하게 고정한 별도 비교"로 재정의했고, Fix C
+설명에 "전체 적용 효과 vs 검사기 단독 활성화 효과"의 두 비교 대상을 명시하는 표를 추가했다. 표의
+prompt·생성 input 열도 "템플릿 해시 불변"과 "호출별 생성 input 변경(해시 비포착 영역)"을 구분하도록
+다시 썼다. 문서 수정만, 코드 변경 없음.
 
 ## 발견된 공백 — 0단계에서 풀지 않고 이후 단계로 이연
 
@@ -301,14 +356,17 @@ stage1_experiment_design.md` §4의 기존 원칙(단위=토큰 수를 비교군
   아직 없으므로 (A/B/C 미구현) 실제 추적은 1단계에서 처음 end-to-end로 검증된다.
 - [x] 기존 결과 보존 확인 (outputs/, Gold Labeling 불변).
 - [x] 검사 범위와 로그 계약 확정: P1-P4 각각이 가리키는 기존/신규 메커니즘, 그리고 P4의 비교 조건 표
-  구조와 그 표를 채우는 세 가지 설계 원칙(공통 적용 여부/비교당 단일 축/비용 명명 규칙).
-- [x] 1차 리뷰(2026-10-28) 4건, 2차 리뷰(2026-10-29) 3건, 3차 확인(2026-11-03) 1건 모두 반영 완료.
-  2차 리뷰 반영: P1에 planner prompt hash + 3-agent validator snapshot 분리, P2에 호출-내부 실패
-  attempt 보존(`_persist_failed_attempt`), P3의 `reason="resolved"`/비어있지 않은 unresolved 모순 교정.
-  회귀 테스트 총 24개 추가 (controller.py 7개, text_agent.py 7개, schemas/wiring 테스트 갱신), 전체
-  테스트 스위트 변경 없이 통과 (사전 존재하던 57건의 무관한 실패는 이 세션 변경 전/후 동일함을 `git
-  stash`로 확인). 3차 확인 반영: P4의 비교 조건 표 TBD 칸이 "리터럴 값"과 "그 값을 정하는 규칙"을
-  구분하지 않았던 문제를 설계 원칙 1(prompt·정규화는 조건의 일부, 공통 적용 아님)·2(행 진행은 trigger
-  축만 바꾸고 feedback·복구 범위는 고정 — Fix C 예외는 명시적 경고로 남김)·3(check/transform/실패한
-  retry/recompute의 비용 기록 명명 규칙, `stage1_experiment_design.md` §4 재사용)으로 고정 — 문서만
-  수정, 코드 변경 없음(Fix A/B/C 자체가 미구현이라 실제 배선은 범위 밖).
+  구조와 그 표를 채우는 세 가지 설계 원칙(공통 적용 여부/기본 비교 vs trigger 단독 비교/비용 명명 규칙).
+- [x] 1차 리뷰(2026-10-28) 4건, 2차 리뷰(2026-10-29) 3건, 3차 확인(2026-11-03) 1건, 4차 확인
+  (2026-11-03) 2건 모두 반영 완료. 2차 리뷰 반영: P1에 planner prompt hash + 3-agent validator
+  snapshot 분리, P2에 호출-내부 실패 attempt 보존(`_persist_failed_attempt`), P3의
+  `reason="resolved"`/비어있지 않은 unresolved 모순 교정. 회귀 테스트 총 24개 추가 (controller.py 7개,
+  text_agent.py 7개, schemas/wiring 테스트 갱신), 전체 테스트 스위트 변경 없이 통과 (사전 존재하던
+  57건의 무관한 실패는 이 세션 변경 전/후 동일함을 `git stash`로 확인). 3차 확인 반영: P4의 비교 조건
+  표 TBD 칸이 "리터럴 값"과 "그 값을 정하는 규칙"을 구분하지 않았던 문제를 설계 원칙 1·2·3으로 고정.
+  4차 확인 반영: 3차의 원칙 2 자체가 원칙 1과 모순("한 묶음으로 켠다"면서 "trigger 축만 바뀐다"고 함)이던
+  것을 "기본 비교=기능 묶음 누적 효과, trigger 단독 효과는 모든 축을 동일하게 고정한 별도 비교"로
+  재정의했고, Fix C를 "prompt 불변 순수 verifier"로 잘못 적었던 것을 Notion C2(source 문맥·수식·가정·
+  참조 의무 주입)에 맞게 "템플릿 해시는 불변이지만 호출별 생성 input은 변경됨"으로 교정하고 "전체 적용
+  효과 vs 검사기 단독 효과"의 두 비교 대상을 명시했다 — 둘 다 문서만 수정, 코드 변경 없음(Fix A/B/C
+  자체가 미구현이라 실제 배선은 범위 밖).
