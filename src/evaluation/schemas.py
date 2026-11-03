@@ -240,12 +240,19 @@ class AdditionalVerifierRunMetadata(BaseModel):
     Unlike ``VerificationConfigSnapshot`` above, every field here is
     actually set from real state at run time (see
     ``run_full_pipeline.py::_build_run_result``) -- never a hardcoded
-    default standing in for a toggle that doesn't exist yet. All three
-    ``*_enabled`` flags are honestly ``False`` until the corresponding
+    default standing in for a toggle that doesn't exist yet. Each
+    ``*_enabled`` flag stays honestly ``False`` until the corresponding
     verifier (Fix A/B/C in the Revision (Additional verifiers) plan) is
     actually implemented and wired in; this schema exists now so every
     future stage writes into the same shape rather than each inventing
-    its own.
+    its own. ``markdown_emphasis_enabled`` (Fix A, Stage 1) is the first of
+    the three to flip -- read back from the real per-run
+    ``TextAgent.enabled_validators["markdown_emphasis"]`` value, not a
+    hardcoded constant, since an ablation run can still disable it.
+    ``math_verifier_enabled``/``dependency_verifier_enabled`` (Fix B/C)
+    remain ``False``: unlike Fix A, those need a production
+    ``ConstraintProvider`` that does not exist in this pipeline yet (see
+    the Stage 0 doc's "Known gap").
 
     ``code_commit`` alone is not a reliable prompt/config identifier: it
     only pins what was committed, not what is actually on disk if the

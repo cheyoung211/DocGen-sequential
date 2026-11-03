@@ -290,7 +290,10 @@ def _short_circuited_before(code: str, errors_by_code: Dict[str, SemanticBlockEr
     return False
 
 # Gated error code -> the DEFAULT_ENABLED_VALIDATORS key that gates it
-# (text_agent.py:1046-1143). "figure_content" gates two distinct codes.
+# (text_agent.py:1046-1143). "figure_content" gates two distinct codes;
+# "plain_title" likewise now gates "plain_caption" too (Revision
+# (Additional verifiers) Stage 1 / Fix A) -- same underlying plain-text
+# rule applied to a second field, not an independent toggle.
 _GATE_KEY_BY_CODE: Dict[str, str] = {
     "forbidden_environment": "forbidden_environment",
     "manual_label": "manual_label",
@@ -298,10 +301,12 @@ _GATE_KEY_BY_CODE: Dict[str, str] = {
     "table_shape": "table_shape",
     "equation_shape": "equation_shape",
     "plain_title": "plain_title",
+    "plain_caption": "plain_title",
     "unicode_math_symbol": "unicode_math_symbol",
     "bare_math_notation": "bare_math_notation",
     "figure_asset_mismatch": "figure_content",
     "figure_forbidden_content": "figure_content",
+    "markdown_emphasis": "markdown_emphasis",
 }
 
 # Gated error code -> the LayoutBlockKinds _validate_one_block actually

@@ -11,10 +11,12 @@ from pydantic import ValidationError
 from scripts.llm_client import LLMClient
 from src.agents.latex_assembler import (
     ENVIRONMENT_TOKEN,
+    convert_markdown_emphasis,
     is_markdown_table,
     validate_fragment_environments,
     validate_markdown_table_columns,
     validate_no_manual_labels,
+    validate_plain_caption,
     validate_plain_title,
 )
 from src.common.schemas import (
@@ -96,6 +98,7 @@ DEFAULT_ENABLED_VALIDATORS: Dict[str, bool] = {
     "bare_math_notation": True,
     "table_shape": True,
     "equation_shape": True,
+    "markdown_emphasis": True,
 }
 
 # A raw Unicode Greek letter or math symbol renders correctly by pure luck
@@ -297,8 +300,20 @@ REMEDIATION_HINTS: Dict[str, str] = {
         "description of one. No '$...$' wrapper is needed -- the composer adds it."
     ),
     "plain_title": (
-        '"title" is plain text only -- remove the backslash/LaTeX command from '
-        'it. Put math notation in "content" instead, inside $...$.'
+        '"title" is plain text only -- remove the backslash/LaTeX command or '
+        'Markdown emphasis (**/__) from it. Put math notation in "content" '
+        "instead, inside $...$, and bold text in \"content\" using \\textbf{...}."
+    ),
+    "plain_caption": (
+        '"caption" is plain text only -- remove the backslash/LaTeX command '
+        'or Markdown emphasis (**/__) from it.'
+    ),
+    "markdown_emphasis": (
+        "Replace Markdown emphasis (**bold** or __bold__) with \\textbf{...} -- "
+        "never leave '**'/'__' in the output. If the exact bold span is unclear "
+        "(unterminated marker, or overlapping with a different marker), rewrite "
+        "that part in plain prose plus \\textbf{...} instead of using '**'/'__' "
+        "at all."
     ),
     "figure_asset_mismatch": (
         "This figure_reference block's \"asset_id\" must be exactly the "
@@ -347,8 +362,16 @@ Generate content for exactly the requested layout blocks.
 <Cross-references and titles>
 - Use \Cref{} or \ref{} only with an exact label listed in
   `available_cross_reference_labels`. Never invent labels.
-- Titles are plain text: never use LaTeX commands, `$...$`, or math notation
-  in `title`. Put mathematical notation in `content`.
+- Titles are plain text: never use LaTeX commands, `$...$`, math notation, or
+  Markdown emphasis (`**bold**`, `__bold__`) in `title` or `caption`. Put
+  mathematical notation in `content`, and bold text in `content` using
+  `\textbf{...}`.
+
+<Text emphasis>
+- Never write Markdown emphasis syntax (`**bold**` or `__bold__`) anywhere in
+  `content`, including inside table cells and list items. Use `\textbf{...}`
+  for bold text instead (wrong: "**Note:** this matters"; right:
+  "\textbf{Note:} this matters").
 
 <Math notation>
 - Never write a raw Unicode Greek letter or math symbol (e.g. ε, δ, α, θ, λ,
@@ -1155,6 +1178,28 @@ Figures owned by this section; refer to these only when relevant:
             )
             return errors
 
+        # Converts every safe **bold**/__bold__ span to \textbf{...} in
+        # place (mutating content_block.content is the point here, unlike
+        # every other check in this method -- see convert_markdown_emphasis)
+        # and raises only for spans that can't be safely auto-converted
+        # (mismatched/unterminated markers, a span crossing a table-cell
+        # boundary, overlapping marker types), routing exactly those to
+        # ordinary block repair instead of guessing. Run first among the
+        # content-quality checks so every later check below sees the
+        # normalized content.
+        if self.enabled_validators.get("markdown_emphasis", True):
+            converted, violations = convert_markdown_emphasis(content_block.content, block_id)
+            content_block.content = converted
+            if violations:
+                errors.append(
+                    SemanticBlockError(
+                        "markdown_emphasis",
+                        block_id,
+                        f"Block '{block_id}' has Markdown emphasis that can't be safely "
+                        "auto-converted to \\textbf{...}: " + "; ".join(violations),
+                    )
+                )
+
         # Same environment/command whitelist the composer enforces in
         # LatexAssembler._validate_fragment, run here too so a
         # violation raises inside process_node's try/except -- which
@@ -1220,6 +1265,14 @@ Figures owned by this section; refer to these only when relevant:
                 validate_plain_title(content_block.title, f"Block '{block_id}'")
             except ValueError as exc:
                 errors.append(SemanticBlockError("plain_title", block_id, str(exc)))
+            # Same gate as title -- caption is rendered through the same
+            # blunt, LaTeX-free _escape_latex (see validate_plain_caption),
+            # so it is the same rule applied to a second field, not a
+            # separate ablation-toggleable check of its own.
+            try:
+                validate_plain_caption(content_block.caption, f"Block '{block_id}'")
+            except ValueError as exc:
+                errors.append(SemanticBlockError("plain_caption", block_id, str(exc)))
 
         # Applies to every block type, including equation -- a raw Unicode
         # symbol is wrong LaTeX regardless of whether it sits inside a math

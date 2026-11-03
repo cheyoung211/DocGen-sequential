@@ -195,6 +195,16 @@ def _build_run_result(
         producer_models=producer_models or {},
         seed=seed,
         additional_verifier_metadata=AdditionalVerifierRunMetadata(
+            # Fix A (Revision (Additional verifiers) Stage 1) is real now --
+            # unlike Fix B/C, it needed no new wiring at all: it runs via
+            # TextAgent/LatexAssembler's own existing enabled_validators
+            # mechanism, which this pipeline already calls unconditionally
+            # for every run. Reading it back out of the same snapshot this
+            # metadata already records (rather than a hardcoded constant)
+            # keeps this flag honest if a future ablation run disables it.
+            markdown_emphasis_enabled=bool(
+                (text_agent_enabled_validators or {}).get("markdown_emphasis", True)
+            ),
             code_commit=_current_code_commit(),
             git_dirty=_git_is_dirty(),
             text_agent_prompt_hash=_text_agent_prompt_hash(),

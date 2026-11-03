@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -214,27 +215,63 @@ def validate_fragment_environments(block_type: SemanticBlockType, content: str, 
 _TITLE_UNSAFE_CHAR = re.compile(r"\\")
 
 
-def validate_plain_title(title: Optional[str], source: str) -> None:
-    """Reject a backslash (a LaTeX command) in a title-like field.
+def _reject_plain_text_markup(value: Optional[str], source: str, field_label: str) -> None:
+    """Shared rule for a field that is NEVER passed through LaTeX rendering
+    at all -- only ``LatexAssembler._escape_latex``, a blunt, command-blind
+    escaper that assumes plain text. A backslash command survives that as
+    mangled literal text (see ``validate_plain_title``'s own history); a
+    Markdown emphasis marker (``**bold**``/``__bold__``) survives it even
+    worse, since ``_escape_latex`` has no notion of Markdown at all and
+    prints the literal asterisks/underscores with no error. Both must be
+    caught here, before rendering, for the same reason.
+    """
+    if not value:
+        return
+    if _TITLE_UNSAFE_CHAR.search(value):
+        raise ValueError(
+            f"{source} {field_label} {value!r} contains a LaTeX command (backslash), which "
+            f"renders as literal text, not a LaTeX command -- {field_label} must be plain text."
+        )
+    candidates = find_markdown_emphasis_matches(value.replace("\r\n", "\n"))
+    if candidates:
+        sample = candidates[0]
+        raise ValueError(
+            f"{source} {field_label} {value!r} contains Markdown emphasis syntax "
+            f"('{sample.marker}{sample.inner}{sample.marker}'), which renders as literal "
+            f"asterisks/underscores (not bold), not a LaTeX command either -- {field_label} "
+            "must be plain text with no emphasis markup at all."
+        )
 
-    Titles (document/section/block titles, table & figure captions) are
-    rendered through ``LatexAssembler._escape_latex`` -- a blunt,
-    command-blind escaper that assumes the string is plain text and turns
-    every backslash into a literal, visible "\\textbackslash{}". A title
-    that legitimately needs math notation (``\\pi``, ``\\theta``, ...) has no
-    way to survive that; the fix is to catch it here, before rendering,
-    rather than let it print as mangled text with no error at all.
+
+def validate_plain_title(title: Optional[str], source: str) -> None:
+    """Reject a LaTeX command (backslash) or Markdown emphasis syntax in a
+    title-like field.
+
+    Titles (document/section/block titles) are rendered through
+    ``LatexAssembler._escape_latex`` -- a blunt, command-blind escaper that
+    assumes the string is plain text and turns every backslash into a
+    literal, visible "\\textbackslash{}". A title that legitimately needs
+    math notation (``\\pi``, ``\\theta``, ...) has no way to survive that;
+    the fix is to catch it here, before rendering, rather than let it print
+    as mangled text with no error at all. The same is true of Markdown
+    emphasis (``**bold**``): there is no LaTeX rendering pass here to turn
+    it into bold, so it would print as literal asterisks instead.
 
     A bare ``$`` (e.g. a dollar figure in a finance-domain title like "$500
     Cost Overrun") is deliberately not flagged here: ``_escape_latex``
     already turns it into a literal, correctly-rendered dollar sign, so it
-    isn't actually broken -- only a backslash command is.
+    isn't actually broken -- only a backslash command or emphasis markup is.
     """
-    if title and _TITLE_UNSAFE_CHAR.search(title):
-        raise ValueError(
-            f"{source} title {title!r} contains a LaTeX command (backslash), which "
-            "renders as literal text, not a LaTeX command -- titles must be plain text."
-        )
+    _reject_plain_text_markup(title, source, "title")
+
+
+def validate_plain_caption(caption: Optional[str], source: str) -> None:
+    """Same rule as ``validate_plain_title``, for a block's ``caption``
+    field -- also rendered through ``_escape_latex`` (see
+    ``LatexAssembler._render_table``/``_render_figure``), never through
+    actual LaTeX, so it must be equally plain.
+    """
+    _reject_plain_text_markup(caption, source, "caption")
 
 
 LABEL_TOKEN = re.compile(r"\\label\s*\{(?P<label>[^{}]+)\}")
@@ -324,6 +361,216 @@ def _find_math_spans(row: str) -> List["tuple[int, int]"]:
     if in_math:
         spans.append((span_start, length))
     return spans
+
+
+@dataclass
+class MarkdownEmphasisMatch:
+    """One ``**bold**``/``__bold__``-shaped span found in one line of block
+    content. ``line_number`` is 1-indexed; ``start``/``end`` are indices
+    within that one line (not the whole, possibly multi-line, content) --
+    ``end`` is just past the closing marker. ``ambiguous`` spans must not be
+    mechanically converted (see ``find_markdown_emphasis_matches``); ``reason``
+    is only set when ``ambiguous`` is true.
+    """
+
+    line_number: int
+    marker: str
+    start: int
+    end: int
+    inner: str
+    ambiguous: bool
+    reason: str = ""
+
+
+_EMPHASIS_MARKERS = ("**", "__")
+
+
+def _line_math_mask(line: str) -> List[bool]:
+    mask = [False] * len(line)
+    for start, end in _find_math_spans(line):
+        for i in range(start, min(end, len(line))):
+            mask[i] = True
+    return mask
+
+
+def _classify_emphasis_pair(
+    line: str, marker: str, open_idx: int, close_idx: int, line_number: int
+) -> Optional[MarkdownEmphasisMatch]:
+    """Classify one candidate ``marker ... marker`` pair, or return ``None``
+    if it isn't a genuine emphasis attempt at all (code/identifier-shaped),
+    in which case it is neither converted nor reported -- see
+    ``find_markdown_emphasis_matches`` for the full reasoning.
+    """
+    inner_start = open_idx + len(marker)
+    inner = line[inner_start:close_idx]
+    end = close_idx + len(marker)
+    before = line[open_idx - 1] if open_idx > 0 else ""
+    after = line[end] if end < len(line) else ""
+    if before.isalnum() or after.isalnum():
+        # e.g. "x**2 and y**3" (exponent-looking code), not an attempted
+        # bold -- a real one is never glued to a preceding/following
+        # alphanumeric character on its outer edge.
+        return None
+    if not inner or inner[0].isspace() or inner[-1].isspace():
+        # "** foo **"/"****" -- CommonMark's own strong-emphasis content
+        # rule (can't start/end with whitespace) would not open/close here
+        # either.
+        return None
+    if "|" in inner:
+        return MarkdownEmphasisMatch(
+            line_number, marker, open_idx, end, inner, True,
+            "crosses a Markdown table cell boundary ('|')",
+        )
+    return MarkdownEmphasisMatch(line_number, marker, open_idx, end, inner, False)
+
+
+def _classify_unterminated(
+    line: str, marker: str, idx: int, line_number: int
+) -> Optional[MarkdownEmphasisMatch]:
+    """Classify a marker occurrence left over after pairing (an odd count on
+    this line). Only reported as ambiguous if it looks like a genuine, just
+    unterminated, open delimiter -- not preceded by an alphanumeric
+    character, and followed by something other than whitespace/end-of-line.
+    """
+    before = line[idx - 1] if idx > 0 else ""
+    after_idx = idx + len(marker)
+    after = line[after_idx] if after_idx < len(line) else ""
+    if before.isalnum() or not after or after.isspace():
+        return None
+    return MarkdownEmphasisMatch(
+        line_number, marker, idx, len(line), line[after_idx:], True,
+        "unterminated -- no matching closing marker on this line",
+    )
+
+
+def _flag_cross_marker_overlaps(line_matches: List[MarkdownEmphasisMatch]) -> None:
+    """Mark both spans ambiguous when a ``**`` span and a ``__`` span on the
+    same line overlap without one fully containing the other -- e.g.
+    ``**foo __bar** baz__``. Properly nested different-marker spans (one
+    fully inside the other) are left alone; the same marker can never
+    reach this function already nested in itself (sequential pairing
+    resolves that case into separate adjacent spans instead, which is the
+    correct reading -- CommonMark doesn't let ``**`` nest in ``**`` either).
+    """
+    for i, first in enumerate(line_matches):
+        for second in line_matches[i + 1 :]:
+            if first.marker == second.marker:
+                continue
+            overlaps = first.start < second.end and second.start < first.end
+            nested = (first.start <= second.start and second.end <= first.end) or (
+                second.start <= first.start and first.end <= second.end
+            )
+            if overlaps and not nested:
+                reason = "overlaps a different emphasis marker without nesting cleanly"
+                first.ambiguous = True
+                first.reason = first.reason or reason
+                second.ambiguous = True
+                second.reason = second.reason or reason
+
+
+def find_markdown_emphasis_matches(text: str) -> List[MarkdownEmphasisMatch]:
+    """Find every ``**bold**``/``__bold__``-shaped span in ``text``,
+    classifying each as safe to mechanically convert to ``\\textbf{...}`` or
+    ambiguous (needs a human/model rewrite via block repair instead).
+
+    Deliberately not a full CommonMark emphasis parser -- just enough
+    structure-awareness to avoid the two failure modes a naive "does this
+    string contain '**'" check or a global regex replace would hit:
+
+    - A delimiter is never considered if it starts inside a
+      ``$...$``/``\\(...\\)``/``\\[...\\]`` math span (reuses
+      ``_find_math_spans``) -- math notation is never text emphasis.
+    - A delimiter run is only treated as emphasis if its outer edges are NOT
+      flanked by an alphanumeric character -- this is what distinguishes
+      genuine prose bold ("**bold**", preceded/followed by space or line
+      start/end) from code-shaped exponent notation ("x**2"). A delimiter
+      that fails this test is not flagged at all: it is not an attempted
+      emphasis, so it is neither safe to convert nor an error to report.
+      This intentionally also lets a doubled-underscore identifier
+      ("__init__") convert like ordinary "__bold__" -- the same syntax is
+      genuinely ambiguous between the two, and nothing in this project's
+      content schema distinguishes a code/literal span from prose, so there
+      is no reliable signal to tell them apart; this matches "**bold**"
+      being favored over any hypothetical code-shaped reading of "**".
+    - Spans never cross a line break or a raw (non-math) '|' -- the latter
+      is what keeps a forgotten closing '**' in one Markdown table cell from
+      swallowing the next cell's content into one (wrong) bold span; the
+      former keeps a list/table row's own line-oriented structure intact.
+    - Pairing is purely sequential (1st+2nd occurrence, 3rd+4th, ...), never
+      "find the matching close" -- the same marker genuinely can't nest in
+      itself in CommonMark either, so two adjacent spans with plain text in
+      between (as in "**a **b** c**") is the correct reading, not nesting.
+      A different-marker overlap that doesn't nest cleanly, and a trailing
+      unpaired marker that still looks like a genuine (just unterminated)
+      open, are both reported as ambiguous.
+    """
+    matches: List[MarkdownEmphasisMatch] = []
+    for line_number, line in enumerate(text.split("\n"), start=1):
+        math_mask = _line_math_mask(line)
+        length = len(line)
+
+        occurrences_by_marker: Dict[str, List[int]] = {marker: [] for marker in _EMPHASIS_MARKERS}
+        index = 0
+        while index < length - 1:
+            if line[index] == "\\":
+                index += 2
+                continue
+            two = line[index : index + 2]
+            if two in occurrences_by_marker and not math_mask[index]:
+                occurrences_by_marker[two].append(index)
+                index += 2
+                continue
+            index += 1
+
+        line_matches: List[MarkdownEmphasisMatch] = []
+        for marker, occurrences in occurrences_by_marker.items():
+            for open_idx, close_idx in zip(occurrences[0::2], occurrences[1::2]):
+                candidate = _classify_emphasis_pair(line, marker, open_idx, close_idx, line_number)
+                if candidate is not None:
+                    line_matches.append(candidate)
+            if len(occurrences) % 2 == 1:
+                trailing = _classify_unterminated(line, marker, occurrences[-1], line_number)
+                if trailing is not None:
+                    line_matches.append(trailing)
+
+        _flag_cross_marker_overlaps(line_matches)
+        matches.extend(line_matches)
+    return matches
+
+
+def convert_markdown_emphasis(content: str, block_id: Optional[str] = None) -> "tuple[str, List[str]]":
+    """Convert every SAFE ``**bold**``/``__bold__`` span in ``content`` to
+    ``\\textbf{...}`` in place; return the (possibly modified) content plus
+    one description per AMBIGUOUS span left untouched, each naming its
+    location and reason -- ready to feed a ``SemanticBlockError``/block
+    repair verbatim instead of auto-converting something uncertain.
+
+    Idempotent: the output contains no ``**``/``__`` delimiters that
+    ``find_markdown_emphasis_matches`` would call safe (every one was just
+    converted into a ``\\textbf{...}`` call, which contains none), so
+    re-running this on its own output changes nothing.
+    """
+    text = content.replace("\r\n", "\n")
+    lines = text.split("\n")
+    matches = find_markdown_emphasis_matches(text)
+
+    safe_by_line: Dict[int, List[MarkdownEmphasisMatch]] = {}
+    violations: List[str] = []
+    for match in matches:
+        if match.ambiguous:
+            location = f"block '{block_id}'" if block_id else "block"
+            raw = f"{match.marker}{match.inner}{match.marker}"
+            violations.append(f"{location}, line {match.line_number}: {raw!r} {match.reason}")
+        else:
+            safe_by_line.setdefault(match.line_number, []).append(match)
+
+    for line_number, line_matches in safe_by_line.items():
+        line = lines[line_number - 1]
+        for match in sorted(line_matches, key=lambda m: m.start, reverse=True):
+            line = line[: match.start] + f"\\textbf{{{match.inner}}}" + line[match.end :]
+        lines[line_number - 1] = line
+
+    return "\n".join(lines), violations
 
 
 def _paired_pipe_indices(row: str, spans: List["tuple[int, int]"]) -> "set[int]":
@@ -531,7 +778,7 @@ def _log_list_check(
         )
 
 
-# The same three checks TextAgent already gates behind its own
+# The same four checks TextAgent already gates behind its own
 # ``enabled_validators`` (see DEFAULT_ENABLED_VALIDATORS in text_agent.py),
 # re-run here as the composer's second line of defense right before
 # rendering. Kept as an independently toggleable dict -- NOT mirrored
@@ -539,11 +786,18 @@ def _log_list_check(
 # study, say, "TextAgent's forbidden_environment check off, composer's on"
 # as its own condition. Label-uniqueness checking has no code here because
 # it stays always-on on the instance method (needs the document-wide label
-# registry, not a per-code toggle).
+# registry, not a per-code toggle). "markdown_emphasis" here is a pure
+# residual CHECK, never a conversion -- TextAgent is where safe spans get
+# mechanically converted; if one still reaches here unconverted (ablation
+# disabled it there, or a stale pre-Stage-1 artifact), the composer must
+# refuse loudly rather than silently rewrite content right before
+# rendering, which would make the stored artifact, verification evidence,
+# and PDF disagree about what this block actually contains.
 DEFAULT_ENABLED_ASSEMBLER_VALIDATORS: Dict[str, bool] = {
     "forbidden_environment": True,
     "manual_label": True,
     "table_columns": True,
+    "markdown_emphasis": True,
     # The five gate-level checks below: disabling one skips both running it
     # and logging its VerificationEvent, so ablation can measure what each
     # gate actually catches. Deliberately excluded from this dict: the
@@ -1142,6 +1396,18 @@ class LatexAssembler:
             and self.enabled_validators.get("table_columns", True)
         ):
             validate_markdown_table_columns(content, block.block_id)
+        if self.enabled_validators.get("markdown_emphasis", True):
+            residual = find_markdown_emphasis_matches(content)
+            if residual:
+                sample = residual[0]
+                raise ValueError(
+                    f"Block '{block.block_id}' line {sample.line_number} still contains "
+                    f"Markdown emphasis syntax ('{sample.marker}{sample.inner}{sample.marker}') "
+                    "-- TextAgent's own markdown_emphasis check should have converted or "
+                    "rejected this before the artifact reached the composer; converting it "
+                    "here instead would make the stored artifact and the rendered PDF "
+                    "disagree about this block's content."
+                )
         for label_match in LABEL_TOKEN.finditer(content):
             self._validate_label(label_match.group("label"), f"block '{block.block_id}'")
 

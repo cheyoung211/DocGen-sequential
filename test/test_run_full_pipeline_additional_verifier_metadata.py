@@ -1,5 +1,6 @@
 """Coverage for scripts/run_full_pipeline.py's AdditionalVerifierRunMetadata
-wiring (Revision (Additional verifiers), Stage 0 / P1).
+wiring (Revision (Additional verifiers), Stage 0 / P1; ``markdown_emphasis_
+enabled``'s real-flag wiring added in Stage 1 / Fix A).
 
 Importing run_full_pipeline.py pulls in its real top-level dependencies
 (LLMClient, SDXLGenerator, FluxGenerator) -- this is the one module that
@@ -121,11 +122,34 @@ class BuildRunResultAdditionalVerifierMetadataTest(unittest.TestCase):
         )
         self.assertEqual(metadata.planner_enabled_validators_snapshot, {"plain_title": True})
         self.assertEqual(metadata.assembler_enabled_validators_snapshot, {"layout_policy": False})
-        # None of Fix A/B/C exist yet (Stage 0) -- every flag must stay
-        # honestly False, never a placeholder True for an unbuilt verifier.
-        self.assertFalse(metadata.markdown_emphasis_enabled)
+        # Fix A (Stage 1) is real now: the supplied text_agent_enabled_
+        # validators dict doesn't mention "markdown_emphasis" at all (this
+        # run didn't touch that toggle), so the honest reading is "on by
+        # its own real default" -- True, matching TextAgent's own
+        # DEFAULT_ENABLED_VALIDATORS. Fix B/C still don't exist, so both
+        # stay honestly False, never a placeholder True for an unbuilt
+        # verifier.
+        self.assertTrue(metadata.markdown_emphasis_enabled)
         self.assertFalse(metadata.math_verifier_enabled)
         self.assertFalse(metadata.dependency_verifier_enabled)
+
+    def test_markdown_emphasis_enabled_reflects_an_explicit_ablation_toggle(self) -> None:
+        # Unlike the "not mentioned" case above, a run that explicitly
+        # disabled the check for ablation must report that honestly too.
+        event_logger = EventLogger(run_id="test_run_stage1_ablation")
+        result = rfp._build_run_result(
+            request_id="test_run_stage1_ablation",
+            status="success",
+            error=None,
+            event_logger=event_logger,
+            start_time=None,
+            token_usage_records=None,
+            benchmark_item=None,
+            producer_models={"text": "gpt-4o-mini"},
+            project_dir=REPO_ROOT,
+            text_agent_enabled_validators={"markdown_emphasis": False},
+        )
+        self.assertFalse(result.additional_verifier_metadata.markdown_emphasis_enabled)
 
     def test_defaults_all_three_snapshots_to_empty_when_not_supplied(self) -> None:
         # Every pre-Stage-0 call shape (none exist yet, but the
