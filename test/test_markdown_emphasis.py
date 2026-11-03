@@ -140,6 +140,21 @@ class FindMarkdownEmphasisMatchesTest(unittest.TestCase):
         matches = find_markdown_emphasis_matches("x**2 and y**3 are both exponents.")
         self.assertEqual(matches, [])
 
+    def test_digit_emphasis_glued_to_a_word_at_end_of_line_is_not_silently_dropped(self) -> None:
+        # Round-4 review finding: `"" in "0123456789"` is True in Python,
+        # so _looks_like_code_exponent_open read "nothing follows the
+        # marker" (end of line) as "a digit follows," wrongly excluding
+        # the marker from opening at all -- with nothing left to classify
+        # it as ambiguous either, "**2**" at the very end of
+        # "**first**and**2**" vanished completely: zero matches, no
+        # conversion, no error. It must be detected now (reported
+        # ambiguous -- unterminated, since nothing closes it once the
+        # preceding "d"+"2" pairing is correctly excluded as code-shaped),
+        # never silently passed through.
+        matches = find_markdown_emphasis_matches("**first**and**2**")
+        self.assertEqual([m.inner for m in matches if not m.ambiguous], ["first"])
+        self.assertTrue(any(m.ambiguous for m in matches))
+
     def test_double_underscore_identifier_converts_like_ordinary_bold(self) -> None:
         # "__init__" and genuine "__bold__" are the same syntax with no
         # reliable way to tell them apart in this project's content schema
@@ -375,6 +390,13 @@ class ConvertMarkdownEmphasisTest(unittest.TestCase):
         self.assertEqual(converted, r"\textbf{first}and\textbf{second}")
         self.assertEqual(violations, [])
 
+    def test_digit_emphasis_glued_to_a_word_at_end_of_line_is_reported_not_silently_passed(self) -> None:
+        original = "**first**and**2**"
+        converted, violations = convert_markdown_emphasis(original, block_id="b1")
+        self.assertEqual(converted, r"\textbf{first}and**2**")
+        self.assertEqual(len(violations), 1)
+        self.assertIn("unterminated", violations[0])
+
     def test_align_environment_content_is_preserved_byte_for_byte(self) -> None:
         text = r"\begin{align} V^{**} &= V \end{align}"
         converted, violations = convert_markdown_emphasis(text)
@@ -514,6 +536,19 @@ class TextAgentMarkdownEmphasisValidatorTest(unittest.TestCase):
         errors = agent._validate_one_block(content_block, layout_block)
         codes = [e.code for e in errors]
         self.assertNotIn("markdown_emphasis", codes)
+
+    def test_digit_emphasis_glued_to_a_word_at_end_of_line_fails_the_check(self) -> None:
+        # Round-4 review finding: the empty-string membership bug made
+        # this exact input invisible to both the generation-time check
+        # and the composer's residual check -- it passed both silently.
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        layout_block = self._layout_block()
+        content_block = ContentBlock(
+            block_id="b1", type=SemanticBlockType.PARAGRAPH, content="**first**and**2**"
+        )
+        errors = agent._validate_one_block(content_block, layout_block)
+        codes = [e.code for e in errors]
+        self.assertIn("markdown_emphasis", codes)
 
     def test_ambiguous_emphasis_raises_markdown_emphasis_error_without_mutating(self) -> None:
         agent = TextAgent(llm_client=_STUB_LLM_CLIENT)

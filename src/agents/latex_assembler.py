@@ -621,13 +621,26 @@ def _looks_like_code_exponent_open(line: str, idx: int, marker: str) -> bool:
     pattern, and the occurrence is free to open normally -- genuinely
     ambiguous cases still get caught downstream (an unterminated open, an
     overlap, a whitespace-padded inner) rather than silently dropped here.
+
+    Round-4 review finding: when ``idx`` is the LAST occurrence on the
+    line (nothing follows the marker at all), the line above used to read
+    ``after`` as ``""`` and then test ``after in "0123456789"`` -- and
+    ``"" in "0123456789"`` is ``True`` in Python (an empty string is a
+    substring of everything), so "nothing follows" was wrongly read as
+    "a digit follows." That silently excluded a marker glued to a
+    preceding word at the very end of a line/string (``"**first**and
+    **2**"``'s closing ``**`` after "2") from ever opening at all, with
+    no ambiguous span reported either -- the exact "silently pass through"
+    outcome this whole function exists to prevent. Checking ``after_index
+    < len(line)`` BEFORE the membership test (not just to decide what
+    ``after`` is, but as part of the returned condition itself) closes
+    this -- "nothing after" is now unambiguously "not a digit after."
     """
     before = line[idx - 1] if idx > 0 else ""
     if not (before.isascii() and before.isalnum()):
         return False
     after_index = idx + len(marker)
-    after = line[after_index] if after_index < len(line) else ""
-    return after in "0123456789"
+    return after_index < len(line) and line[after_index] in "0123456789"
 
 
 def _find_matches_for_marker(
@@ -891,7 +904,26 @@ def convert_markdown_emphasis(
 #        compound marker runs (***bold***) and unbalanced-brace spans are
 #        never auto-converted, and the pure per-block check fails on ANY
 #        remaining match (not only ambiguous ones).
-MARKDOWN_EMPHASIS_RULE_VERSION = 3
+#   4 -- round-3 review fixes: the code/math-exponent-operator exclusion
+#        (x**2) is now a two-sided ASCII-alnum-before + ASCII-digit-after
+#        signal (_looks_like_code_exponent_open) instead of a one-sided
+#        "preceded by any alphanumeric" check, so an ordinary word glued
+#        to an opening marker with no space (매우**중요**합니다,
+#        **first**and**second**) opens normally instead of being
+#        silently dropped; \begin{<name>}...\end{<name>} for a recognized
+#        display-math/matrix environment name is now also masked as
+#        implicit math, independent of any $/\(/\[ delimiter; and an
+#        EQUATION-kind block's content is now exempted from this check
+#        entirely at its three call sites (its whole content is a math
+#        body by this project's own convention, with or without a
+#        delimiter at all). Round-4 review fix folded into the same
+#        version bump: the exponent-operator signal's end-of-line bounds
+#        check (an empty "nothing follows" read as "a digit follows,"
+#        since `"" in "0123456789"` is True in Python) was corrected --
+#        no new detection/safety RULE changed, but the rule's own
+#        behavior at line-end did, which is exactly what this version
+#        number exists to track.
+MARKDOWN_EMPHASIS_RULE_VERSION = 4
 
 
 def persist_markdown_emphasis_pass(

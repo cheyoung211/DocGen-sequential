@@ -77,7 +77,12 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
   제외한다: (1) marker 바로 앞 글자가 **ASCII** 영숫자(식별자 문자 — CJK 단어는 절대 해당 안 됨)이고,
   (2) marker 바로 뒤 글자가 **ASCII 숫자**(지수 — 본문 강조의 시작 글자는 거의 항상 숫자가 아님)인
   경우만. 둘 중 하나라도 아니면 평범하게 후보로 열린다 — 이후 짝이 안 맞으면 ambiguous로 남아 복구
-  대상이 되므로, 조용히 통과시키는 경우는 더 이상 없다.
+  대상이 되므로, 조용히 통과시키는 경우는 더 이상 없다. **라운드 4 리뷰 수정**: "marker 바로 뒤"가
+  줄 끝이라 아무 글자도 없을 때, `after = ""`로 읽은 뒤 `after in "0123456789"`로 검사했는데 Python에서
+  빈 문자열은 모든 문자열의 부분 문자열이라 이 식이 `True`가 된다 — "뒤에 아무것도 없음"이 "뒤에 숫자가
+  있음"으로 잘못 읽혀, 줄 끝에 붙은 숫자 강조(`"**first**and**2**"`의 `**2**`)가 열기 후보에서 제외된
+  뒤 아무것도 못 닫아 완전히 조용히 사라졌다. `after_index < len(line)`을 멤버십 검사보다 먼저(그리고
+  반환값의 일부로) 확인하도록 고쳐 "뒤에 아무것도 없음"이 더 이상 "숫자가 있음"으로 읽히지 않는다.
 - `convert_markdown_emphasis(content, block_id, *, matches=None)`: 안전(ambiguous=False)한 span만
   `\textbf{...}`로 치환하고, 나머지는 원본 그대로 둔 채 위치·이유가 담긴 설명 문자열 목록을 반환한다.
   **idempotent**. `matches`를 미리 넘기면(비용 측정을 이미 호출자가 했을 때) 다시 스캔하지 않는다.
@@ -139,7 +144,7 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
 
 ## A4. 회귀 및 실제 출력 확인
 
-`test/test_markdown_emphasis.py`(84 tests) + `test/core/test_adapters.py`(adapter 순수성/FAIL 판정
+`test/test_markdown_emphasis.py`(87 tests) + `test/core/test_adapters.py`(adapter 순수성/FAIL 판정
 2건):
 
 - 탐지기/변환기 단위 테스트: 본문 bold, 표 셀 bold, 여러 강조 구간, 짝 불일치(미종료 marker), 표 셀
@@ -172,7 +177,8 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
 변경 전/후 전체 테스트 스위트 비교: 기존에 알려진, 이 revision과 무관한 57개 실패
 (`test_text_agent_structural_toggle.py` 등 — [[docgen_revision_2026_10_15]] Stage 1 메모 참고)가
 **정확히 동일하게** 유지됨을 `git stash`로 전/후 비교해 확인했다(실패한 테스트 목록까지 diff로 동일함을
-확인 — 개수만 같은 게 아니다). 통과 테스트는 879 → 934(라운드 1) → 952(라운드 2) → 966(라운드 3).
+확인 — 개수만 같은 게 아니다). 통과 테스트는 879 → 934(라운드 1) → 952(라운드 2) → 966(라운드 3)
+→ 969(라운드 4).
 
 ## Stage 0 메타데이터와의 관계
 
@@ -329,6 +335,32 @@ False" 주장도 이에 맞춰 수정했고, 명시적 ablation(끄기)이 여�
 `_validate_blocks_against_layout`/adapter/`_validate_fragment` 통합 경로로 재확인,
 `test/test_markdown_emphasis.py`에 14개 테스트 추가(70 → 84). `git stash`로 전/후 비교해 기존 57개
 무관 실패가 **실패 목록까지 정확히 동일하게** 유지됨을 재확인(통과: 952 → 966).
+
+## Stage 1, 라운드 4 리뷰 (2026-11-03)
+
+라운드 3 수정 자체에서 탐지 누락 1건과 버전 관리 누락 1건을 사용자가 추가로 찾았다:
+
+1. **숫자 강조가 줄 끝에 있으면 여전히 탐지를 놓침.** `"**first**and**2**"` → `\textbf{first}and**2**`로
+   변환되고 생성·조립 검사 모두 통과했다. 원인은 `_looks_like_code_exponent_open`의 마지막 줄
+   `after in "0123456789"`다 — marker 바로 뒤에 아무 글자도 없을 때(줄 끝) `after = ""`로 읽었는데,
+   Python에서 빈 문자열은 모든 문자열의 부분 문자열이라 `"" in "0123456789"`가 `True`다. 즉 "뒤에
+   아무것도 없음"이 "뒤에 숫자가 있음"으로 잘못 읽혀, `"and"`에 붙은 `**2**`가 코드/지수 표현으로
+   오인되어 열기 후보에서 제외됐고, 닫는 쪽도 같은 함수로 같은 이유로 제외돼 결국 아무 match도 남지
+   않았다(조용히 사라짐, ambiguous 보고조차 없음). 수정: `after_index < len(line)`을 멤버십 검사 앞에
+   서, 반환값 자체의 일부로 명시적으로 확인한다 — "뒤에 아무것도 없음"은 이제 항상 "숫자 아님"으로
+   읽힌다. 수정 후 `"**first**and**2**"`는 `**2**` 부분이 ambiguous(미종료)로 보고되어 복구 대상이
+   된다 — "변환하거나 모호하면 복구 대상으로 남겨야 한다"는 요구를 그대로 만족한다. `x**2`,
+   `x**2 and y**3`, `x**2 and **important**.` 등 기존 보호 사례는 그대로 유지됨을 재확인했다.
+2. **탐지·안전 판정 규칙이 두 라운드(3, 4)에 걸쳐 바뀌었는데 `MARKDOWN_EMPHASIS_RULE_VERSION`은 여전히
+   3.** 라운드 3에서 지수 표현 판별 규칙 전체 교체와 수식 환경 인식을 추가했는데도 버전을 올리지
+   않았다. 수정: `MARKDOWN_EMPHASIS_RULE_VERSION = 4`로 올리고, 상수 위 주석의 변경 이력에 버전 3→4
+   구간(라운드 3의 두 가지 설계 변경 + 라운드 4의 줄 끝 버그 수정)을 모두 기록했다 — 이후 저장된
+   `markdown_emphasis_conversion_*.json` 레코드의 `rule_version` 필드가 실제로 그 판정을 만든 코드와
+   맞아떨어진다.
+
+전체 재검증: 재현 입력을 함수 단위 + `_validate_one_block`/`_validate_fragment` 통합 경로로 재확인,
+`test/test_markdown_emphasis.py`에 3개 테스트 추가(84 → 87). `git stash`로 전/후 비교해 기존 57개
+무관 실패가 **실패 목록까지 정확히 동일하게** 유지됨을 재확인(통과: 966 → 969).
 
 ## 다음 단계
 
