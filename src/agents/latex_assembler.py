@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -224,6 +226,19 @@ def _reject_plain_text_markup(value: Optional[str], source: str, field_label: st
     worse, since ``_escape_latex`` has no notion of Markdown at all and
     prints the literal asterisks/underscores with no error. Both must be
     caught here, before rendering, for the same reason.
+
+    Round-2 review finding: ``find_markdown_emphasis_matches`` was called
+    with its default math-exclusion mask on, which treats a bare ``$`` as
+    the start of a math region to protect. A title/caption field is never
+    rendered through real LaTeX math at all -- a bare ``$`` here is just a
+    literal dollar sign that ``_escape_latex`` prints correctly (see
+    ``validate_plain_title``'s own docstring) -- so an unterminated
+    ``$...`` (e.g. "Cost $5 **discount**") wrongly "protected" every
+    character after it, hiding a real violation. The backslash check above
+    already guarantees ``value`` has no backslash by the time this call is
+    reached, so there is nothing left for the math mask to legitimately
+    protect anyway (no ``\\(``, ``\\[``, ``\\verb``, ``\\texttt{}`` can
+    appear); passing ``apply_literal_math_mask=False`` makes that explicit.
     """
     if not value:
         return
@@ -232,7 +247,9 @@ def _reject_plain_text_markup(value: Optional[str], source: str, field_label: st
             f"{source} {field_label} {value!r} contains a LaTeX command (backslash), which "
             f"renders as literal text, not a LaTeX command -- {field_label} must be plain text."
         )
-    candidates = find_markdown_emphasis_matches(value.replace("\r\n", "\n"))
+    candidates = find_markdown_emphasis_matches(
+        value.replace("\r\n", "\n"), apply_literal_math_mask=False
+    )
     if candidates:
         sample = candidates[0]
         raise ValueError(
@@ -383,8 +400,25 @@ class MarkdownEmphasisMatch:
 
 
 _EMPHASIS_MARKERS = ("**", "__")
+_MARKER_RUN_CHARS = ("*", "_")
 _VERB_COMMAND = "\\verb"
 _TEXTT_COMMAND_OPEN = "\\texttt{"
+# A backslash-escaped occurrence of one of these characters renders as that
+# literal character, not as the syntax it would otherwise trigger --
+# `\$` is a literal dollar sign, never the start of math; `\{`/`\}` are
+# literal braces, never a LaTeX group delimiter; `\\` is a literal
+# backslash. Round-2 review finding: `_literal_or_math_mask` used to treat
+# every bare `$`/`{`/`}` as live syntax regardless of a preceding escaping
+# backslash, so "The price is \\$5 and **important**." mistook `\$` for
+# the start of unterminated math and excluded everything after it, and
+# "\\texttt{\\{} then **bold**." mistook the escaped `\{` for a second,
+# unmatched group-open inside the \texttt{} argument and excluded the rest
+# of the line along with it.
+_ESCAPED_LITERAL_CHARS = ("$", "{", "}", "\\")
+
+
+def _is_escaped_literal(text: str, index: int, length: int) -> bool:
+    return text[index] == "\\" and index + 1 < length and text[index + 1] in _ESCAPED_LITERAL_CHARS
 
 
 def _literal_or_math_mask(text: str) -> List[bool]:
@@ -407,6 +441,11 @@ def _literal_or_math_mask(text: str) -> List[bool]:
       code/identifier-like text, so a doubled-underscore run inside it
       (``\\texttt{__init__}``) is the author explicitly marking it
       literal/monospace, not writing Markdown bold.
+
+    A backslash-escaped ``$``/``{``/``}``/``\\`` (see
+    ``_is_escaped_literal``) is consumed as a literal pair everywhere
+    below, before it ever reaches the ``$`` toggle or the ``\\texttt{}``
+    brace-depth counter -- round-2 review fix (see ``_ESCAPED_LITERAL_CHARS``).
     """
     length = len(text)
     mask = [False] * length
@@ -427,6 +466,9 @@ def _literal_or_math_mask(text: str) -> List[bool]:
             depth = 1
             i = index + len(_TEXTT_COMMAND_OPEN)
             while i < length and depth > 0:
+                if _is_escaped_literal(text, i, length):
+                    i += 2
+                    continue
                 if text[i] == "{":
                     depth += 1
                 elif text[i] == "}":
@@ -446,6 +488,11 @@ def _literal_or_math_mask(text: str) -> List[bool]:
             in_math = False
             index += 2
             continue
+        if _is_escaped_literal(text, index, length):
+            if in_math:
+                mask[index] = mask[index + 1] = True
+            index += 2
+            continue
         if char == "$":
             if index + 1 < length and text[index + 1] == "$":
                 mask[index] = mask[index + 1] = True
@@ -460,6 +507,37 @@ def _literal_or_math_mask(text: str) -> List[bool]:
             mask[index] = True
         index += 1
     return mask
+
+
+def _has_balanced_braces(inner: str) -> bool:
+    """Whether wrapping ``inner`` in ``\\textbf{...}`` keeps the enclosing
+    LaTeX group structure well-formed.
+
+    Round-2 review repro: "**text { brace**" has inner text "text { brace"
+    -- one naked, unescaped '{' with no matching '}'. Converting it to
+    "\\textbf{text { brace}" leaves two opens and one close, a brace
+    imbalance the composer only catches later (as a confusing "unclosed
+    environment" error far from the actual cause). A backslash-escaped
+    ``\\{``/``\\}`` is a literal brace, not a group delimiter, and does not
+    count (same convention as ``_literal_or_math_mask``'s ``\\texttt{}``
+    depth counter).
+    """
+    depth = 0
+    index = 0
+    length = len(inner)
+    while index < length:
+        char = inner[index]
+        if char == "\\" and index + 1 < length:
+            index += 2
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+        index += 1
+    return depth == 0
 
 
 def _classify_pair(
@@ -483,6 +561,11 @@ def _classify_pair(
         return MarkdownEmphasisMatch(
             line_number, marker, open_idx, end, inner, True,
             "crosses a Markdown table cell boundary ('|')",
+        )
+    if not _has_balanced_braces(inner):
+        return MarkdownEmphasisMatch(
+            line_number, marker, open_idx, end, inner, True,
+            "contains an unbalanced brace ('{' or '}') and is not safe to wrap in \\textbf{...}",
         )
     return MarkdownEmphasisMatch(line_number, marker, open_idx, end, inner, False)
 
@@ -570,7 +653,9 @@ def _flag_cross_marker_overlaps(line_matches: List[MarkdownEmphasisMatch]) -> No
                 second.reason = second.reason or reason
 
 
-def find_markdown_emphasis_matches(text: str) -> List[MarkdownEmphasisMatch]:
+def find_markdown_emphasis_matches(
+    text: str, *, apply_literal_math_mask: bool = True
+) -> List[MarkdownEmphasisMatch]:
     """Find every ``**bold**``/``__bold__``-shaped span in ``text``,
     classifying each as safe to mechanically convert to ``\\textbf{...}`` or
     ambiguous (needs a human/model rewrite via block repair instead).
@@ -582,7 +667,9 @@ def find_markdown_emphasis_matches(text: str) -> List[MarkdownEmphasisMatch]:
     - A delimiter starting inside math (tracked across the whole string,
       not per line), inside ``\\verb<delim>...<delim>``, or inside a
       ``\\texttt{...}`` argument is never considered at all (see
-      ``_literal_or_math_mask``).
+      ``_literal_or_math_mask``) -- unless ``apply_literal_math_mask`` is
+      False, which skips that mask entirely (see its own docstring note
+      below).
     - An occurrence immediately preceded by an alphanumeric character,
       with nothing already pending to close, is excluded *before*
       pairing -- this is what lets "x**2" sit next to a real
@@ -591,6 +678,19 @@ def find_markdown_emphasis_matches(text: str) -> List[MarkdownEmphasisMatch]:
       side is checked, not the closing side -- the latter would wrongly
       reject languages that attach grammar directly after a closing
       marker with no space).
+    - A maximal run of 3+ of the same marker character (``***bold***``,
+      a compound bold+italic marker this project's Markdown subset does
+      not support) is never treated as an ordinary 2-char marker at all --
+      round-2 review repro: the old 2-char-window scan read "***bold***"
+      as "**" + "*bold" + "**" + "*", converting it to
+      "\\textbf{*bold}*" and leaving a stray asterisk. Each such run is
+      reported directly as its own ambiguous match instead (see the
+      run-scanning loop below); a run of exactly 2 is the ordinary marker,
+      a run of 1 is not a marker this project recognizes at all.
+    - A matched pair whose inner text has an unbalanced brace is ambiguous
+      too (see ``_classify_pair``/``_has_balanced_braces``) -- round-2
+      review repro: "**text { brace**" converted to
+      "\\textbf{text { brace}", a brace-imbalanced result.
     - Spans never cross a line break or a raw (non-math) '|' -- the
       latter is what keeps a forgotten closing '**' in one Markdown table
       cell from swallowing the next cell's content into one (wrong) bold
@@ -599,27 +699,52 @@ def find_markdown_emphasis_matches(text: str) -> List[MarkdownEmphasisMatch]:
       same marker can never nest in itself; a different-marker span that
       overlaps at all -- nested or merely crossing -- is ambiguous, never
       independently converted (see ``_flag_cross_marker_overlaps``).
+
+    ``apply_literal_math_mask=False`` is for a plain-text field (title/
+    caption) that is never rendered through real LaTeX math at all -- see
+    ``_reject_plain_text_markup`` -- where applying the math mask would be
+    wrong, not merely unnecessary: a bare ``$`` there is just a literal
+    dollar sign, not the start of something to protect.
     """
-    excluded = _literal_or_math_mask(text)
+    excluded = _literal_or_math_mask(text) if apply_literal_math_mask else [False] * len(text)
     matches: List[MarkdownEmphasisMatch] = []
     offset = 0
     for line_number, line in enumerate(text.split("\n"), start=1):
         length = len(line)
 
         occurrences_by_marker: Dict[str, List[int]] = {marker: [] for marker in _EMPHASIS_MARKERS}
+        line_matches: List[MarkdownEmphasisMatch] = []
         index = 0
-        while index < length - 1:
-            if line[index] == "\\":
+        while index < length:
+            char = line[index]
+            if char == "\\":
                 index += 2
                 continue
-            two = line[index : index + 2]
-            if two in occurrences_by_marker and not excluded[offset + index]:
-                occurrences_by_marker[two].append(index)
-                index += 2
+            if char in _MARKER_RUN_CHARS and not excluded[offset + index]:
+                run_start = index
+                while (
+                    index < length
+                    and line[index] == char
+                    and not excluded[offset + index]
+                ):
+                    index += 1
+                run_length = index - run_start
+                if run_length == 2:
+                    occurrences_by_marker[char * 2].append(run_start)
+                elif run_length >= 3:
+                    run_text = line[run_start:index]
+                    line_matches.append(
+                        MarkdownEmphasisMatch(
+                            line_number, char * 2, run_start, index, run_text, True,
+                            f"compound emphasis marker run ('{run_text}') is not "
+                            "safely convertible",
+                        )
+                    )
+                # run_length == 1: a lone '*'/'_' is not one of this
+                # project's two supported markers at all -- ignored.
                 continue
             index += 1
 
-        line_matches: List[MarkdownEmphasisMatch] = []
         for marker, occurrences in occurrences_by_marker.items():
             line_matches.extend(_find_matches_for_marker(line, marker, occurrences, line_number))
 
@@ -629,7 +754,12 @@ def find_markdown_emphasis_matches(text: str) -> List[MarkdownEmphasisMatch]:
     return matches
 
 
-def convert_markdown_emphasis(content: str, block_id: Optional[str] = None) -> "tuple[str, List[str]]":
+def convert_markdown_emphasis(
+    content: str,
+    block_id: Optional[str] = None,
+    *,
+    matches: Optional[List[MarkdownEmphasisMatch]] = None,
+) -> "tuple[str, List[str]]":
     """Convert every SAFE ``**bold**``/``__bold__`` span in ``content`` to
     ``\\textbf{...}`` in place; return the (possibly modified) content plus
     one description per AMBIGUOUS span left untouched, each naming its
@@ -644,19 +774,30 @@ def convert_markdown_emphasis(content: str, block_id: Optional[str] = None) -> "
     Pure -- never call this and then discard the possibility that nothing
     changed; the caller decides what to do with the returned content
     (persist it) and is responsible for recording that decision (see
-    ``TextAgent._persist_markdown_emphasis_conversion``). This function
-    itself has no side effects.
+    ``persist_markdown_emphasis_pass``). This function itself has no side
+    effects.
+
+    ``matches`` lets a caller that already ran ``find_markdown_emphasis_
+    matches`` on this exact (newline-normalized) text -- e.g. to measure
+    and persist that call's own latency/counts -- pass the result straight
+    through instead of paying for the scan twice.
     """
     text = content.replace("\r\n", "\n")
     lines = text.split("\n")
-    matches = find_markdown_emphasis_matches(text)
+    if matches is None:
+        matches = find_markdown_emphasis_matches(text)
 
     safe_by_line: Dict[int, List[MarkdownEmphasisMatch]] = {}
     violations: List[str] = []
     for match in matches:
         if match.ambiguous:
             location = f"block '{block_id}'" if block_id else "block"
-            raw = f"{match.marker}{match.inner}{match.marker}"
+            # The exact source substring, not marker+inner+marker
+            # reconstructed -- for a compound marker run (e.g. "***bold***")
+            # `inner` already IS the whole flagged run, so re-wrapping it in
+            # `marker` on both sides would double it into a garbled
+            # "*******"-style display.
+            raw = lines[match.line_number - 1][match.start : match.end]
             violations.append(f"{location}, line {match.line_number}: {raw!r} {match.reason}")
         else:
             safe_by_line.setdefault(match.line_number, []).append(match)
@@ -668,6 +809,87 @@ def convert_markdown_emphasis(content: str, block_id: Optional[str] = None) -> "
         lines[line_number - 1] = line
 
     return "\n".join(lines), violations
+
+
+# Bumped whenever find_markdown_emphasis_matches/convert_markdown_emphasis's
+# detection or safety rules change, so a persisted
+# markdown_emphasis_conversion_*.json record (see
+# persist_markdown_emphasis_pass) stays attributable to the exact algorithm
+# that produced it even after the rules move on:
+#   1 -- initial Stage 1 implementation (symmetric alnum-adjacency check on
+#        both sides of a pair, blind sequential pairing, per-line math
+#        reset).
+#   2 -- round-1 review fixes: 1-deep stack pairing, asymmetric
+#        (opening-side-only) alnum check, whole-text literal/math mask
+#        covering \verb and \texttt{} and multi-line math, cross-marker
+#        overlap always ambiguous.
+#   3 -- round-2 review fixes: escape-aware literal/math mask (\$, \{, \},
+#        \\), plain title/caption fields skip the math mask entirely,
+#        compound marker runs (***bold***) and unbalanced-brace spans are
+#        never auto-converted, and the pure per-block check fails on ANY
+#        remaining match (not only ambiguous ones).
+MARKDOWN_EMPHASIS_RULE_VERSION = 3
+
+
+def persist_markdown_emphasis_pass(
+    sections_dir: Path,
+    node_id: str,
+    *,
+    phase: str,
+    block_id: Optional[str],
+    original_content: Optional[str],
+    converted_content: Optional[str],
+    safe_count: int,
+    ambiguous_count: int,
+    latency_s: float,
+) -> None:
+    """Persist one provenance record for one markdown_emphasis check/convert
+    pass over one block's field, whatever the outcome.
+
+    Round-2 review finding: the original version of this record was only
+    written when ``converted_content`` differed from ``original_content``,
+    so three kinds of real cost went completely unrecorded -- a block with
+    nothing to convert, a block whose emphasis is entirely ambiguous (so
+    content never changes even though the check still ran and still
+    failed), and the composer's own pre-assembly residual check (``phase=
+    "assembler_residual_check"``/``"assembler_figure_caption_check"``,
+    called from ``LatexAssembler``). A record is written here every time,
+    regardless of whether anything changed or any violation was found;
+    ``converted_content`` stays ``None`` when nothing was (or could be)
+    converted. ``rule_version`` stamps ``MARKDOWN_EMPHASIS_RULE_VERSION``
+    so a historical record is always attributable to the detection/safety
+    rules that produced it. File naming uses its own, separately-scanned
+    sequence shared by every phase that calls this for the same
+    ``node_id`` -- the same convention ``TextAgent._persist_failed_attempt``/
+    ``_snapshot_before_overwrite`` use.
+    """
+    existing = list(sections_dir.glob(f"{node_id}.markdown_emphasis_conversion_*.json"))
+    next_index = len(existing) + 1
+    diff = ""
+    if converted_content is not None and original_content is not None:
+        diff = "\n".join(
+            difflib.unified_diff(
+                original_content.splitlines(),
+                converted_content.splitlines(),
+                fromfile="original",
+                tofile="converted",
+                lineterm="",
+            )
+        )
+    record = {
+        "node_id": node_id,
+        "block_id": block_id,
+        "phase": phase,
+        "rule_version": MARKDOWN_EMPHASIS_RULE_VERSION,
+        "original_content": original_content,
+        "converted_content": converted_content,
+        "diff": diff,
+        "safe_match_count": safe_count,
+        "ambiguous_match_count": ambiguous_count,
+        "transform_latency_s": latency_s,
+    }
+    path = sections_dir / f"{node_id}.markdown_emphasis_conversion_{next_index}.json"
+    path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _paired_pipe_indices(row: str, spans: List["tuple[int, int]"]) -> "set[int]":
@@ -1277,12 +1499,16 @@ class LatexAssembler:
             rendered.append(self._render_semantic_block(layout_block, content_block))
 
             for figure_id in figure_after.pop(layout_block.id, []):
-                rendered.append(self._render_figure(figure_id, layout.section_id, blueprint, graph))
+                rendered.append(
+                    self._render_figure(figure_id, layout.section_id, blueprint, graph, sections_dir)
+                )
 
         # Slots without an explicit anchor belong at the end of their owner section.
         for figure_ids in figure_after.values():
             for figure_id in figure_ids:
-                rendered.append(self._render_figure(figure_id, layout.section_id, blueprint, graph))
+                rendered.append(
+                    self._render_figure(figure_id, layout.section_id, blueprint, graph, sections_dir)
+                )
 
         if blueprint.layout_policy.get("insert_float_barrier_after_section", False):
             rendered.append(r"\FloatBarrier")
@@ -1351,6 +1577,15 @@ class LatexAssembler:
         blocks: Sequence[ContentBlock],
         blocks_path: Path,
     ) -> None:
+        # blocks_path is always "<sections_dir>/<section_id>.blocks.json"
+        # (see _read_semantic_blocks) -- derived here instead of adding a
+        # separate parameter, so _validate_fragment's residual check below
+        # can persist its own cost/provenance record (phase=
+        # "assembler_residual_check") into the exact same sections_dir the
+        # real generation path's own markdown_emphasis_conversion_*.json
+        # records already live in, under the same node_id (section_id).
+        sections_dir = blocks_path.parent
+        node_id = layout.section_id
         expected_ids = [block.id for block in layout.blocks]
         actual_ids = [block.block_id for block in blocks]
         if actual_ids != expected_ids:
@@ -1379,7 +1614,7 @@ class LatexAssembler:
                     f"Only figure-reference blocks may declare asset_id; "
                     f"block '{layout_block.id}' is '{layout_block.kind.value}'."
                 )
-            self._validate_fragment(content_block)
+            self._validate_fragment(content_block, sections_dir, node_id)
 
     @staticmethod
     def _figures_by_anchor(
@@ -1481,8 +1716,24 @@ class LatexAssembler:
             SemanticBlockType.COMPARISON: "Comparison",
         }.get(block_type, "Details")
 
-    def _validate_fragment(self, block: ContentBlock) -> None:
-        """Reject LaTeX that would escape the semantic-block rendering boundary."""
+    def _validate_fragment(
+        self,
+        block: ContentBlock,
+        sections_dir: Optional[Path] = None,
+        node_id: Optional[str] = None,
+    ) -> None:
+        """Reject LaTeX that would escape the semantic-block rendering boundary.
+
+        ``sections_dir``/``node_id`` are optional (default ``None``, same
+        convention as ``event_logger`` elsewhere in this class) -- a direct
+        unit-test caller that only wants the raise/no-raise behavior can
+        still call ``_validate_fragment(block)`` with no change; the real
+        ``_validate_semantic_blocks`` call site always supplies both, so the
+        residual check's own cost is persisted (``phase=
+        "assembler_residual_check"``) on the real composer path -- round-2
+        review finding: this check's latency went completely unrecorded
+        before, unlike TextAgent's generation-time conversion pass.
+        """
         content = block.content.replace("\r\n", "\n")
         if self.enabled_validators.get("forbidden_environment", True):
             content = validate_fragment_environments(block.type, block.content, block.block_id)
@@ -1494,23 +1745,45 @@ class LatexAssembler:
         ):
             validate_markdown_table_columns(content, block.block_id)
         if self.enabled_validators.get("markdown_emphasis", True):
+            start = time.perf_counter()
             residual = find_markdown_emphasis_matches(content)
-            if residual:
-                sample = residual[0]
-                raise ValueError(
-                    f"Block '{block.block_id}' line {sample.line_number} still contains "
-                    f"Markdown emphasis syntax ('{sample.marker}{sample.inner}{sample.marker}') "
-                    "-- TextAgent's own markdown_emphasis check should have converted or "
-                    "rejected this before the artifact reached the composer; converting it "
-                    "here instead would make the stored artifact and the rendered PDF "
-                    "disagree about this block's content."
-                )
-            # title/caption are rendered through _escape_latex only (never
-            # through LaTeX), so the same residual-check discipline applies
-            # to the exact fields _render_semantic_block/_render_table
-            # actually use for final output, not only to `content`.
-            validate_plain_title(block.title, f"Block '{block.block_id}'")
-            validate_plain_caption(block.caption, f"Block '{block.block_id}'")
+            safe_count = sum(1 for m in residual if not m.ambiguous)
+            ambiguous_count = len(residual) - safe_count
+            try:
+                if residual:
+                    sample = residual[0]
+                    raise ValueError(
+                        f"Block '{block.block_id}' line {sample.line_number} still contains "
+                        f"Markdown emphasis syntax ('{sample.marker}{sample.inner}{sample.marker}') "
+                        "-- TextAgent's own markdown_emphasis check should have converted or "
+                        "rejected this before the artifact reached the composer; converting it "
+                        "here instead would make the stored artifact and the rendered PDF "
+                        "disagree about this block's content."
+                    )
+                # title/caption are rendered through _escape_latex only
+                # (never through LaTeX), so the same residual-check
+                # discipline applies to the exact fields
+                # _render_semantic_block/_render_table actually use for
+                # final output, not only to `content`. Their own
+                # find_markdown_emphasis_matches cost is folded into this
+                # same latency window/record rather than persisting a
+                # third and fourth record per block for two short strings.
+                validate_plain_title(block.title, f"Block '{block.block_id}'")
+                validate_plain_caption(block.caption, f"Block '{block.block_id}'")
+            finally:
+                latency_s = time.perf_counter() - start
+                if sections_dir is not None and node_id is not None:
+                    persist_markdown_emphasis_pass(
+                        sections_dir,
+                        node_id,
+                        phase="assembler_residual_check",
+                        block_id=block.block_id,
+                        original_content=content,
+                        converted_content=None,
+                        safe_count=safe_count,
+                        ambiguous_count=ambiguous_count,
+                        latency_s=latency_s,
+                    )
         for label_match in LABEL_TOKEN.finditer(content):
             self._validate_label(label_match.group("label"), f"block '{block.block_id}'")
 
@@ -1863,6 +2136,7 @@ class LatexAssembler:
         section_id: str,
         blueprint: DocumentBlueprint,
         graph: DocumentGraph,
+        sections_dir: Optional[Path] = None,
     ) -> str:
         placement = blueprint.figure_slots[figure_id]
         entry = graph.figure_registry.get(figure_id)
@@ -1883,7 +2157,33 @@ class LatexAssembler:
             # _escape_latex as a block's own caption -- so it needs the same
             # rejection, not just ContentBlock.caption (see
             # validate_plain_caption/_validate_fragment above).
-            validate_plain_caption(raw_caption, f"Figure '{figure_id}'")
+            # `sections_dir` is optional (default None, same convention as
+            # _validate_fragment) -- a direct unit-test caller skips
+            # persistence; the real _render_section call site always
+            # supplies it, so this check's cost is recorded too (round-2
+            # review finding -- see persist_markdown_emphasis_pass).
+            start = time.perf_counter()
+            residual = find_markdown_emphasis_matches(
+                raw_caption.replace("\r\n", "\n"), apply_literal_math_mask=False
+            )
+            safe_count = sum(1 for m in residual if not m.ambiguous)
+            ambiguous_count = len(residual) - safe_count
+            try:
+                validate_plain_caption(raw_caption, f"Figure '{figure_id}'")
+            finally:
+                latency_s = time.perf_counter() - start
+                if sections_dir is not None:
+                    persist_markdown_emphasis_pass(
+                        sections_dir,
+                        section_id,
+                        phase="assembler_figure_caption_check",
+                        block_id=figure_id,
+                        original_content=raw_caption,
+                        converted_content=None,
+                        safe_count=safe_count,
+                        ambiguous_count=ambiguous_count,
+                        latency_s=latency_s,
+                    )
         caption = self._escape_latex(raw_caption or figure_id)
         label = self._safe_label(
             entry.label or placement.label or f"fig:{figure_id}",

@@ -5,11 +5,14 @@ Covers, in order: the shared detector/converter (``find_markdown_emphasis_
 matches``/``convert_markdown_emphasis``) in isolation, including the round-1
 review fixes (nested-span corruption, code-disrupts-later-bold, Korean
 particles glued to a closing marker, ``\\verb``/``\\texttt{}``/multi-line
-math preservation); TextAgent's pure (non-mutating) ``_validate_one_block``
-check plus the explicit, separately-provenanced conversion step in
-``_validate_blocks_against_layout``; LatexAssembler's composer-side residual
-check (content AND title/caption, plus a figure's own caption); and one real
-end-to-end compile through tectonic.
+math preservation) AND the round-2 review fixes (escape-aware literal/math
+mask, plain title/caption fields skipping the math mask entirely, compound
+marker runs, unbalanced-brace safety); TextAgent's pure (non-mutating)
+``_validate_one_block`` check -- which now fails on ANY remaining match, not
+only ambiguous ones -- plus the explicit, always-provenanced conversion step
+in ``_validate_blocks_against_layout``; LatexAssembler's composer-side
+residual check (content AND title/caption, plus a figure's own caption),
+now also provenanced; and one real end-to-end compile through tectonic.
 """
 
 from __future__ import annotations
@@ -38,9 +41,11 @@ from src.common.state import (
 )
 
 from src.agents.latex_assembler import (
+    MARKDOWN_EMPHASIS_RULE_VERSION,
     LatexAssembler,
     convert_markdown_emphasis,
     find_markdown_emphasis_matches,
+    validate_plain_caption,
 )
 from src.agents.latex_compiler import LatexCompiler
 from src.agents.text_agent import TextAgent
@@ -159,6 +164,62 @@ class FindMarkdownEmphasisMatchesTest(unittest.TestCase):
         matches = find_markdown_emphasis_matches("**중요**합니다.")
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0].inner, "중요")
+        self.assertFalse(matches[0].ambiguous)
+
+    def test_escaped_dollar_does_not_start_a_math_exclusion(self) -> None:
+        # Round-2 review finding: _literal_or_math_mask used to treat a
+        # backslash-escaped dollar sign ("\$") the same as a bare,
+        # math-opening "$" -- so this input's "$" toggled math on with no
+        # closing "$" ever found, excluding "**important**" from being
+        # scanned at all.
+        matches = find_markdown_emphasis_matches("The price is \\$5 and **important**.")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].inner, "important")
+        self.assertFalse(matches[0].ambiguous)
+
+    def test_escaped_brace_inside_texttt_does_not_extend_the_literal_span(self) -> None:
+        # Round-2 review finding: the \texttt{} brace-depth counter used to
+        # treat an escaped "\{" the same as a real, unescaped group-open,
+        # so "\texttt{\{}" (whose real closing brace is the very next
+        # character) never found a second real "}" and masked the rest of
+        # the line, including the following "**bold**", as if it were
+        # still inside the \texttt{} argument.
+        matches = find_markdown_emphasis_matches(r"\texttt{\{} then **bold**.")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].inner, "bold")
+        self.assertFalse(matches[0].ambiguous)
+
+    def test_compound_triple_marker_run_is_ambiguous_not_misread(self) -> None:
+        # Round-2 review finding: a naive 2-char-window scan read
+        # "***bold***" as "**" + "*bold" + "**" + "*", which _classify_pair
+        # called SAFE (no leading/trailing whitespace, no pipe) and
+        # convert_markdown_emphasis then turned into "\textbf{*bold}*" --
+        # a stray asterisk left over from a marker run this project's
+        # Markdown subset does not support at all. A run of 3+ of the same
+        # marker character is never treated as an ordinary 2-char marker.
+        matches = find_markdown_emphasis_matches("***bold***")
+        self.assertEqual(len(matches), 2)
+        self.assertTrue(all(m.ambiguous for m in matches))
+        self.assertTrue(all("compound" in m.reason for m in matches))
+
+    def test_quadruple_marker_run_is_also_ambiguous(self) -> None:
+        matches = find_markdown_emphasis_matches("****very bold****")
+        self.assertTrue(all(m.ambiguous for m in matches))
+
+    def test_unbalanced_brace_inside_a_pair_is_ambiguous(self) -> None:
+        # Round-2 review finding: "**text { brace**" has inner text
+        # "text { brace" -- one naked, unmatched "{". Converting it to
+        # "\textbf{text { brace}" leaves two opens and one close, a brace
+        # imbalance the composer only caught much later, far from the
+        # actual cause.
+        matches = find_markdown_emphasis_matches("**text { brace**")
+        self.assertEqual(len(matches), 1)
+        self.assertTrue(matches[0].ambiguous)
+        self.assertIn("unbalanced brace", matches[0].reason)
+
+    def test_balanced_brace_inside_a_pair_still_converts(self) -> None:
+        matches = find_markdown_emphasis_matches("**a set {x, y}**")
+        self.assertEqual(len(matches), 1)
         self.assertFalse(matches[0].ambiguous)
 
     def test_bold_table_cell_is_found_and_safe(self) -> None:
@@ -303,6 +364,39 @@ class ConvertMarkdownEmphasisTest(unittest.TestCase):
         self.assertEqual(converted, text)
         self.assertEqual(violations, [])
 
+    def test_escaped_dollar_does_not_block_later_conversion(self) -> None:
+        text = "The price is \\$5 and **important**."
+        converted, violations = convert_markdown_emphasis(text)
+        self.assertEqual(converted, "The price is \\$5 and \\textbf{important}.")
+        self.assertEqual(violations, [])
+
+    def test_escaped_brace_in_texttt_does_not_block_later_conversion(self) -> None:
+        text = r"\texttt{\{} then **bold**."
+        converted, violations = convert_markdown_emphasis(text)
+        self.assertEqual(converted, r"\texttt{\{} then \textbf{bold}.")
+        self.assertEqual(violations, [])
+
+    def test_compound_marker_run_is_never_auto_converted(self) -> None:
+        original = "***bold***"
+        converted, violations = convert_markdown_emphasis(original, block_id="b1")
+        self.assertEqual(converted, original)
+        self.assertEqual(len(violations), 2)
+
+    def test_unbalanced_brace_span_is_never_auto_converted(self) -> None:
+        original = "**text { brace**"
+        converted, violations = convert_markdown_emphasis(original, block_id="b1")
+        self.assertEqual(converted, original)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("unbalanced brace", violations[0])
+
+    def test_violation_message_shows_the_exact_source_substring(self) -> None:
+        # The violation string must reconstruct the real source text, not
+        # double-wrap a compound run's already-complete `inner` in
+        # `marker` on both sides again (which used to garble "***bold***"'s
+        # own violation message into something like "'*******'").
+        _, violations = convert_markdown_emphasis("***bold***", block_id="b1")
+        self.assertTrue(any("'***'" in v for v in violations))
+
     def test_conversion_is_idempotent(self) -> None:
         text = "**One** and __two__ and an **unterminated marker."
         once, violations_once = convert_markdown_emphasis(text)
@@ -316,24 +410,44 @@ class TextAgentMarkdownEmphasisValidatorTest(unittest.TestCase):
     read-only check (round-1 review finding: it used to mutate
     content_block.content as a side effect, which corrupted
     TextAgentValidatorAdapter's verdicts -- see test/core/test_adapters.py's
-    adapter-purity test for that half of the fix). The actual conversion is
-    tested separately below, against _validate_blocks_against_layout, the
-    real generation path's own explicit normalization step."""
+    adapter-purity test for that half of the fix) that fails on ANY
+    remaining match, safe or ambiguous (round-2 review finding: it used to
+    only fail on AMBIGUOUS matches, so a direct caller that skips the real
+    generation path's conversion step entirely -- exactly what the adapter
+    does -- got a PASS for a stored artifact that still literally
+    contained "**important**"; being theoretically convertible is not the
+    same as the artifact, as it actually exists right now, satisfying the
+    rule). The actual conversion is tested separately below, against
+    _validate_blocks_against_layout, the real generation path's own
+    explicit normalization step."""
 
     @staticmethod
     def _layout_block(kind: LayoutBlockKind = LayoutBlockKind.PARAGRAPH) -> LayoutBlock:
         return LayoutBlock(id="b1", kind=kind)
 
-    def test_safe_emphasis_passes_without_mutating_content(self) -> None:
+    def test_unconverted_safe_emphasis_still_fails_the_pure_check(self) -> None:
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        layout_block = self._layout_block()
+        original = "This is **important**."
+        content_block = ContentBlock(block_id="b1", type=SemanticBlockType.PARAGRAPH, content=original)
+        errors = agent._validate_one_block(content_block, layout_block)
+        codes = [e.code for e in errors]
+        self.assertIn("markdown_emphasis", codes)
+        self.assertEqual(content_block.content, original)
+
+    def test_already_converted_content_passes(self) -> None:
+        # The flip side of the case above: this must not become an
+        # unconditional fail. Content with no remaining "**"/"__"
+        # delimiter at all -- already converted, or always plain -- still
+        # passes.
         agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
         layout_block = self._layout_block()
         content_block = ContentBlock(
-            block_id="b1", type=SemanticBlockType.PARAGRAPH, content="This is **important**."
+            block_id="b1", type=SemanticBlockType.PARAGRAPH, content=r"This is \textbf{important}."
         )
         errors = agent._validate_one_block(content_block, layout_block)
         codes = [e.code for e in errors]
         self.assertNotIn("markdown_emphasis", codes)
-        self.assertEqual(content_block.content, "This is **important**.")
 
     def test_ambiguous_emphasis_raises_markdown_emphasis_error_without_mutating(self) -> None:
         agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
@@ -392,6 +506,23 @@ class TextAgentMarkdownEmphasisValidatorTest(unittest.TestCase):
         self.assertNotIn("plain_title", codes)
         self.assertNotIn("plain_caption", codes)
 
+    def test_caption_with_bare_dollar_and_markdown_emphasis_is_still_rejected(self) -> None:
+        # Round-2 review finding: validate_plain_caption used to apply the
+        # math-exclusion mask, so an unterminated bare "$" in a caption
+        # (never real math -- caption is rendered through _escape_latex
+        # only) wrongly "protected" everything after it, including a real
+        # "**discount**" violation, letting the whole caption through.
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        layout_block = self._layout_block(LayoutBlockKind.TABLE)
+        content_block = ContentBlock(
+            block_id="b1", type=SemanticBlockType.TABLE,
+            content="| A | B |\n| --- | --- |\n| 1 | 2 |",
+            caption="Cost $5 **discount**",
+        )
+        errors = agent._validate_one_block(content_block, layout_block)
+        codes = [e.code for e in errors]
+        self.assertIn("plain_caption", codes)
+
 
 class ValidateBlocksAgainstLayoutConversionTest(unittest.TestCase):
     """The real generation path's explicit, separately-provenanced
@@ -419,18 +550,58 @@ class ValidateBlocksAgainstLayoutConversionTest(unittest.TestCase):
             self.assertEqual(len(provenance_files), 1)
             record = json.loads(provenance_files[0].read_text(encoding="utf-8"))
             self.assertEqual(record["block_id"], "b1")
+            self.assertEqual(record["phase"], "generation")
+            self.assertEqual(record["rule_version"], MARKDOWN_EMPHASIS_RULE_VERSION)
             self.assertEqual(record["original_content"], "This is **important**.")
             self.assertEqual(record["converted_content"], r"This is \textbf{important}.")
             self.assertIn("textbf", record["diff"])
+            self.assertEqual(record["safe_match_count"], 1)
+            self.assertEqual(record["ambiguous_match_count"], 0)
             self.assertGreaterEqual(record["transform_latency_s"], 0.0)
 
-    def test_no_provenance_file_when_nothing_was_converted(self) -> None:
+    def test_provenance_is_persisted_even_when_nothing_needed_converting(self) -> None:
+        # Round-2 review finding: a record used to exist only when
+        # converted != original, so a block with no Markdown emphasis at
+        # all -- the common case -- left no record that its check had
+        # ever run: no latency, no rule_version, nothing. The check/convert
+        # pass is persisted every time now; converted_content stays None
+        # when there was nothing to change.
         agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
         with tempfile.TemporaryDirectory() as tmp:
             sections_dir = Path(tmp)
             raw_blocks = [{"block_id": "b1", "type": "paragraph", "content": "Plain content."}]
             agent._validate_blocks_against_layout(raw_blocks, self._layout_blocks(), sections_dir, "sec1")
-            self.assertEqual(list(sections_dir.glob("sec1.markdown_emphasis_conversion_*.json")), [])
+
+            provenance_files = list(sections_dir.glob("sec1.markdown_emphasis_conversion_*.json"))
+            self.assertEqual(len(provenance_files), 1)
+            record = json.loads(provenance_files[0].read_text(encoding="utf-8"))
+            self.assertIsNone(record["converted_content"])
+            self.assertEqual(record["safe_match_count"], 0)
+            self.assertEqual(record["ambiguous_match_count"], 0)
+            self.assertGreaterEqual(record["transform_latency_s"], 0.0)
+
+    def test_provenance_is_persisted_for_an_all_ambiguous_block_even_though_it_then_fails(self) -> None:
+        # The other previously-unrecorded gap: a block whose Markdown
+        # emphasis is entirely ambiguous never changes (converted_content
+        # stays None), but the check still ran, still cost real latency,
+        # and the block still fails validation right after -- all three
+        # facts must be recoverable from the persisted record.
+        from src.agents.text_agent import SemanticBlockErrors
+
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        with tempfile.TemporaryDirectory() as tmp:
+            sections_dir = Path(tmp)
+            raw_blocks = [
+                {"block_id": "b1", "type": "paragraph", "content": "This has an **unterminated marker."}
+            ]
+            with self.assertRaises(SemanticBlockErrors):
+                agent._validate_blocks_against_layout(raw_blocks, self._layout_blocks(), sections_dir, "sec1")
+
+            provenance_files = list(sections_dir.glob("sec1.markdown_emphasis_conversion_*.json"))
+            self.assertEqual(len(provenance_files), 1)
+            record = json.loads(provenance_files[0].read_text(encoding="utf-8"))
+            self.assertIsNone(record["converted_content"])
+            self.assertEqual(record["ambiguous_match_count"], 1)
 
 
 class LatexAssemblerMarkdownEmphasisResidualCheckTest(unittest.TestCase):
@@ -485,6 +656,44 @@ class LatexAssemblerMarkdownEmphasisResidualCheckTest(unittest.TestCase):
         )
         assembler._validate_fragment(block)  # must not raise -- gate is off
 
+    def test_residual_check_cost_is_persisted_when_sections_dir_is_given(self) -> None:
+        # Round-2 review finding: this check's own cost went completely
+        # unrecorded before -- unlike TextAgent's generation-time
+        # conversion pass. sections_dir/node_id are optional (default
+        # None, same convention as event_logger elsewhere in this class)
+        # so every other test in this class above, which calls
+        # _validate_fragment(block) with neither, is unaffected; the real
+        # _validate_semantic_blocks call site always supplies both.
+        assembler = LatexAssembler()
+        block = ContentBlock(
+            block_id="p1", type=SemanticBlockType.PARAGRAPH,
+            content=r"This is \textbf{important}.",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            sections_dir = Path(tmp)
+            assembler._validate_fragment(block, sections_dir, "sec1")
+            provenance_files = list(sections_dir.glob("sec1.markdown_emphasis_conversion_*.json"))
+            self.assertEqual(len(provenance_files), 1)
+            record = json.loads(provenance_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(record["phase"], "assembler_residual_check")
+            self.assertEqual(record["block_id"], "p1")
+            self.assertIsNone(record["converted_content"])
+            self.assertGreaterEqual(record["transform_latency_s"], 0.0)
+
+    def test_residual_check_cost_is_persisted_even_when_the_check_then_fails(self) -> None:
+        assembler = LatexAssembler()
+        block = ContentBlock(
+            block_id="p1", type=SemanticBlockType.PARAGRAPH, content="This is **important**."
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            sections_dir = Path(tmp)
+            with self.assertRaises(ValueError):
+                assembler._validate_fragment(block, sections_dir, "sec1")
+            provenance_files = list(sections_dir.glob("sec1.markdown_emphasis_conversion_*.json"))
+            self.assertEqual(len(provenance_files), 1)
+            record = json.loads(provenance_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(record["safe_match_count"], 1)
+
 
 class FigureCaptionMarkdownEmphasisTest(unittest.TestCase):
     """A figure's caption is planner-authored (FigureRegistryEntry/
@@ -524,6 +733,19 @@ class FigureCaptionMarkdownEmphasisTest(unittest.TestCase):
         assembler._rendered_labels = set()  # normally set up by assemble()
         rendered = assembler._render_figure("fig1", "sec1", blueprint, graph)
         self.assertIn("Plain caption", rendered)
+
+    def test_figure_caption_check_cost_is_persisted_when_sections_dir_is_given(self) -> None:
+        graph, blueprint = self._graph_with_figure("Plain caption")
+        assembler = LatexAssembler()
+        assembler._rendered_labels = set()
+        with tempfile.TemporaryDirectory() as tmp:
+            sections_dir = Path(tmp)
+            assembler._render_figure("fig1", "sec1", blueprint, graph, sections_dir)
+            provenance_files = list(sections_dir.glob("sec1.markdown_emphasis_conversion_*.json"))
+            self.assertEqual(len(provenance_files), 1)
+            record = json.loads(provenance_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(record["phase"], "assembler_figure_caption_check")
+            self.assertEqual(record["block_id"], "fig1")
 
 
 class ScriptedLLMClient:

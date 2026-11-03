@@ -635,16 +635,22 @@ def test_validator_adapter_markdown_emphasis_check_does_not_mutate_the_artifact(
     """Revision (Additional verifiers) Stage 1, round-1 review: an earlier
     version of TextAgent._validate_one_block's own markdown_emphasis check
     mutated content_block.content as a side effect (converting a safe
-    "**bold**" span to "\\textbf{...}" in place) -- so a PASS verdict for a
+    "**bold**" span to "\\textbf{...}" in place) -- so a verdict for a
     stored artifact version (e.g. "b1@1") was actually computed against
     DIFFERENT content than what that version's artifact_id/content really
     holds, exactly the kind of check-vs-storage desync every other check
-    in _validate_one_block already avoids. The check is pure now: it
-    reports only whether an AMBIGUOUS (not safely convertible) span
-    remains, and never touches content_block at all -- any real
-    conversion happens as its own separate, explicitly-provenanced step in
+    in _validate_one_block already avoids. The check is pure now: it never
+    touches content_block at all -- any real conversion happens as its own
+    separate, explicitly-provenanced step in
     TextAgent._validate_blocks_against_layout, which this adapter never
-    calls (it talks to _validate_one_block directly)."""
+    calls (it talks to _validate_one_block directly).
+
+    Round-2 review finding: the check must still FAIL here, even though
+    the span is safely convertible -- being convertible is not the same
+    as the stored artifact, as it actually exists right now, satisfying
+    the plain-LaTeX rule (see TextAgent._validate_one_block's own updated
+    docstring). An earlier version of this test asserted PASS for exactly
+    this input, which was the bug, not the spec."""
     text_agent = TextAgent(llm_client=MagicMock())
     adapter = TextAgentValidatorAdapter(text_agent)
     artifact = ArtifactRef(artifact_id="b1", version=1, kind=ArtifactKind.BLOCK)
@@ -658,8 +664,29 @@ def test_validator_adapter_markdown_emphasis_check_does_not_mutate_the_artifact(
     )[0]
 
     assert content_block.content == original_content
-    assert evidence.outcome == CheckOutcome.PASS
+    assert evidence.outcome == CheckOutcome.FAIL
     assert evidence.checked_artifact == artifact
+
+
+def test_validator_adapter_markdown_emphasis_check_passes_already_converted_content() -> None:
+    """The flip side of the FAIL case above: content with no remaining
+    "**"/"__" delimiter at all (already converted to \\textbf{...}, or
+    always plain) must still PASS -- the round-2 fix (FAIL on ANY match)
+    must not make this check unconditionally fail."""
+    text_agent = TextAgent(llm_client=MagicMock())
+    adapter = TextAgentValidatorAdapter(text_agent)
+    artifact = ArtifactRef(artifact_id="b1", version=1, kind=ArtifactKind.BLOCK)
+    layout_block = LayoutBlock(id="b1", kind=LayoutBlockKind.PARAGRAPH)
+    content_block = ContentBlock(
+        block_id="b1", type=SemanticBlockType.PARAGRAPH, content=r"This is \textbf{important}."
+    )
+
+    evidence = adapter.check(
+        artifact, [_constraint("markdown_emphasis")],
+        context={"content_block": content_block, "layout_block": layout_block},
+    )[0]
+
+    assert evidence.outcome == CheckOutcome.PASS
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 import json
 import time
 from pathlib import Path
@@ -16,6 +15,7 @@ from src.agents.latex_assembler import (
     convert_markdown_emphasis,
     find_markdown_emphasis_matches,
     is_markdown_table,
+    persist_markdown_emphasis_pass,
     validate_fragment_environments,
     validate_markdown_table_columns,
     validate_no_manual_labels,
@@ -1134,11 +1134,14 @@ Figures owned by this section; refer to these only when relevant:
         itself (see that method's own markdown_emphasis check), so a
         ``Validator`` wrapping ``_validate_one_block`` directly (e.g.
         ``TextAgentValidatorAdapter``) can check an artifact without ever
-        silently rewriting it. Every block whose content this pass actually
-        changes gets its original/diff/converted text and transform latency
-        persisted (``_persist_markdown_emphasis_conversion``) -- the only
-        record of that rewrite for a block that succeeds on its first
-        attempt, since ``_persist_failed_attempt`` only ever fires on failure.
+        silently rewriting it. Every block's check/convert pass -- whether
+        or not anything actually changed, whether every span is ambiguous,
+        whatever the outcome -- gets a ``persist_markdown_emphasis_pass``
+        record (``phase="generation"``): round-2 review finding, a record
+        used to exist only when content actually changed, so a block with
+        nothing to convert or a block that's entirely ambiguous left no
+        trace its check had ever run at all, unlike ``_persist_failed_
+        attempt``'s per-failed-attempt coverage of everything else.
         """
         if not isinstance(raw_blocks, list):
             raise ValueError("content_blocks must be a JSON array.")
@@ -1156,18 +1159,24 @@ Figures owned by this section; refer to these only when relevant:
             for content_block in blocks:
                 original = content_block.content
                 start = time.perf_counter()
-                converted, _ = convert_markdown_emphasis(original, content_block.block_id)
+                found = find_markdown_emphasis_matches(original)
+                converted, _ = convert_markdown_emphasis(original, content_block.block_id, matches=found)
                 latency_s = time.perf_counter() - start
-                if converted != original:
+                changed = converted != original
+                if changed:
                     content_block.content = converted
-                    self._persist_markdown_emphasis_conversion(
-                        sections_dir,
-                        node_id,
-                        block_id=content_block.block_id,
-                        original_content=original,
-                        converted_content=converted,
-                        latency_s=latency_s,
-                    )
+                safe_count = sum(1 for m in found if not m.ambiguous)
+                persist_markdown_emphasis_pass(
+                    sections_dir,
+                    node_id,
+                    phase="generation",
+                    block_id=content_block.block_id,
+                    original_content=original,
+                    converted_content=converted if changed else None,
+                    safe_count=safe_count,
+                    ambiguous_count=len(found) - safe_count,
+                    latency_s=latency_s,
+                )
 
         errors: List[SemanticBlockError] = []
         for content_block, layout_block in zip(blocks, layout_blocks):
@@ -1175,52 +1184,6 @@ Figures owned by this section; refer to these only when relevant:
         if errors:
             raise SemanticBlockErrors(blocks, errors)
         return blocks
-
-    @staticmethod
-    def _persist_markdown_emphasis_conversion(
-        sections_dir: Path,
-        node_id: str,
-        *,
-        block_id: Optional[str],
-        original_content: str,
-        converted_content: str,
-        latency_s: float,
-    ) -> None:
-        """Preserve one block's original text, a unified diff, and the
-        converted text for a Markdown-emphasis auto-conversion, plus the
-        transform's own latency.
-
-        Revision (Additional verifiers) Stage 1 / A2-A3 explicitly asks for
-        this provenance (원본·diff·변환 버전, transform latency) for every
-        conversion -- not just a failed one. ``_persist_failed_attempt``
-        already preserves rejected content, but only fires on a FAILED
-        attempt; a block whose Markdown emphasis converts cleanly on the
-        very first try (the common case) previously left no trace that it
-        had ever been rewritten at all. File naming uses its own,
-        separately-scanned sequence, the same convention
-        ``_persist_failed_attempt`` and ``_snapshot_before_overwrite`` use.
-        """
-        existing = list(sections_dir.glob(f"{node_id}.markdown_emphasis_conversion_*.json"))
-        next_index = len(existing) + 1
-        diff = "\n".join(
-            difflib.unified_diff(
-                original_content.splitlines(),
-                converted_content.splitlines(),
-                fromfile="original",
-                tofile="converted",
-                lineterm="",
-            )
-        )
-        record = {
-            "node_id": node_id,
-            "block_id": block_id,
-            "original_content": original_content,
-            "converted_content": converted_content,
-            "diff": diff,
-            "transform_latency_s": latency_s,
-        }
-        path = sections_dir / f"{node_id}.markdown_emphasis_conversion_{next_index}.json"
-        path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _validate_one_block(
         self,
@@ -1258,33 +1221,42 @@ Figures owned by this section; refer to these only when relevant:
             )
             return errors
 
-        # Read-only check: are there any AMBIGUOUS (not safely convertible)
-        # Markdown-emphasis spans left in this block's content. Unlike an
-        # earlier version of this check, this never mutates
-        # content_block.content -- a Validator wrapping this method (see
+        # Read-only check: is there ANY Markdown-emphasis span -- safe or
+        # ambiguous -- left in this block's content. Unlike an earlier
+        # version of this check, this never mutates content_block.content
+        # -- a Validator wrapping this method (see
         # src/core/adapters.py::TextAgentValidatorAdapter) must be able to
         # check an artifact without silently changing what it contains,
         # the same guarantee every other check in this method already
         # gives. The actual **safe**-span conversion is a separate,
         # explicit step the real generation path runs in
         # _validate_blocks_against_layout, before this method is ever
-        # called -- by the time a block reaches here, its content either
-        # already has safe spans converted, or (for a direct caller like
-        # the adapter, which never runs that step) still has its original,
-        # unconverted text, which this check reads as-is either way.
+        # called -- by the time a block reaches here on that path, every
+        # safe span has already been converted, so anything still present
+        # is already ambiguous.
+        #
+        # Round-2 review finding: this used to only fail on AMBIGUOUS
+        # matches, so a direct caller that skips the conversion step
+        # entirely (exactly what the adapter does) got a PASS verdict for
+        # a stored artifact that still literally contained "**important**"
+        # -- being theoretically convertible does not mean the artifact,
+        # as it actually exists right now, satisfies the plain-LaTeX rule.
+        # Any remaining match, safe or ambiguous, is now a FAIL.
         if self.enabled_validators.get("markdown_emphasis", True):
-            ambiguous = [m for m in find_markdown_emphasis_matches(content_block.content) if m.ambiguous]
-            if ambiguous:
-                descriptions = [
-                    f"line {m.line_number}: {m.marker + m.inner + m.marker!r} {m.reason}"
-                    for m in ambiguous
-                ]
+            matches = find_markdown_emphasis_matches(content_block.content)
+            if matches:
+                content_lines = content_block.content.replace("\r\n", "\n").split("\n")
+                descriptions = []
+                for m in matches:
+                    raw = content_lines[m.line_number - 1][m.start : m.end]
+                    reason = m.reason or "is still unconverted Markdown emphasis syntax"
+                    descriptions.append(f"line {m.line_number}: {raw!r} {reason}")
                 errors.append(
                     SemanticBlockError(
                         "markdown_emphasis",
                         block_id,
-                        f"Block '{block_id}' has Markdown emphasis that can't be safely "
-                        "auto-converted to \\textbf{...}: " + "; ".join(descriptions),
+                        f"Block '{block_id}' still contains Markdown emphasis syntax that must "
+                        "not reach this check unconverted: " + "; ".join(descriptions),
                     )
                 )
 

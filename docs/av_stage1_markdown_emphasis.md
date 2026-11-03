@@ -42,24 +42,34 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
 
 ## A2. 탐지와 제한된 변환
 
-핵심 함수 전부 `src/agents/latex_assembler.py`. 아래는 **라운드 1 리뷰 반영 후** 최종 설계다 — 최초
-버전의 설계·버그는 "라운드 1 리뷰" 절에 따로 기록했다.
+핵심 함수 전부 `src/agents/latex_assembler.py`. 아래는 **라운드 2 리뷰 반영 후** 최종 설계다 — 이전
+버전들의 설계·버그는 "라운드 1 리뷰"/"라운드 2 리뷰" 절에 따로 기록했다.
 
 - `_literal_or_math_mask(text)`: 전체 텍스트(여러 줄 포함) 기준으로 한 번에 계산하는 제외 마스크.
   `$...$`/`\(...\)`/`\[...\]` 수식은 상태를 줄마다 리셋하지 않고 텍스트 전체에 걸쳐 추적하고,
   `\verb<delim>...<delim>`(리터럴)과 `\texttt{...}`(이 프로젝트의 code/식별자 표기 규약) 내부도
-  제외한다.
-- `find_markdown_emphasis_matches(text)`: 줄 단위로 `**`/`__` 후보 위치를 모은 뒤(위 마스크에 걸리는
-  위치는 애초에 후보에서 제외), marker별로 **1-depth 스택**(`_find_matches_for_marker`)으로 짝짓는다:
-  이미 열린 pending이 있으면 무조건 닫고(그래서 같은 marker는 절대 자기 자신 안에 중첩될 수 없다),
-  pending이 없을 때는 **여는 쪽 바로 앞 글자가 영숫자가 아닐 때만** 새로 연다. "닫는 쪽 뒤에 오는
-  글자"는 더 이상 조건에 넣지 않는다 — 한국어처럼 공백 없이 조사·어미가 바로 붙는 언어의 정상적인 표현을
-  "코드처럼 보임"으로 오인하지 않기 위해서다. 줄 끝까지 안 닫힌 pending은 ambiguous(미종료)로 보고한다.
-  서로 다른 marker(`**`/`__`)가 겹치면 — 완전히 포함되는 중첩이든 부분적으로만 겹치든 — 양쪽 다
-  ambiguous로 표시한다(`_flag_cross_marker_overlaps`). span의 inner가 비어 있거나 앞뒤에 공백이 있거나
-  표 셀 경계(이스케이프되지 않은 `|`)를 넘으면 그 pair 자체가 ambiguous다(`_classify_pair`).
-- `convert_markdown_emphasis(content, block_id)`: 안전(ambiguous=False)한 span만 `\textbf{...}`로
-  치환하고, 나머지는 원본 그대로 둔 채 위치·이유가 담긴 설명 문자열 목록을 반환한다. **idempotent**.
+  제외한다. 백슬래시로 이스케이프된 `\$`/`\{`/`\}`/`\\`는 (`_is_escaped_literal`) 수식 토글이나
+  `\texttt{}` 중괄호 깊이 계산 어느 쪽에도 영향을 주지 않는 리터럴 한 쌍으로 먼저 소비된다 — 라운드 2
+  리뷰 수정(아래 참고).
+- `find_markdown_emphasis_matches(text, *, apply_literal_math_mask=True)`: 줄 단위로 `*`/`_` 문자의
+  **연속된 run**을 스캔한다(위 마스크에 걸리는 위치는 애초에 run에 들어가지 않음). run 길이가 정확히
+  2면 평범한 marker 후보, 1이면 이 프로젝트가 지원하지 않는 강조라 무시, **3 이상이면 통째로 하나의
+  ambiguous match로 직접 보고하고 marker 짝짓기 풀에는 전혀 들어가지 않는다** — `***bold***` 같은
+  복합(bold+italic) marker를 라운드 2 리뷰가 잡아냈다(아래 참고). 길이-2 run들은 marker별로
+  **1-depth 스택**(`_find_matches_for_marker`)으로 짝짓는다: 이미 열린 pending이 있으면 무조건 닫고
+  (그래서 같은 marker는 절대 자기 자신 안에 중첩될 수 없다), pending이 없을 때는 **여는 쪽 바로 앞
+  글자가 영숫자가 아닐 때만** 새로 연다. "닫는 쪽 뒤에 오는 글자"는 더 이상 조건에 넣지 않는다 —
+  한국어처럼 공백 없이 조사·어미가 바로 붙는 언어의 정상적인 표현을 "코드처럼 보임"으로 오인하지 않기
+  위해서다. 줄 끝까지 안 닫힌 pending은 ambiguous(미종료)로 보고한다. 서로 다른 marker(`**`/`__`)가
+  겹치면 — 완전히 포함되는 중첩이든 부분적으로만 겹치든 — 양쪽 다 ambiguous로 표시한다
+  (`_flag_cross_marker_overlaps`). span의 inner가 비어 있거나 앞뒤에 공백이 있거나 표 셀 경계
+  (이스케이프되지 않은 `|`)를 넘거나 **중괄호 짝이 안 맞으면**(`_has_balanced_braces` — 라운드 2 리뷰
+  수정, 아래 참고) 그 pair 자체가 ambiguous다(`_classify_pair`). `apply_literal_math_mask=False`를
+  주면 위 마스크를 통째로 건너뛴다 — title/caption처럼 실제 LaTeX 수식을 전혀 통과하지 않는 plain-text
+  필드용(`_reject_plain_text_markup`이 사용 — 아래 참고).
+- `convert_markdown_emphasis(content, block_id, *, matches=None)`: 안전(ambiguous=False)한 span만
+  `\textbf{...}`로 치환하고, 나머지는 원본 그대로 둔 채 위치·이유가 담긴 설명 문자열 목록을 반환한다.
+  **idempotent**. `matches`를 미리 넘기면(비용 측정을 이미 호출자가 했을 때) 다시 스캔하지 않는다.
 - Dunder/식별자(`__init__`) 보호는 넣지 않았다: "__three__"처럼 공백 없는 한 단어짜리 진짜
   bold("__bold__" 변형)를 깨뜨리는 회귀가 있어서다 — 다만 `\texttt{__init__}`처럼 명시적으로 literal로
   표시된 경우는 위 `_literal_or_math_mask`가 별도로 보호한다.
@@ -67,20 +77,30 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
 ## A3. 생성·복구·조립 연결
 
 - **생성 직후, 검사 (TextAgent)**: `_validate_one_block`의 markdown_emphasis 체크는 **순수 읡기 전용**
-  이다 — `find_markdown_emphasis_matches`로 ambiguous span만 확인하고, `content_block`은 절대
-  건드리지 않는다(라운드 1 리뷰로 뒤집힌 설계 — 아래 참고). 안전하게 변환되지 않은 span이 남으면
+  이다 — `find_markdown_emphasis_matches`로 **남아 있는 모든** span(안전하든 ambiguous든)을 확인하고,
+  `content_block`은 절대 건드리지 않는다(라운드 1 리뷰로 뒤집힌 설계). **라운드 2 리뷰 수정**: 예전에는
+  ambiguous span만 실패 처리했는데, "변환 가능하다"는 사실이 "지금 이 artifact가 규칙을 충족한다"는
+  뜻은 아니다 — 변환 단계를 거치지 않는 직접 호출자(바로 다음 항목의 adapter)에게는 안전-but-미변환
+  span도 명백한 위반이다. 지금은 남은 span이 하나라도 있으면
   `SemanticBlockError("markdown_emphasis", ...)`를 내서 기존 attempt-retry 루프로 넘긴다.
 - **생성 직후, 변환 (TextAgent)**: 실제 안전-span 변환은 `_validate_blocks_against_layout`에서 **명시적으로,
-  검사보다 먼저** 일어난다 — 블록마다 `convert_markdown_emphasis`를 호출해 내용이 실제로 바뀐 경우에만
-  `content_block.content`를 갱신하고, `_persist_markdown_emphasis_conversion`으로 원본·unified
-  diff·변환본·transform latency를 `{node_id}.markdown_emphasis_conversion_N.json`에 남긴다 (아래
-  "라운드 1 리뷰" #6 참고). `regenerate_blocks`도 같은 `_run_generation_loop`를 거치므로 block 복구
-  경로도 동일하게 적용된다.
+  검사보다 먼저** 일어난다 — 블록마다 `find_markdown_emphasis_matches`로 한 번 스캔하고 그 결과를
+  `convert_markdown_emphasis(..., matches=...)`에 넘겨 이중 스캔 없이 변환한다. 내용이 실제로 바뀐
+  경우에만 `content_block.content`를 갱신하지만, **변환 여부와 무관하게 매 블록마다**
+  `persist_markdown_emphasis_pass`(`src/agents/latex_assembler.py`, phase=`"generation"`)로
+  원본·unified diff(바뀐 경우만)·변환본(바뀐 경우만, 아니면 `None`)·safe/ambiguous 매치 수·
+  `rule_version`·transform latency를 `{node_id}.markdown_emphasis_conversion_N.json`에 남긴다 —
+  **라운드 2 리뷰 수정**: 예전에는 `converted != original`일 때만 기록이 생겨서, 변환할 게 없는 블록이나
+  전부 ambiguous라 안 바뀐 블록의 비용이 전혀 기록되지 않았다(아래 참고). `regenerate_blocks`도 같은
+  `_run_generation_loop`를 거치므로 block 복구 경로도 동일하게 적용된다.
 - **title/caption**: 둘 다 LaTeX를 전혀 통과하지 않고 `_escape_latex`로만 처리되므로(Markdown 개념이
   없는 escaper), 변환이 아니라 **항상 거부**한다 — `validate_plain_title`은 title, 신규
   `validate_plain_caption`은 caption에 같은 규칙(백슬래시 명령 + Markdown 강조 둘 다 금지)을 적용한다.
   둘 다 같은 `enabled_validators["plain_title"]` 게이트를 공유한다 — `figure_content`가 두 코드를
-  공유하는 기존 패턴과 동일.
+  공유하는 기존 패턴과 동일. **라운드 2 리뷰 수정**: 공유 헬퍼 `_reject_plain_text_markup`이 내부에서
+  `find_markdown_emphasis_matches`를 호출할 때 `apply_literal_math_mask=False`를 넘긴다 — title/
+  caption은 진짜 LaTeX 수식을 전혀 거치지 않으므로 bare `$`를 수식 시작으로 "보호"하면 안 된다(아래
+  참고).
 - **저장 직전**: `_run_generation_loop`이 모든 block 통과 후에만 `.blocks.json`/`.draft.tex`를 쓰므로,
   변환된 `\textbf{...}` 형태가 이미 canonical artifact에 들어간다 — 별도 배선 불필요.
 - **조립 전 잔여 검사 (LatexAssembler)**: `_validate_fragment`에 추가한 체크는 **검사만** 하고 절대
@@ -88,26 +108,39 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
   `_render_figure`에서는 planner가 작성한 figure 자체의 caption(`FigureRegistryEntry.caption`/
   `FigurePlacement.caption`)도 같은 규칙으로 거부한다 — 둘 다 `_escape_latex`로만 렌더링되는
   "실제 최종 출력에 쓰이는 필드"이기 때문이다. `DEFAULT_ENABLED_ASSEMBLER_VALIDATORS["markdown_emphasis"]`
-  로 독립 토글 가능.
+  로 독립 토글 가능. **라운드 2 리뷰 수정**: 두 체크 모두 선택적 `sections_dir`/`node_id` 파라미터
+  (기본 `None`, 이 클래스의 `event_logger` 파라미터와 동일한 관례)를 받아, 실제 호출 경로
+  (`_validate_semantic_blocks`/`_render_section`)에서는 `phase="assembler_residual_check"`/
+  `"assembler_figure_caption_check"`로 자신의 비용도 `persist_markdown_emphasis_pass`에 기록한다 —
+  예전에는 이 조립 단계의 검사 비용이 TextAgent 쪽과 달리 전혀 기록되지 않았다.
 - **Validator adapter**: `src/core/adapters.py::_GATE_KEY_BY_CODE`에 `markdown_emphasis` →
   `markdown_emphasis`, `plain_caption` → `plain_title` 매핑 추가. 쪼개진 구조적/게이트 체크 순서 로직
-  (`_short_circuited_before`)은 일반화돼 있어 추가 수정이 필요 없었다.
+  (`_short_circuited_before`)은 일반화돼 있어 추가 수정이 필요 없었다 — 라운드 2에서도 마찬가지로
+  이 파일은 전혀 바뀌지 않았다(`_validate_one_block`이 순수한 FAIL/PASS 신호만 주면 adapter의 일반화된
+  매핑 로직이 알아서 올바르게 동작한다).
 
 ## A4. 회귀 및 실제 출력 확인
 
-`test/test_markdown_emphasis.py`(53 tests) + `test/core/test_adapters.py`(adapter 순수성 1건 추가):
+`test/test_markdown_emphasis.py`(70 tests) + `test/core/test_adapters.py`(adapter 순수성/FAIL 판정
+2건):
 
 - 탐지기/변환기 단위 테스트: 본문 bold, 표 셀 bold, 여러 강조 구간, 짝 불일치(미종료 marker), 표 셀
   경계를 넘는 ambiguous span, 서로 다른 marker의 중첩/겹침(둘 다 ambiguous), 기존 `\textbf{...}`
   무변화, `x**2`류 코드 무시(및 뒤에 오는 진짜 bold를 방해하지 않음 확인), 한국어 조사가 닫는 marker
-  뒤에 바로 붙는 경우, `\verb`/`\texttt{}`/여러 줄 수식 보존, `$...$`/`\[...\]` 내부 무시, idempotency.
-- TextAgent 배선: 순수 검사(무변환), ambiguous 시 `markdown_emphasis` 에러(역시 무변환), 토글 끄면
-  통과, title/caption 거부. `_validate_blocks_against_layout`의 실제 변환 + provenance 파일 생성/
-  미생성.
-- LatexAssembler 배선: content/title/caption 잔여물 각각 거부, 이미 변환된 내용 통과, 토글 끄면 통과.
-  별도 클래스로 figure 자체 caption 거부/통과.
-- Adapter 순수성: `TextAgentValidatorAdapter.check()`가 markdown_emphasis를 검사해도
-  `content_block.content`가 바뀌지 않고, PASS 판정이 실제로 검사한(미변환) 내용에 대한 것임을 확인.
+  뒤에 바로 붙는 경우, `\verb`/`\texttt{}`/여러 줄 수식 보존, `$...$`/`\[...\]` 내부 무시, idempotency,
+  이스케이프된 `\$`/`\{`/`\}`가 뒤쪽 강조를 가리지 않음, 복합 marker run(`***`/`****`)과 중괄호 불균형
+  span이 ambiguous로 처리됨, 위반 메시지가 실제 원본 부분 문자열을 보여줌(marker+inner+marker 이중
+  래핑 없이).
+- TextAgent 배선: **남은 span이 있으면(안전하든 ambiguous든) 항상 실패**, 이미 변환된 내용은 통과,
+  토글 끄면 통과, title/caption 거부(bare `$` 뒤에 오는 강조 포함). `_validate_blocks_against_layout`의
+  실제 변환 + provenance 기록이 **항상**(변환 없음/전부 ambiguous라 변환 실패하는 경우 포함) 남음,
+  `rule_version`/`phase`/safe·ambiguous 매치 수 필드 확인.
+- LatexAssembler 배선: content/title/caption 잔여물 각각 거부, 이미 변환된 내용 통과, 토글 끄면 통과,
+  `sections_dir`를 주면 잔여 검사 비용이 영향(성공/실패 모두) 기록됨. 별도 클래스로 figure 자체 caption
+  거부/통과 + 비용 기록.
+- Adapter: `TextAgentValidatorAdapter.check()`가 markdown_emphasis를 검사해도
+  `content_block.content`가 바뀌지 않음(순수성), 안전하지만 미변환인 span은 FAIL, 이미 변환된 내용은
+  PASS.
 - **E2E (`@unittest.skipUnless(shutil.which("tectonic"), ...)`, 이 환경에서 실제 실행됨)**: 스크립트된
   LLM으로 `TextAgent.process_node` 실제 재시도 루프(1차 시도에서 3개 block 안전 변환, 한국어 조사
   포함 + 1개 block ambiguous로 실패 → 2차 시도에서 그 1개만 재생성) → provenance 파일 3개 이상 생성
@@ -116,7 +149,8 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
 
 변경 전/후 전체 테스트 스위트 비교: 기존에 알려진, 이 revision과 무관한 57개 실패
 (`test_text_agent_structural_toggle.py` 등 — [[docgen_revision_2026_10_15]] Stage 1 메모 참고)가
-**정확히 동일하게** 유지됨을 `git stash`로 전/후 비교해 확인했다. 통과 테스트는 879 → 934.
+**정확히 동일하게** 유지됨을 `git stash`로 전/후 비교해 확인했다(실패한 테스트 목록까지 diff로 동일함을
+확인 — 개수만 같은 게 아니다). 통과 테스트는 879 → 934(라운드 1) → 952(라운드 2).
 
 ## Stage 0 메타데이터와의 관계
 
@@ -179,6 +213,63 @@ False" 주장도 이에 맞춰 수정했고, 명시적 ablation(끄기)이 여�
 그대로 입력해 출력 비교), `test/test_markdown_emphasis.py`(53 tests, 전면 재작성) +
 `test/core/test_adapters.py`(adapter 순수성 테스트 1건 추가). `git stash`로 전/후 비교해 기존 57개
 무관 실패가 동일하게 유지됨을 재확인(통과: 879 → 934).
+
+## Stage 1, 라운드 2 리뷰 (2026-11-03)
+
+라운드 1에서 고친 설계를 다시 실제 재현 입력으로 검토한 사용자 리뷰가 추가로 4건의 실제 버그/누락을
+찾았다. 모두 코드로 고쳤다:
+
+1. **[P1] Adapter가 변환되지 않은 금지 강조에 여전히 PASS를 반환함.** `b1@1 = "This is **important**."`
+   에 대해 검사 후에도 내용이 안 바뀐 채로(`**important**`가 그대로 남은 채) adapter가 PASS를 반환했다
+   — assembler는 당연히 같은 내용을 FAIL시킨다. 원인: `_validate_one_block`이 `ambiguous=True`인
+   후보만 오류로 처리했다 — "안전하게 변환될 수 있다"는 사실이 "지금 이 artifact가 규칙을 충족한다"는
+   뜻은 아니다. 실제 생성 경로는 검사 전에 이미 변환을 하므로, 순수 검사 함수 입장에서는 남아 있는
+   모든 금지 강조(안전하든 ambiguous든)가 FAIL이어야 맞다. 수정: `_validate_one_block`은 이제
+   `find_markdown_emphasis_matches`의 결과가 하나라도 있으면 실패한다. 이 입력의 PASS를 정답으로
+   고정하던 adapter 테스트도 FAIL로 뒤집었고, 이미 변환된 내용(`\textbf{...}`)은 여전히 PASS임을 보는
+   테스트를 새로 추가했다.
+2. **[P1] 새 문맥 마스크가 escape를 잘못 처리해 뒤쪽 강조를 놓침.** `"The price is \$5 and
+   **important**."`가 생성·조립 검사를 모두 통과하고 별표가 남은 채 출력됐다 — `\$`의 `$`를 (이스케이프
+   무시하고) 수식 시작으로 오인해 이후 전체를 제외 마스크에 넣었다. `"\texttt{\{} then **bold**."`도
+   같은 근본 원인으로 깨졌다 — `\texttt{}`의 중괄호 깊이 계산이 `\{`(이스케이프된 리터럴 중괄호)를 진짜
+   미매칭 group-open으로 세어, 그 뒤 두 번째 실제 닫는 `}`를 못 찾고 줄 끝까지 전부 `\texttt{}` 인수로
+   간주했다. plain-text caption(`"Cost $5 **discount**"`)도 같은 이유로 통과했는데, 여기는 애초에 수식
+   제외 규칙 자체를 적용하면 안 되는 필드다 — title/caption은 진짜 LaTeX 수식을 전혀 거치지 않고
+   `_escape_latex`만 거치므로 `$`도 그냥 일반 문자로 렌더링된다. 수정: `_literal_or_math_mask`에
+   `_is_escaped_literal`(백슬래시로 이스케이프된 `$`/`{`/`}`/`\`는 리터럴 한 쌍으로 먼저 소비, 어떤
+   상태도 바꾸지 않음)을 추가해 메인 루프와 `\texttt{}` 중괄호 추적 양쪽에 적용. `find_markdown_
+   emphasis_matches`에 `apply_literal_math_mask=False` 옵션을 추가하고, `_reject_plain_text_markup`
+   (title/caption 공통 경로)이 이를 사용 — 백슬래시 자체는 이미 그 앞에서 통째로 거부되므로(title/
+   caption에 LaTeX 명령이 있으면 그 자체로 에러), 수식 마스크가 보호해 줄 게 원래 아무것도 없는
+   필드다.
+3. **[P2] 자동 변환의 안전 판정이 아직 너무 넓음.** `"***bold***"`가 `"\textbf{*bold}*"`로 변환되고
+   검사를 통과했다 — 2글자 창(window) 스캔이 3글자 이상 연속된 marker run을 "`**` + `*bold` + `**` +
+   `*`"로 잘못 쪼갰다. `"**text { brace**"`는 `"\textbf{text { brace}"`로 변환된 뒤 조립 중 중괄호
+   불균형 오류를 냈다 — inner에 짝 안 맞는 `{`가 그대로 들어가면서 `\textbf{...}`로 감싸면 전체 괄호
+   구조가 깨진다. 수정: 같은 marker 문자가 3개 이상 연속되면(run) 통째로 ambiguous match로 바로
+   보고하고 marker 짝짓기 풀에는 전혀 넣지 않는다(`find_markdown_emphasis_matches`의 run-스캔 루프).
+   `_classify_pair`에 `_has_balanced_braces` 검사를 추가해, inner의 중괄호가 짝이 안 맞으면(이스케이프된
+   `\{`/`\}`는 제외하고 계산) 그 pair도 ambiguous로 분류한다. 둘 다 block 복구로 넘어가며, 자동 변환은
+   더 이상 시도하지 않는다. (부수적으로, 위반 메시지가 `marker+inner+marker`를 이중으로 이어붙여
+   `"***bold***"`류를 `"'*******'"`처럼 알아보기 힘들게 표시하던 것도 실제 원본 부분 문자열을 그대로
+   보여주도록 고쳤다.)
+4. **[P2] 성공한 자동 변환 외 다른 모든 검사/변환 경로의 비용·버전 기록이 빠짐.** 원본·변환본·diff·
+   `transform_latency_s`는 `converted != original`일 때만 기록됐다 — 그래서 (a) 변환할 게 없는 블록,
+   (b) 강조가 전부 ambiguous라 안 바뀐 블록, (c) 조립 전 잔여 검사(`LatexAssembler._validate_fragment`/
+   `_render_figure`)의 비용이 전혀 기록되지 않았다. 변환 기록에는 어떤 규칙 버전이 그 판정을 내렸는지
+   알 수 있는 필드도 없었다. 수정: 공유 함수 `persist_markdown_emphasis_pass`(`latex_assembler.py`)를
+   새로 만들어 — (1) `MARKDOWN_EMPHASIS_RULE_VERSION`(현재 3; 히스토리는 코드 주석에 기록)을 매 기록에
+   찍고, (2) `_validate_blocks_against_layout`이 **변환 여부와 무관하게 매 블록마다** `phase=
+   "generation"`으로 기록하도록 바꾸고(실패로 끝나도 기록은 먼저 남도록 `finally`로 감쌈), (3)
+   `_validate_fragment`/`_render_figure`에 선택적 `sections_dir`/`node_id` 파라미터(기본 `None`, 기존
+   `event_logger` 관례와 동일 — 직접 호출하는 단위 테스트는 그대로 둠)를 추가해 `_validate_semantic_
+   blocks`/`_render_section`이라는 실제 호출 경로에서 `phase="assembler_residual_check"`/
+   `"assembler_figure_caption_check"`로 조립 쪽 비용도 기록하게 했다. `safe_match_count`/
+   `ambiguous_match_count` 필드도 추가했다.
+
+전체 재검증: 4가지 모두 사용자가 제시한 정확한 재현 입력으로 직접 확인, `test/test_markdown_emphasis.py`
+(70 tests, 신규 17건) + `test/core/test_adapters.py`(신규 1건 + 기존 1건 판정 뒤집음). `git stash`로
+전/후 비교해 기존 57개 무관 실패가 **실패 목록까지 정확히 동일하게** 유지됨을 재확인(통과: 934 → 952).
 
 ## 다음 단계
 
