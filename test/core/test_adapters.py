@@ -631,6 +631,37 @@ def test_validator_adapter_returns_nothing_when_nothing_was_requested() -> None:
     assert adapter.check(artifact, [], context={"content_block": content_block, "layout_block": layout_block}) == []
 
 
+def test_validator_adapter_markdown_emphasis_check_does_not_mutate_the_artifact() -> None:
+    """Revision (Additional verifiers) Stage 1, round-1 review: an earlier
+    version of TextAgent._validate_one_block's own markdown_emphasis check
+    mutated content_block.content as a side effect (converting a safe
+    "**bold**" span to "\\textbf{...}" in place) -- so a PASS verdict for a
+    stored artifact version (e.g. "b1@1") was actually computed against
+    DIFFERENT content than what that version's artifact_id/content really
+    holds, exactly the kind of check-vs-storage desync every other check
+    in _validate_one_block already avoids. The check is pure now: it
+    reports only whether an AMBIGUOUS (not safely convertible) span
+    remains, and never touches content_block at all -- any real
+    conversion happens as its own separate, explicitly-provenanced step in
+    TextAgent._validate_blocks_against_layout, which this adapter never
+    calls (it talks to _validate_one_block directly)."""
+    text_agent = TextAgent(llm_client=MagicMock())
+    adapter = TextAgentValidatorAdapter(text_agent)
+    artifact = ArtifactRef(artifact_id="b1", version=1, kind=ArtifactKind.BLOCK)
+    layout_block = LayoutBlock(id="b1", kind=LayoutBlockKind.PARAGRAPH)
+    original_content = "This is **important**."
+    content_block = ContentBlock(block_id="b1", type=SemanticBlockType.PARAGRAPH, content=original_content)
+
+    evidence = adapter.check(
+        artifact, [_constraint("markdown_emphasis")],
+        context={"content_block": content_block, "layout_block": layout_block},
+    )[0]
+
+    assert content_block.content == original_content
+    assert evidence.outcome == CheckOutcome.PASS
+    assert evidence.checked_artifact == artifact
+
+
 # ---------------------------------------------------------------------------
 # RepairPolicy: grouping, deferred attempt-counting, and shared scope rules.
 # ---------------------------------------------------------------------------
