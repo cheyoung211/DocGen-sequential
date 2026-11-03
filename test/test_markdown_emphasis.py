@@ -110,6 +110,36 @@ class FindMarkdownEmphasisMatchesTest(unittest.TestCase):
         self.assertEqual(matches[0].inner, "important")
         self.assertFalse(matches[0].ambiguous)
 
+    def test_korean_word_glued_to_an_opening_marker_still_converts(self) -> None:
+        # Round-3 review finding: the old rule excluded ANY occurrence
+        # preceded by an alphanumeric character from opening at all, which
+        # silently dropped completely ordinary Korean prose that glues a
+        # bold span directly onto a preceding word with no space ("우" in
+        # "매우" is alphanumeric, same as the 'x' in "x**2" -- but this is
+        # not a code pattern at all). Only an ASCII-alnum-before +
+        # ASCII-digit-after combination (see _looks_like_code_exponent_open)
+        # is excluded now.
+        matches = find_markdown_emphasis_matches("매우**중요**합니다.")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].inner, "중요")
+        self.assertFalse(matches[0].ambiguous)
+
+    def test_word_glued_marker_separating_two_spans_both_convert(self) -> None:
+        # Round-3 review finding: "**first**and**second**" used to convert
+        # only the first span -- the second span's opening "**" is glued
+        # to "and" (alphanumeric), which the old rule treated exactly like
+        # "x**2" and silently excluded from ever opening at all.
+        matches = find_markdown_emphasis_matches("**first**and**second**")
+        self.assertEqual([m.inner for m in matches], ["first", "second"])
+        self.assertTrue(all(not m.ambiguous for m in matches))
+
+    def test_code_exponent_followed_by_a_letter_is_still_ignored(self) -> None:
+        # The code-exponent exclusion requires BOTH signals (ASCII-alnum
+        # before, ASCII-digit after) -- confirm the "after" side alone
+        # isn't sufficient to flag a real word as code-shaped.
+        matches = find_markdown_emphasis_matches("x**2 and y**3 are both exponents.")
+        self.assertEqual(matches, [])
+
     def test_double_underscore_identifier_converts_like_ordinary_bold(self) -> None:
         # "__init__" and genuine "__bold__" are the same syntax with no
         # reliable way to tell them apart in this project's content schema
@@ -137,6 +167,26 @@ class FindMarkdownEmphasisMatchesTest(unittest.TestCase):
         text = "\\[\n  a**b\n\\]"
         matches = find_markdown_emphasis_matches(text)
         self.assertEqual(matches, [])
+
+    def test_emphasis_inside_align_environment_is_ignored(self) -> None:
+        # Round-3 review finding: "\begin{align} V^{**} &= V \end{align}"
+        # false-flagged the bare "**" as Markdown emphasis -- the mask
+        # only recognized $/\(/\[ delimiters, never that the align
+        # environment itself already establishes math mode.
+        text = r"\begin{align} V^{**} &= V \end{align}"
+        matches = find_markdown_emphasis_matches(text)
+        self.assertEqual(matches, [])
+
+    def test_emphasis_inside_pmatrix_environment_is_ignored(self) -> None:
+        text = r"$\begin{pmatrix} a & ** \\ b & c \end{pmatrix}$"
+        matches = find_markdown_emphasis_matches(text)
+        self.assertEqual(matches, [])
+
+    def test_emphasis_outside_a_math_environment_on_the_same_text_still_converts(self) -> None:
+        text = r"\begin{align} a &= b \end{align} and **important**."
+        matches = find_markdown_emphasis_matches(text)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].inner, "important")
 
     def test_emphasis_inside_verb_is_ignored(self) -> None:
         # Round-1 review finding: \verb's argument renders byte-for-byte;
@@ -313,6 +363,22 @@ class ConvertMarkdownEmphasisTest(unittest.TestCase):
     def test_code_glued_marker_does_not_block_a_later_real_bold_from_converting(self) -> None:
         converted, violations = convert_markdown_emphasis("x**2 and **important**.")
         self.assertEqual(converted, r"x**2 and \textbf{important}.")
+        self.assertEqual(violations, [])
+
+    def test_korean_word_glued_marker_converts_correctly(self) -> None:
+        converted, violations = convert_markdown_emphasis("매우**중요**합니다.")
+        self.assertEqual(converted, "매우\\textbf{중요}합니다.")
+        self.assertEqual(violations, [])
+
+    def test_word_glued_separator_both_spans_convert(self) -> None:
+        converted, violations = convert_markdown_emphasis("**first**and**second**")
+        self.assertEqual(converted, r"\textbf{first}and\textbf{second}")
+        self.assertEqual(violations, [])
+
+    def test_align_environment_content_is_preserved_byte_for_byte(self) -> None:
+        text = r"\begin{align} V^{**} &= V \end{align}"
+        converted, violations = convert_markdown_emphasis(text)
+        self.assertEqual(converted, text)
         self.assertEqual(violations, [])
 
     def test_existing_textbf_survives_unchanged(self) -> None:
@@ -523,6 +589,31 @@ class TextAgentMarkdownEmphasisValidatorTest(unittest.TestCase):
         codes = [e.code for e in errors]
         self.assertIn("plain_caption", codes)
 
+    def test_equation_block_bare_formula_is_exempt(self) -> None:
+        # Round-3 review finding: an EQUATION block's whole content IS a
+        # math body, with no delimiter required at all -- "V^{**} = V" is
+        # valid, correct LaTeX with zero Markdown intent, but the detector
+        # has no way to know that without being told the block's kind.
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        layout_block = self._layout_block(LayoutBlockKind.EQUATION)
+        content_block = ContentBlock(
+            block_id="b1", type=SemanticBlockType.EQUATION, content="V^{**} = V"
+        )
+        errors = agent._validate_one_block(content_block, layout_block)
+        codes = [e.code for e in errors]
+        self.assertNotIn("markdown_emphasis", codes)
+
+    def test_equation_block_align_environment_is_exempt(self) -> None:
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        layout_block = self._layout_block(LayoutBlockKind.EQUATION)
+        content_block = ContentBlock(
+            block_id="b1", type=SemanticBlockType.EQUATION,
+            content=r"\begin{align} V^{**} &= V \end{align}",
+        )
+        errors = agent._validate_one_block(content_block, layout_block)
+        codes = [e.code for e in errors]
+        self.assertNotIn("markdown_emphasis", codes)
+
 
 class ValidateBlocksAgainstLayoutConversionTest(unittest.TestCase):
     """The real generation path's explicit, separately-provenanced
@@ -603,6 +694,20 @@ class ValidateBlocksAgainstLayoutConversionTest(unittest.TestCase):
             self.assertIsNone(record["converted_content"])
             self.assertEqual(record["ambiguous_match_count"], 1)
 
+    def test_equation_block_is_skipped_entirely_and_not_flagged(self) -> None:
+        # Round-3 review finding: without this exemption, a correct bare
+        # formula like "V^{**} = V" would fail validation right after
+        # this conversion step (nothing safely converts it, since it's
+        # not Markdown at all) and get regenerated forever.
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        layout_blocks = [LayoutBlock(id="eq1", kind=LayoutBlockKind.EQUATION)]
+        with tempfile.TemporaryDirectory() as tmp:
+            sections_dir = Path(tmp)
+            raw_blocks = [{"block_id": "eq1", "type": "equation", "content": "V^{**} = V"}]
+            blocks = agent._validate_blocks_against_layout(raw_blocks, layout_blocks, sections_dir, "sec1")
+            self.assertEqual(blocks[0].content, "V^{**} = V")
+            self.assertEqual(list(sections_dir.glob("sec1.markdown_emphasis_conversion_*.json")), [])
+
 
 class LatexAssemblerMarkdownEmphasisResidualCheckTest(unittest.TestCase):
     """LatexAssembler._validate_fragment must refuse a block that still
@@ -655,6 +760,27 @@ class LatexAssemblerMarkdownEmphasisResidualCheckTest(unittest.TestCase):
             block_id="p1", type=SemanticBlockType.PARAGRAPH, content="This is **important**."
         )
         assembler._validate_fragment(block)  # must not raise -- gate is off
+
+    def test_equation_block_bare_formula_is_exempt_from_the_residual_check(self) -> None:
+        # Round-3 review finding: without this exemption, every correct
+        # EQUATION artifact using "**" as a genuine LaTeX superscript (not
+        # Markdown at all) would fail right before rendering.
+        assembler = LatexAssembler()
+        block = ContentBlock(
+            block_id="eq1", type=SemanticBlockType.EQUATION, content="V^{**} = V"
+        )
+        assembler._validate_fragment(block)  # must not raise
+
+    def test_equation_block_title_emphasis_is_still_rejected(self) -> None:
+        # The EQUATION exemption covers `content` only -- title/caption
+        # are separate plain-text fields with no such exemption.
+        assembler = LatexAssembler()
+        block = ContentBlock(
+            block_id="eq1", type=SemanticBlockType.EQUATION,
+            content="V^{**} = V", title="**Bold Title**",
+        )
+        with self.assertRaises(ValueError):
+            assembler._validate_fragment(block)
 
     def test_residual_check_cost_is_persisted_when_sections_dir_is_given(self) -> None:
         # Round-2 review finding: this check's own cost went completely

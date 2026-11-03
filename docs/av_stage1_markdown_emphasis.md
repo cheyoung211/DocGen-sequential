@@ -42,37 +42,55 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
 
 ## A2. 탐지와 제한된 변환
 
-핵심 함수 전부 `src/agents/latex_assembler.py`. 아래는 **라운드 2 리뷰 반영 후** 최종 설계다 — 이전
-버전들의 설계·버그는 "라운드 1 리뷰"/"라운드 2 리뷰" 절에 따로 기록했다.
+핵심 함수 전부 `src/agents/latex_assembler.py`. 아래는 **라운드 3 리뷰 반영 후** 최종 설계다 — 이전
+버전들의 설계·버그는 "라운드 1/2/3 리뷰" 절에 따로 기록했다.
 
 - `_literal_or_math_mask(text)`: 전체 텍스트(여러 줄 포함) 기준으로 한 번에 계산하는 제외 마스크.
   `$...$`/`\(...\)`/`\[...\]` 수식은 상태를 줄마다 리셋하지 않고 텍스트 전체에 걸쳐 추적하고,
   `\verb<delim>...<delim>`(리터럴)과 `\texttt{...}`(이 프로젝트의 code/식별자 표기 규약) 내부도
   제외한다. 백슬래시로 이스케이프된 `\$`/`\{`/`\}`/`\\`는 (`_is_escaped_literal`) 수식 토글이나
   `\texttt{}` 중괄호 깊이 계산 어느 쪽에도 영향을 주지 않는 리터럴 한 쌍으로 먼저 소비된다 — 라운드 2
-  리뷰 수정(아래 참고).
+  리뷰 수정. **라운드 3 리뷰 수정**: `\begin{<name>}...\end{<name>}`도 `<name>`이
+  `ALLOWED_ENVIRONMENTS[SemanticBlockType.EQUATION]`(align/gather/equation/.../pmatrix 등, 이
+  프로젝트가 이미 "수식·행렬 환경"으로 인정하는 바로 그 집합)에 속하면 전체를 제외 마스크에 넣는다 —
+  `$...$` 등 delimiter 유무와 무관하게 환경 자체가 이미 수식이기 때문이다(아래 참고).
 - `find_markdown_emphasis_matches(text, *, apply_literal_math_mask=True)`: 줄 단위로 `*`/`_` 문자의
   **연속된 run**을 스캔한다(위 마스크에 걸리는 위치는 애초에 run에 들어가지 않음). run 길이가 정확히
   2면 평범한 marker 후보, 1이면 이 프로젝트가 지원하지 않는 강조라 무시, **3 이상이면 통째로 하나의
   ambiguous match로 직접 보고하고 marker 짝짓기 풀에는 전혀 들어가지 않는다** — `***bold***` 같은
-  복합(bold+italic) marker를 라운드 2 리뷰가 잡아냈다(아래 참고). 길이-2 run들은 marker별로
-  **1-depth 스택**(`_find_matches_for_marker`)으로 짝짓는다: 이미 열린 pending이 있으면 무조건 닫고
-  (그래서 같은 marker는 절대 자기 자신 안에 중첩될 수 없다), pending이 없을 때는 **여는 쪽 바로 앞
-  글자가 영숫자가 아닐 때만** 새로 연다. "닫는 쪽 뒤에 오는 글자"는 더 이상 조건에 넣지 않는다 —
-  한국어처럼 공백 없이 조사·어미가 바로 붙는 언어의 정상적인 표현을 "코드처럼 보임"으로 오인하지 않기
-  위해서다. 줄 끝까지 안 닫힌 pending은 ambiguous(미종료)로 보고한다. 서로 다른 marker(`**`/`__`)가
-  겹치면 — 완전히 포함되는 중첩이든 부분적으로만 겹치든 — 양쪽 다 ambiguous로 표시한다
-  (`_flag_cross_marker_overlaps`). span의 inner가 비어 있거나 앞뒤에 공백이 있거나 표 셀 경계
-  (이스케이프되지 않은 `|`)를 넘거나 **중괄호 짝이 안 맞으면**(`_has_balanced_braces` — 라운드 2 리뷰
-  수정, 아래 참고) 그 pair 자체가 ambiguous다(`_classify_pair`). `apply_literal_math_mask=False`를
-  주면 위 마스크를 통째로 건너뛴다 — title/caption처럼 실제 LaTeX 수식을 전혀 통과하지 않는 plain-text
-  필드용(`_reject_plain_text_markup`이 사용 — 아래 참고).
+  복합(bold+italic) marker를 라운드 2 리뷰가 잡아냈다. 길이-2 run들은 marker별로 **1-depth
+  스택**(`_find_matches_for_marker`)으로 짝짓는다: 이미 열린 pending이 있으면 무조건 닫고(그래서 같은
+  marker는 절대 자기 자신 안에 중첩될 수 없다), pending이 없을 때는 **코드/수식 지수 표현처럼 보이지
+  않을 때만**(`_looks_like_code_exponent_open` — 라운드 3 리뷰 수정, 아래 참고) 새로 연다. "닫는 쪽
+  뒤에 오는 글자"는 조건에 넣지 않는다 — 한국어처럼 공백 없이 조사·어미가 바로 붙는 언어의 정상적인
+  표현을 "코드처럼 보임"으로 오인하지 않기 위해서다. 줄 끝까지 안 닫힌 pending은 ambiguous(미종료)로
+  보고한다. 서로 다른 marker(`**`/`__`)가 겹치면 — 완전히 포함되는 중첩이든 부분적으로만 겹치든 —
+  양쪽 다 ambiguous로 표시한다(`_flag_cross_marker_overlaps`). span의 inner가 비어 있거나 앞뒤에
+  공백이 있거나 표 셀 경계(이스케이프되지 않은 `|`)를 넘거나 **중괄호 짝이 안 맞으면**
+  (`_has_balanced_braces` — 라운드 2 리뷰 수정) 그 pair 자체가 ambiguous다(`_classify_pair`).
+  `apply_literal_math_mask=False`를 주면 위 마스크를 통째로 건너뛴다 — title/caption처럼 실제 LaTeX
+  수식을 전혀 통과하지 않는 plain-text 필드용(`_reject_plain_text_markup`이 사용).
+- `_looks_like_code_exponent_open(line, idx, marker)`: **라운드 3 리뷰로 전면 교체된 규칙**. 예전
+  규칙("여는 쪽 바로 앞 글자가 영숫자이면 무조건 제외")은 `x**2`를 보호하려다가 "매우**중요**합니다"
+  (앞 글자 "우"가 영숫자)나 "**first**and**second**"(두 번째 span의 여는 쪽이 "and"에 붙음) 같은
+  정상적인 본문 강조까지 조용히 놓쳤다. 새 규칙은 **두 신호가 모두 있어야만** 코드/지수 표현으로 보고
+  제외한다: (1) marker 바로 앞 글자가 **ASCII** 영숫자(식별자 문자 — CJK 단어는 절대 해당 안 됨)이고,
+  (2) marker 바로 뒤 글자가 **ASCII 숫자**(지수 — 본문 강조의 시작 글자는 거의 항상 숫자가 아님)인
+  경우만. 둘 중 하나라도 아니면 평범하게 후보로 열린다 — 이후 짝이 안 맞으면 ambiguous로 남아 복구
+  대상이 되므로, 조용히 통과시키는 경우는 더 이상 없다.
 - `convert_markdown_emphasis(content, block_id, *, matches=None)`: 안전(ambiguous=False)한 span만
   `\textbf{...}`로 치환하고, 나머지는 원본 그대로 둔 채 위치·이유가 담긴 설명 문자열 목록을 반환한다.
   **idempotent**. `matches`를 미리 넘기면(비용 측정을 이미 호출자가 했을 때) 다시 스캔하지 않는다.
 - Dunder/식별자(`__init__`) 보호는 넣지 않았다: "__three__"처럼 공백 없는 한 단어짜리 진짜
   bold("__bold__" 변형)를 깨뜨리는 회귀가 있어서다 — 다만 `\texttt{__init__}`처럼 명시적으로 literal로
   표시된 경우는 위 `_literal_or_math_mask`가 별도로 보호한다.
+- **EQUATION block 전체 예외 (라운드 3 리뷰 신규)**: EQUATION 타입 블록의 `content`는 처음부터 전체가
+  수식 본문이다 — `$...$`/환경 wrapper 없는 "맨몸" 수식(`V^{**} = V`)도 유효한 콘텐츠로 이미
+  지원됐다(`_render_equation`, `_validate_bare_math_commands`의 EQUATION 예외 참고). 마스크나 환경
+  인식만으로는 이 "delimiter 자체가 없는" 경우를 처리할 수 없으므로, block 종류를 직접 전달받는
+  세 호출부(`TextAgent._validate_one_block`, `_validate_blocks_against_layout`,
+  `LatexAssembler._validate_fragment`)가 EQUATION 타입일 때 markdown_emphasis
+  검사·변환을 통째로 건너뛴다 — `content`만 예외이며 title/caption은 그대로 검사한다(아래 참고).
 
 ## A3. 생성·복구·조립 연결
 
@@ -121,23 +139,27 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
 
 ## A4. 회귀 및 실제 출력 확인
 
-`test/test_markdown_emphasis.py`(70 tests) + `test/core/test_adapters.py`(adapter 순수성/FAIL 판정
+`test/test_markdown_emphasis.py`(84 tests) + `test/core/test_adapters.py`(adapter 순수성/FAIL 판정
 2건):
 
 - 탐지기/변환기 단위 테스트: 본문 bold, 표 셀 bold, 여러 강조 구간, 짝 불일치(미종료 marker), 표 셀
   경계를 넘는 ambiguous span, 서로 다른 marker의 중첩/겹침(둘 다 ambiguous), 기존 `\textbf{...}`
   무변화, `x**2`류 코드 무시(및 뒤에 오는 진짜 bold를 방해하지 않음 확인), 한국어 조사가 닫는 marker
-  뒤에 바로 붙는 경우, `\verb`/`\texttt{}`/여러 줄 수식 보존, `$...$`/`\[...\]` 내부 무시, idempotency,
-  이스케이프된 `\$`/`\{`/`\}`가 뒤쪽 강조를 가리지 않음, 복합 marker run(`***`/`****`)과 중괄호 불균형
-  span이 ambiguous로 처리됨, 위반 메시지가 실제 원본 부분 문자열을 보여줌(marker+inner+marker 이중
-  래핑 없이).
+  뒤에 바로 붙는 경우, **한국어 단어/영어 단어가 여는 marker에 바로 붙어도 정상 변환됨**, `\verb`/
+  `\texttt{}`/여러 줄 수식/**align·pmatrix 등 수식 환경 내부** 보존, `$...$`/`\[...\]` 내부 무시,
+  idempotency, 이스케이프된 `\$`/`\{`/`\}`가 뒤쪽 강조를 가리지 않음, 복합 marker run(`***`/`****`)과
+  중괄호 불균형 span이 ambiguous로 처리됨, 위반 메시지가 실제 원본 부분 문자열을 보여줌
+  (marker+inner+marker 이중 래핑 없이).
 - TextAgent 배선: **남은 span이 있으면(안전하든 ambiguous든) 항상 실패**, 이미 변환된 내용은 통과,
-  토글 끄면 통과, title/caption 거부(bare `$` 뒤에 오는 강조 포함). `_validate_blocks_against_layout`의
-  실제 변환 + provenance 기록이 **항상**(변환 없음/전부 ambiguous라 변환 실패하는 경우 포함) 남음,
-  `rule_version`/`phase`/safe·ambiguous 매치 수 필드 확인.
+  토글 끄면 통과, title/caption 거부(bare `$` 뒤에 오는 강조 포함), **EQUATION block의 맨몸/align
+  수식은 markdown_emphasis 검사·변환에서 완전히 면제**(title은 그대로 검사). `_validate_blocks_
+  against_layout`의 실제 변환 + provenance 기록이 **항상**(변환 없음/전부 ambiguous라 변환 실패하는
+  경우 포함) 남음(단, EQUATION block은 건너뛰어 기록도 안 남음), `rule_version`/`phase`/safe·ambiguous
+  매치 수 필드 확인.
 - LatexAssembler 배선: content/title/caption 잔여물 각각 거부, 이미 변환된 내용 통과, 토글 끄면 통과,
-  `sections_dir`를 주면 잔여 검사 비용이 영향(성공/실패 모두) 기록됨. 별도 클래스로 figure 자체 caption
-  거부/통과 + 비용 기록.
+  `sections_dir`를 주면 잔여 검사 비용이 영향(성공/실패 모두) 기록됨, **EQUATION block의 맨몸 수식은
+  잔여 검사에서 면제되지만 title은 여전히 거부됨**. 별도 클래스로 figure 자체 caption 거부/통과 + 비용
+  기록.
 - Adapter: `TextAgentValidatorAdapter.check()`가 markdown_emphasis를 검사해도
   `content_block.content`가 바뀌지 않음(순수성), 안전하지만 미변환인 span은 FAIL, 이미 변환된 내용은
   PASS.
@@ -150,7 +172,7 @@ TextAgent/LatexAssembler가 이미 모든 실제 실행에서 무조건 호출�
 변경 전/후 전체 테스트 스위트 비교: 기존에 알려진, 이 revision과 무관한 57개 실패
 (`test_text_agent_structural_toggle.py` 등 — [[docgen_revision_2026_10_15]] Stage 1 메모 참고)가
 **정확히 동일하게** 유지됨을 `git stash`로 전/후 비교해 확인했다(실패한 테스트 목록까지 diff로 동일함을
-확인 — 개수만 같은 게 아니다). 통과 테스트는 879 → 934(라운드 1) → 952(라운드 2).
+확인 — 개수만 같은 게 아니다). 통과 테스트는 879 → 934(라운드 1) → 952(라운드 2) → 966(라운드 3).
 
 ## Stage 0 메타데이터와의 관계
 
@@ -270,6 +292,43 @@ False" 주장도 이에 맞춰 수정했고, 명시적 ablation(끄기)이 여�
 전체 재검증: 4가지 모두 사용자가 제시한 정확한 재현 입력으로 직접 확인, `test/test_markdown_emphasis.py`
 (70 tests, 신규 17건) + `test/core/test_adapters.py`(신규 1건 + 기존 1건 판정 뒤집음). `git stash`로
 전/후 비교해 기존 57개 무관 실패가 **실패 목록까지 정확히 동일하게** 유지됨을 재확인(통과: 934 → 952).
+
+## Stage 1, 라운드 3 리뷰 (2026-11-03)
+
+이전 라운드까지 고친 설계를 다시 실제 재현 입력으로 검토한 사용자 리뷰가 2건을 추가로 찾았다 — 둘 다
+"stage1을 완료하기 위해 남은 문제"로 명시됐다. 모두 코드로 고쳤다:
+
+1. **앞 글자와 붙은 강조가 여전히 검사에서 빠짐.** `"매우**중요**합니다."`(그대로 남고 생성·조립 검사
+   모두 통과), `"**first**and**second**"`(첫 번째만 변환되고 `**second**`는 조용히 남음), caption의
+   같은 패턴 — 모두 라운드 1에서 추가한 "여는 marker 바로 앞이 영숫자이면 무조건 제외" 규칙 때문이었다.
+   `x**2`를 보호하려던 규칙이 그보다 훨씬 넓은 범위 — 앞에 아무 글자나 붙은 모든 본문 강조 — 를 조용히
+   제외해 버렸다. 한국어 음절("우")도 영숫자로 판정되고, 영어 단어("and")에 붙은 강조도 똑같이 걸렸다.
+   수정: `_looks_like_code_exponent_open`으로 교체 — **ASCII 영숫자가 바로 앞에 있고 ASCII 숫자가
+   marker 바로 뒤에 오는 경우만** (예: `x**2`, `value**10`) 코드/지수 표현으로 제외한다. 둘 중 하나라도
+   아니면 평범한 후보로 열리고, 이후 짝이 안 맞으면(미종료 등) ambiguous로 보고되어 복구 대상이 된다
+   — 조용히 통과시키는 경로가 완전히 사라졌다. `x**2 and y**3`처럼 두 코드형 패턴이 나란히 있는 기존
+   보호 사례, `x**2 and **important**.`처럼 코드와 진짜 bold가 섞인 라운드 1의 회귀 테스트는 그대로
+   유지됨을 재확인했다.
+2. **equation block의 정상 수식이 markdown_emphasis 오류로 판정됨.** `"V^{**} = V"`(delimiter 없는
+   맨몸 수식)와 `"\begin{align} V^{**} &= V \end{align}"` 둘 다 거짓 오류를 냈다 — `"$V^{**} = V$"`는
+   통과하는데, 제외 마스크가 `$`/`\(`/`\[` 같은 delimiter만 인식하고 (a) block 자체가 EQUATION이라
+   delimiter가 아예 필요 없다는 사실과 (b) `\begin{align}` 같은 환경 자체가 이미 수식 모드를 연다는
+   사실을 전혀 몰랐기 때문이다. 두 가지를 모두 고쳤다: (a) `_literal_or_math_mask`가 이제
+   `\begin{<name>}...\end{<name>}`을 `<name>`이 `ALLOWED_ENVIRONMENTS[SemanticBlockType.EQUATION]`
+   (align/gather/equation/.../pmatrix 등 — 이 프로젝트가 이미 "수식·행렬 환경"으로 정의해 둔 바로 그
+   집합, 새로 만들지 않고 그대로 재사용)에 속하면 전체를 제외 마스크에 넣는다 — 이걸로
+   `\begin{align}...\end{align}` 케이스가 환경 인식만으로 이미 해결된다. (b) 그래도 delimiter도
+   환경도 전혀 없는 맨몸 수식(`"V^{**} = V"`)은 마스크로 해결할 수 없으므로, block 종류를 이미 알고
+   있는 세 호출부(`TextAgent._validate_one_block`/`_validate_blocks_against_layout`,
+   `LatexAssembler._validate_fragment`)가 EQUATION 타입일 때 markdown_emphasis 검사·변환 자체를
+   건너뛴다 — `_validate_bare_math_commands`가 이미 똑같은 이유로 EQUATION을 예외처리하는 것과 같은
+   패턴. `content`에만 적용되고 title/caption은 그대로 검사됨을 별도 테스트로 확인했다(EQUATION block
+   의 title에 Markdown 강조가 남아 있으면 여전히 거부).
+
+전체 재검증: 두 가지 모두 사용자가 제시한 정확한 재현 입력으로 직접(함수 단위) + `_validate_one_block`/
+`_validate_blocks_against_layout`/adapter/`_validate_fragment` 통합 경로로 재확인,
+`test/test_markdown_emphasis.py`에 14개 테스트 추가(70 → 84). `git stash`로 전/후 비교해 기존 57개
+무관 실패가 **실패 목록까지 정확히 동일하게** 유지됨을 재확인(통과: 952 → 966).
 
 ## 다음 단계
 

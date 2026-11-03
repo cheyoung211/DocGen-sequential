@@ -415,6 +415,18 @@ _TEXTT_COMMAND_OPEN = "\\texttt{"
 # unmatched group-open inside the \texttt{} argument and excluded the rest
 # of the line along with it.
 _ESCAPED_LITERAL_CHARS = ("$", "{", "}", "\\")
+_BEGIN_TOKEN = "\\begin{"
+# The exact set this project already treats as "a display-math/matrix
+# environment" (ALLOWED_ENVIRONMENTS[SemanticBlockType.EQUATION], defined
+# above) -- align/gather/equation/... are EQUATION-block-only per that
+# table's own comment, and matrix environments "only ever appear nested
+# inside a $.../equation body" per MATRIX_ENVIRONMENTS' comment. Either
+# way, content between a recognized `\begin{name}` and its `\end{name}` is
+# already math, with or without a surrounding `$...$`/`\[...\]` -- round-3
+# review finding: "\begin{align} V^{**} &= V \end{align}" false-flagged
+# the bare `**` as Markdown emphasis because the mask only recognized
+# `$`/`\(`/`\[` delimiters, never the environment itself.
+_MATH_ENVIRONMENT_NAMES = ALLOWED_ENVIRONMENTS[SemanticBlockType.EQUATION]
 
 
 def _is_escaped_literal(text: str, index: int, length: int) -> bool:
@@ -441,6 +453,12 @@ def _literal_or_math_mask(text: str) -> List[bool]:
       code/identifier-like text, so a doubled-underscore run inside it
       (``\\texttt{__init__}``) is the author explicitly marking it
       literal/monospace, not writing Markdown bold.
+    - ``\\begin{<name>}...\\end{<name>}`` for any display-math/matrix
+      environment this project recognizes (``_MATH_ENVIRONMENT_NAMES``,
+      e.g. ``align``, ``gather``, ``pmatrix``) -- round-3 review finding:
+      this content is already math by construction, with or without a
+      surrounding ``$...$``/``\\[...\\]``, exactly like an EQUATION
+      block's bare-formula case below is math with no delimiter at all.
 
     A backslash-escaped ``$``/``{``/``}``/``\\`` (see
     ``_is_escaped_literal``) is consumed as a literal pair everywhere
@@ -478,6 +496,16 @@ def _literal_or_math_mask(text: str) -> List[bool]:
                 mask[j] = True
             index = i
             continue
+        if char == "\\" and not in_math and text.startswith(_BEGIN_TOKEN, index):
+            match = ENVIRONMENT_TOKEN.match(text, index)
+            if match and match.group("name") in _MATH_ENVIRONMENT_NAMES:
+                end_token = f"\\end{{{match.group('name')}}}"
+                close = text.find(end_token, match.end())
+                end = (close + len(end_token)) if close != -1 else length
+                for i in range(index, end):
+                    mask[i] = True
+                index = end
+                continue
         if char == "\\" and index + 1 < length and text[index : index + 2] in (r"\(", r"\["):
             mask[index] = mask[index + 1] = True
             in_math = True
@@ -570,6 +598,38 @@ def _classify_pair(
     return MarkdownEmphasisMatch(line_number, marker, open_idx, end, inner, False)
 
 
+def _looks_like_code_exponent_open(line: str, idx: int, marker: str) -> bool:
+    """Whether ``marker`` at ``idx``, with nothing currently pending to
+    close, looks like a code/math exponentiation operator (``x**2``,
+    ``value**10``) rather than a genuine emphasis span glued to a
+    preceding word with no space.
+
+    Round-3 review finding: the previous rule excluded ANY occurrence
+    preceded by an alphanumeric character at all, which silently dropped
+    completely ordinary prose that glues emphasis directly onto a
+    preceding word with no space -- normal in Korean/agglutinative
+    languages ("매우**중요**합니다", where "우" is alphanumeric) and
+    unremarkable in English too ("**first**and**second**", where the
+    second span's "**" is glued to "and"). The ACTUAL ``x**2``/``value**10``
+    pattern this rule exists to protect has two narrower, specific
+    signals, and needs BOTH: the character immediately before is ASCII
+    alphanumeric (an identifier character -- never true for a CJK word,
+    which is exactly what let the Korean case through this check), AND
+    the character immediately after the marker is an ASCII digit (an
+    exponent -- never true when the marker opens ordinary prose, whatever
+    script it's in). Either signal failing means this is not the code
+    pattern, and the occurrence is free to open normally -- genuinely
+    ambiguous cases still get caught downstream (an unterminated open, an
+    overlap, a whitespace-padded inner) rather than silently dropped here.
+    """
+    before = line[idx - 1] if idx > 0 else ""
+    if not (before.isascii() and before.isalnum()):
+        return False
+    after_index = idx + len(marker)
+    after = line[after_index] if after_index < len(line) else ""
+    return after in "0123456789"
+
+
 def _find_matches_for_marker(
     line: str, marker: str, occurrences: List[int], line_number: int
 ) -> List[MarkdownEmphasisMatch]:
@@ -582,20 +642,20 @@ def _find_matches_for_marker(
     one containing the other.
 
     An occurrence with nothing pending opens a new pending span, but ONLY
-    if it is not immediately preceded by an alphanumeric character.
-    Excluding it here -- before any pairing, not after -- is what keeps
-    "x**2"'s own "**" from ever being treated as a delimiter at all: under
-    the previous blind-sequential-pairing design, that occurrence got
-    paired with whatever the *next* "**" happened to be (even a real
-    bold's opening delimiter), which silently broke the real pair instead
-    of being ignored. There is deliberately no equivalent restriction on
-    what a CLOSING delimiter may be followed by -- Korean (and other
-    languages without whitespace-separated grammatical particles)
-    routinely attaches a verb ending or particle directly after a bolded
-    word with no space ("**중요**합니다"), which is normal prose, not a
-    code-glued pattern; only gluing on the *opening* side reliably signals
-    "this is the middle of some other token," so only that side is
-    checked.
+    if it doesn't look like a code/math exponentiation operator (see
+    ``_looks_like_code_exponent_open``). Excluding it here -- before any
+    pairing, not after -- is what keeps "x**2"'s own "**" from ever being
+    treated as a delimiter at all: under the previous blind-sequential-
+    pairing design, that occurrence got paired with whatever the *next*
+    "**" happened to be (even a real bold's opening delimiter), which
+    silently broke the real pair instead of being ignored. There is
+    deliberately no equivalent restriction on what a CLOSING delimiter
+    may be followed by -- Korean (and other languages without whitespace-
+    separated grammatical particles) routinely attaches a verb ending or
+    particle directly after a bolded word with no space ("**중요**합니다"),
+    which is normal prose, not a code-glued pattern; only gluing on the
+    *opening* side can ever signal "this is the middle of some other
+    token," so only that side is checked.
 
     A pending open still unclosed at end of line is reported as an
     unterminated, ambiguous match (it was already confirmed not to be
@@ -608,11 +668,10 @@ def _find_matches_for_marker(
             matches.append(_classify_pair(line, marker, pending_open, idx, line_number))
             pending_open = None
             continue
-        before = line[idx - 1] if idx > 0 else ""
-        if not before.isalnum():
+        if not _looks_like_code_exponent_open(line, idx, marker):
             pending_open = idx
-        # else: glued to a preceding alphanumeric character with nothing
-        # pending to close (e.g. "x**2") -- not an emphasis attempt at
+        # else: looks like a code/math exponent operator (e.g. "x**2")
+        # with nothing pending to close -- not an emphasis attempt at
         # all, silently skipped (neither converted nor reported).
     if pending_open is not None:
         end = pending_open + len(marker)
@@ -670,14 +729,18 @@ def find_markdown_emphasis_matches(
       ``_literal_or_math_mask``) -- unless ``apply_literal_math_mask`` is
       False, which skips that mask entirely (see its own docstring note
       below).
-    - An occurrence immediately preceded by an alphanumeric character,
-      with nothing already pending to close, is excluded *before*
-      pairing -- this is what lets "x**2" sit next to a real
-      "**important**" on the same line without disrupting it (see
-      ``_find_matches_for_marker``'s docstring for why only the opening
-      side is checked, not the closing side -- the latter would wrongly
-      reject languages that attach grammar directly after a closing
-      marker with no space).
+    - An occurrence that looks like a code/math exponent operator
+      (``x**2``: ASCII-alphanumeric immediately before, ASCII digit
+      immediately after -- see ``_looks_like_code_exponent_open``), with
+      nothing already pending to close, is excluded *before* pairing --
+      this is what lets "x**2" sit next to a real "**important**" on the
+      same line without disrupting it, while still allowing an ordinary
+      word glued directly to an opening marker with no space
+      ("매우**중요**합니다", "**first**and**second**") to open normally
+      (see ``_find_matches_for_marker``'s docstring for why only the
+      opening side is checked at all, not the closing side -- the latter
+      would wrongly reject languages that attach grammar directly after a
+      closing marker with no space).
     - A maximal run of 3+ of the same marker character (``***bold***``,
       a compound bold+italic marker this project's Markdown subset does
       not support) is never treated as an ordinary 2-char marker at all --
@@ -1746,7 +1809,14 @@ class LatexAssembler:
             validate_markdown_table_columns(content, block.block_id)
         if self.enabled_validators.get("markdown_emphasis", True):
             start = time.perf_counter()
-            residual = find_markdown_emphasis_matches(content)
+            # An EQUATION block's whole `content` IS a math body, with no
+            # delimiter required at all (a bare "V^{**} = V" is valid) --
+            # round-3 review finding, same exemption TextAgent's own
+            # markdown_emphasis check gets (_validate_one_block). title/
+            # caption below are unaffected: they're separate plain-text
+            # fields with no such exemption, equation block or not.
+            is_equation_body = block.type == SemanticBlockType.EQUATION
+            residual = [] if is_equation_body else find_markdown_emphasis_matches(content)
             safe_count = sum(1 for m in residual if not m.ambiguous)
             ambiguous_count = len(residual) - safe_count
             try:

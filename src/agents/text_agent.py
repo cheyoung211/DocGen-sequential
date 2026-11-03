@@ -1142,6 +1142,15 @@ Figures owned by this section; refer to these only when relevant:
         nothing to convert or a block that's entirely ambiguous left no
         trace its check had ever run at all, unlike ``_persist_failed_
         attempt``'s per-failed-attempt coverage of everything else.
+
+        An EQUATION-kind block is skipped entirely here (same exemption
+        ``_validate_bare_math_commands`` already gets, see
+        ``_validate_one_block``): its whole ``content`` IS a math body --
+        round-3 review finding, a bare, undelimited formula like
+        "V^{**} = V" has no ``$``/environment token at all for
+        ``_literal_or_math_mask`` to ever recognize, so without this
+        block-kind exemption a block that's correct math every time gets
+        rejected and regenerated forever.
         """
         if not isinstance(raw_blocks, list):
             raise ValueError("content_blocks must be a JSON array.")
@@ -1156,7 +1165,9 @@ Figures owned by this section; refer to these only when relevant:
             )
 
         if self.enabled_validators.get("markdown_emphasis", True):
-            for content_block in blocks:
+            for content_block, layout_block in zip(blocks, layout_blocks):
+                if layout_block.kind == LayoutBlockKind.EQUATION:
+                    continue
                 original = content_block.content
                 start = time.perf_counter()
                 found = find_markdown_emphasis_matches(original)
@@ -1241,8 +1252,16 @@ Figures owned by this section; refer to these only when relevant:
         # a stored artifact that still literally contained "**important**"
         # -- being theoretically convertible does not mean the artifact,
         # as it actually exists right now, satisfies the plain-LaTeX rule.
-        # Any remaining match, safe or ambiguous, is now a FAIL.
-        if self.enabled_validators.get("markdown_emphasis", True):
+        # Any remaining match, safe or ambiguous, is now a FAIL. An
+        # EQUATION-kind block is exempt entirely (round-3 review finding,
+        # same exemption _validate_bare_math_commands already gets below):
+        # its whole content IS a math body, with no delimiter required at
+        # all (e.g. "V^{**} = V"), so scanning it for Markdown emphasis at
+        # all is simply the wrong check for this block kind.
+        if (
+            self.enabled_validators.get("markdown_emphasis", True)
+            and layout_block.kind != LayoutBlockKind.EQUATION
+        ):
             matches = find_markdown_emphasis_matches(content_block.content)
             if matches:
                 content_lines = content_block.content.replace("\r\n", "\n").split("\n")
