@@ -8,6 +8,7 @@ from __future__ import annotations
 from src.core.dependency_mapping import CrossSectionObligation, DependencyMappingReport, MappingStatus
 from src.core.dependency_verifier import verify_cross_section_obligations
 from src.core.schemas import CheckOutcome, UnknownReason
+from src.core.shared_value_registry import SharedValueCheckConfig
 from src.dataset.schemas import DependencyRelation
 
 
@@ -158,6 +159,95 @@ def test_partial_target_success_does_not_hide_the_other_targets_failure():
     assert result.total_targets == 2
     assert result.pass_count == 1
     assert result.fail_count == 1
+
+
+def test_must_be_consistent_with_passes_when_restated_value_matches():
+    obligation = CrossSectionObligation(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH, description="x",
+        source_section_id="definition", target_section_id="worked_examples", status=MappingStatus.MATCHED,
+        matched_source_section_id="definition", matched_target_section_id="worked_examples",
+    )
+    rendered = {
+        "definition": "We fix $n = 10$ throughout this document.",
+        "worked_examples": "Using $n = 10$ as defined above, the sum is computed.",
+    }
+    result = verify_cross_section_obligations(
+        _report([obligation]), rendered, {"d1": SharedValueCheckConfig(relevant_symbols=["n"])}
+    )
+    assert result.records[0].outcome == CheckOutcome.PASS
+
+
+def test_must_reuse_fails_on_a_restated_mismatched_coefficient():
+    # Gold Labeling sample_005: a coefficient restated 10x/25x off.
+    obligation = CrossSectionObligation(
+        dependency_id="d1", relation=DependencyRelation.MUST_REUSE, description="x",
+        source_section_id="formal_definition", target_section_id="worked_examples", status=MappingStatus.MATCHED,
+        matched_source_section_id="formal_definition", matched_target_section_id="worked_examples",
+    )
+    rendered = {
+        "formal_definition": "The bending stress coefficient is $k = 25$.",
+        "worked_examples": "Using the coefficient $k = 10$, we compute the deflection.",
+    }
+    result = verify_cross_section_obligations(
+        _report([obligation]), rendered, {"d1": SharedValueCheckConfig(relevant_symbols=["k"])}
+    )
+    assert result.records[0].outcome == CheckOutcome.FAIL
+    assert "k" in result.records[0].detail
+
+
+def test_shared_value_relation_is_unknown_without_relevant_symbols_configured():
+    # Backward-compatible default: no shared_value_configs entry at all
+    # must behave exactly like before B3 existed.
+    obligation = CrossSectionObligation(
+        dependency_id="d1", relation=DependencyRelation.MUST_REUSE, description="x",
+        source_section_id="intro", target_section_id="summary", status=MappingStatus.MATCHED,
+        matched_source_section_id="intro", matched_target_section_id="summary",
+    )
+    rendered = {"intro": "n = 10", "summary": "n = 10"}
+    result = verify_cross_section_obligations(_report([obligation]), rendered)
+    assert result.records[0].outcome == CheckOutcome.UNKNOWN
+    assert result.records[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+
+def test_shared_value_relation_is_unknown_when_target_never_restates_the_symbol():
+    obligation = CrossSectionObligation(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH, description="x",
+        source_section_id="definition", target_section_id="summary", status=MappingStatus.MATCHED,
+        matched_source_section_id="definition", matched_target_section_id="summary",
+    )
+    rendered = {"definition": "$n = 10$", "summary": "The result follows from the definition."}
+    result = verify_cross_section_obligations(
+        _report([obligation]), rendered, {"d1": SharedValueCheckConfig(relevant_symbols=["n"])}
+    )
+    assert result.records[0].outcome == CheckOutcome.UNKNOWN
+    assert result.records[0].unknown_reason == UnknownReason.NOT_CHECKED
+
+
+def test_shared_value_relation_does_not_flag_a_different_examples_own_value():
+    # Gold Labeling: "다른 예제의 n 값은 다를 수 있다" -- an obligation that
+    # does NOT name "n" as relevant must never compare it.
+    obligation = CrossSectionObligation(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH, description="x",
+        source_section_id="example_a", target_section_id="example_b", status=MappingStatus.MATCHED,
+        matched_source_section_id="example_a", matched_target_section_id="example_b",
+    )
+    rendered = {"example_a": "Here n = 5 for this example.", "example_b": "Here n = 12 for a different example."}
+    result = verify_cross_section_obligations(
+        _report([obligation]), rendered, {"d1": SharedValueCheckConfig(relevant_symbols=["alpha"])}
+    )
+    assert result.records[0].outcome == CheckOutcome.UNKNOWN
+
+
+def test_symbol_aliases_let_a_renamed_symbol_still_be_compared():
+    obligation = CrossSectionObligation(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH, description="x",
+        source_section_id="definition", target_section_id="summary", status=MappingStatus.MATCHED,
+        matched_source_section_id="definition", matched_target_section_id="summary",
+    )
+    rendered = {"definition": "$u = 42$", "summary": "$U = 42$"}
+    config = SharedValueCheckConfig(relevant_symbols=["energy"], symbol_aliases={"energy": ["u", "U"]})
+    result = verify_cross_section_obligations(_report([obligation]), rendered, {"d1": config})
+    assert result.records[0].outcome == CheckOutcome.PASS
 
 
 def test_coverage_counts_separate_pass_fail_unknown_and_checked_vs_total():

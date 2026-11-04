@@ -125,7 +125,39 @@ def test_context_for_matches_call_one_to_one():
     assert set(context["dependency"].keys()) == {c.constraint_id for c in constraints}
     assert context["dependency"]["d1::summary"] == {
         "relation": "must_precede", "allowed_labels": [], "order_hint": [0, 3],
+        "relevant_symbols": [],
     }
+
+
+def test_relevant_symbols_default_to_empty_without_opting_in():
+    # Fix B's B3 registry needs an explicit per-dependency symbol
+    # allowlist (never guessed) -- a caller who doesn't pass
+    # relevant_symbols_by_dependency gets exactly the pre-B3 shape.
+    store = ArtifactGraphStore()
+    obligation = CrossSectionObligation(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH, description="x",
+        source_section_id="intro", target_section_id="summary", status=MappingStatus.MATCHED,
+        matched_source_section_id="intro", matched_target_section_id="summary",
+    )
+    provider = DependencyConstraintProvider(_report([obligation]), store)
+    target_ref = ArtifactRef(artifact_id="summary", version=1, kind=ArtifactKind.SECTION)
+    context = provider.context_for(target_ref)
+    assert context["dependency"]["d1::summary"]["relevant_symbols"] == []
+
+
+def test_relevant_symbols_are_threaded_through_when_supplied():
+    store = ArtifactGraphStore()
+    obligation = CrossSectionObligation(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH, description="x",
+        source_section_id="intro", target_section_id="summary", status=MappingStatus.MATCHED,
+        matched_source_section_id="intro", matched_target_section_id="summary",
+    )
+    provider = DependencyConstraintProvider(
+        _report([obligation]), store, relevant_symbols_by_dependency={"d1": ["n", "\\alpha"]}
+    )
+    target_ref = ArtifactRef(artifact_id="summary", version=1, kind=ArtifactKind.SECTION)
+    context = provider.context_for(target_ref)
+    assert context["dependency"]["d1::summary"]["relevant_symbols"] == ["n", "\\alpha"]
 
 
 def test_two_targets_of_the_same_dependency_id_get_distinct_constraint_ids():

@@ -1,32 +1,35 @@
 """Relation-specific verification for the "Revision (Additional verifiers)"
-plan's Fix C, checklist item C3's first bullet ("작성된 참조의 유효성 검사에
-필수 참조 누락 검사와 문서 순서 검사를 추가한다") -- see
-``docs/av_stage2_dependency_mapping.md`` for why ``must_reuse``/``must_be_
-consistent_with`` (C3's second bullet) are deliberately NOT checked here:
-the plan's own text ties their check to Fix B's shared-value registry,
-which doesn't exist on this branch yet -- Fix B (B1-B3) comes after all of
-Fix C, per the user's explicit 2026-11-03 decision recorded in that doc's
-header note.
+plan's Fix C, checklist item C3 -- both bullets, over one
+``DependencyMappingReport`` (``src/core/dependency_mapping.py``, C1) and
+the document's actual rendered section text:
 
-Checks the two ``DependencyRelation`` kinds this round can check for real,
-over one ``DependencyMappingReport`` (``src/core/dependency_mapping.py``,
-C1) and the document's actual rendered section text:
+- ``MUST_REFERENCE`` (C3 bullet 1): did the target section's rendered
+  LaTeX actually cite one of the obligation's ``allowed_labels`` via a
+  real ``\\ref``-style command (reusing ``latex_assembler.
+  REFERENCE_COMMAND``, not reimplemented) -- a bare prose mention is not
+  a citation (Gold Labeling sample_005: "summary.tex 전체에 Cref가 단 한
+  번도 없음... 확정 미충족").
+- ``MUST_PRECEDE`` (C3 bullet 1): does the matched source section
+  actually precede the matched target section in the blueprint's own
+  section order, per the obligation's ``order_hint``.
+- ``MUST_REUSE``/``MUST_BE_CONSISTENT_WITH`` (C3 bullet 2, added once Fix
+  B's B3 shared-value registry existed -- see
+  ``docs/av_stage3_math_verifier.md``): delegates to
+  ``shared_value_registry.check_shared_value_consistency`` for the
+  numeric-restatement component specifically, via
+  ``_verify_shared_value_relation`` below. Only checked when a caller
+  explicitly supplies ``relevant_symbols`` (per obligation, via
+  ``verify_cross_section_obligations``'s ``shared_value_configs``) --
+  with none supplied, this stays UNKNOWN/NOT_REPRESENTABLE exactly as
+  before this round, since this check never guesses which symbols a
+  dependency shares.
 
-- ``MUST_REFERENCE``: did the target section's rendered LaTeX actually cite
-  one of the obligation's ``allowed_labels`` via a real ``\\ref``-style
-  command (reusing ``latex_assembler.REFERENCE_COMMAND``, not
-  reimplemented) -- a bare prose mention is not a citation (Gold Labeling
-  sample_005: "summary.tex 전체에 Cref가 단 한 번도 없음... 확정 미충족").
-- ``MUST_PRECEDE``: does the matched source section actually precede the
-  matched target section in the blueprint's own section order, per the
-  obligation's ``order_hint``.
-
-``MUST_REUSE``/``MUST_BE_CONSISTENT_WITH`` obligations, and any obligation
-whose mapping ``status`` isn't ``MATCHED``, resolve to ``UNKNOWN`` with an
-explicit reason -- never silently ``PASS``. A self-reported "I cited/reused
-this" claim from the generator is never trusted in place of this scan (Gold
-Labeling sample_008's fabricated citation is exactly the failure mode this
-guards against -- see the design doc's rubric principle 8).
+Any obligation whose mapping ``status`` isn't ``MATCHED`` resolves to
+``UNKNOWN`` with an explicit reason -- never silently ``PASS``. A
+self-reported "I cited/reused this" claim from the generator is never
+trusted in place of this scan (Gold Labeling sample_008's fabricated
+citation is exactly the failure mode this guards against -- see the
+design doc's rubric principle 8).
 
 Deliberately a direct function over ``DependencyMappingReport`` + rendered
 text, not yet a formal ``Validator``/``ConstraintProvider`` -- mirrors how
@@ -41,13 +44,14 @@ here; wrapping this as a ``Validator`` is explicit, deferred follow-up work
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Sequence, Set
 
 from pydantic import BaseModel, Field
 
 from src.agents.latex_assembler import REFERENCE_COMMAND
 from src.core.dependency_mapping import CrossSectionObligation, DependencyMappingReport, MappingStatus
 from src.core.schemas import CheckOutcome, UnknownReason
+from src.core.shared_value_registry import SharedValueCheckConfig, check_shared_value_consistency
 from src.dataset.schemas import DependencyRelation
 
 
@@ -124,19 +128,34 @@ class DependencyVerificationResult(BaseModel):
 
 
 def verify_cross_section_obligations(
-    report: DependencyMappingReport, rendered_sections: Dict[str, str]
+    report: DependencyMappingReport,
+    rendered_sections: Dict[str, str],
+    shared_value_configs: Optional[Dict[str, SharedValueCheckConfig]] = None,
 ) -> DependencyVerificationResult:
     """Verifies every ``CrossSectionObligation`` C1 produced -- one record
     per obligation (i.e. per target), regardless of outcome. Never drops an
     obligation from the result just because it isn't checkable this round;
-    that case is UNKNOWN with a reason, not an absence."""
+    that case is UNKNOWN with a reason, not an absence.
+
+    ``shared_value_configs`` is keyed by ``dependency_id`` and only
+    consulted for ``must_reuse``/``must_be_consistent_with`` obligations
+    (C3 bullet 2) -- a ``dependency_id`` with no entry here (the default,
+    with no argument at all) stays UNKNOWN/NOT_REPRESENTABLE, exactly the
+    pre-B3 behavior, since this never guesses a symbol allowlist on its
+    own (see ``shared_value_registry``'s own docstring)."""
+    shared_value_configs = shared_value_configs or {}
     return DependencyVerificationResult(
-        records=[_verify_one(obligation, rendered_sections) for obligation in report.cross_section_obligations]
+        records=[
+            _verify_one(obligation, rendered_sections, shared_value_configs)
+            for obligation in report.cross_section_obligations
+        ]
     )
 
 
 def _verify_one(
-    obligation: CrossSectionObligation, rendered_sections: Dict[str, str]
+    obligation: CrossSectionObligation,
+    rendered_sections: Dict[str, str],
+    shared_value_configs: Dict[str, SharedValueCheckConfig],
 ) -> DependencyVerificationRecord:
     if obligation.status != MappingStatus.MATCHED:
         return DependencyVerificationRecord(
@@ -153,6 +172,18 @@ def _verify_one(
     if obligation.relation == DependencyRelation.MUST_PRECEDE:
         return _verify_must_precede(obligation)
 
+    config = shared_value_configs.get(obligation.dependency_id)
+    if config is not None and config.relevant_symbols:
+        return _verify_shared_value_relation(
+            obligation,
+            rendered_sections,
+            config.relevant_symbols,
+            scope=config.scope,
+            unit=config.unit,
+            assumptions=config.assumptions,
+            symbol_aliases=config.symbol_aliases,
+        )
+
     return DependencyVerificationRecord(
         dependency_id=obligation.dependency_id,
         relation=obligation.relation,
@@ -160,10 +191,69 @@ def _verify_one(
         outcome=CheckOutcome.UNKNOWN,
         unknown_reason=UnknownReason.NOT_REPRESENTABLE,
         detail=(
-            f"{obligation.relation.value} verification is deferred to Fix B's shared-value "
-            "registry/recompute checks, not implemented on this branch yet -- the plan's own "
-            "C3 instruction ties must_reuse/must_be_consistent_with to Fix B's registry."
+            f"{obligation.relation.value} verification needs an explicit relevant_symbols "
+            "allowlist (shared_value_configs[dependency_id]) -- none supplied, and this check "
+            "never guesses which symbols a dependency shares (see shared_value_registry's own "
+            "docstring for why)."
         ),
+    )
+
+
+def _verify_shared_value_relation(
+    obligation: CrossSectionObligation,
+    rendered_sections: Dict[str, str],
+    relevant_symbols: Sequence[str],
+    *,
+    scope: str = "global",
+    unit: Optional[str] = None,
+    assumptions: Sequence[str] = (),
+    symbol_aliases: Optional[Dict[str, List[str]]] = None,
+) -> DependencyVerificationRecord:
+    """Adapter from ``shared_value_registry.check_shared_value_consistency``
+    (B3's real check) into this module's ``DependencyVerificationRecord``
+    vocabulary -- mirrors ``_verify_must_reference``/``_verify_must_precede``:
+    the decision is made once, in ``shared_value_registry``, never
+    reimplemented here."""
+    source_text = rendered_sections.get(obligation.matched_source_section_id or "")
+    target_text = rendered_sections.get(obligation.matched_target_section_id or "")
+    if source_text is None or target_text is None:
+        missing = []
+        if source_text is None:
+            missing.append(f"source {obligation.matched_source_section_id!r}")
+        if target_text is None:
+            missing.append(f"target {obligation.matched_target_section_id!r}")
+        return DependencyVerificationRecord(
+            dependency_id=obligation.dependency_id,
+            relation=obligation.relation,
+            target_section_id=obligation.target_section_id,
+            outcome=CheckOutcome.UNKNOWN,
+            unknown_reason=UnknownReason.MISSING_DEPENDENCY,
+            detail=f"no rendered text supplied for: {', '.join(missing)}.",
+        )
+
+    config = SharedValueCheckConfig(
+        relevant_symbols=list(relevant_symbols),
+        symbol_aliases=symbol_aliases or {},
+        scope=scope,
+        unit=unit,
+        assumptions=list(assumptions),
+    )
+    record = check_shared_value_consistency(
+        dependency_id=obligation.dependency_id,
+        relation=obligation.relation,
+        source_section_id=obligation.matched_source_section_id,
+        target_section_id=obligation.matched_target_section_id,
+        source_text=source_text,
+        target_text=target_text,
+        config=config,
+    )
+    return DependencyVerificationRecord(
+        dependency_id=record.dependency_id,
+        relation=record.relation,
+        target_section_id=record.target_section_id,
+        outcome=record.outcome,
+        unknown_reason=record.unknown_reason,
+        detail=record.detail,
     )
 
 

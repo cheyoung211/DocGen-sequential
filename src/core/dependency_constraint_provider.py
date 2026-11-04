@@ -25,6 +25,17 @@ exposes both halves from the one place that actually has the data
 them; actually wiring that combination into ``repair_operations.py``/
 ``controller.py``'s own re-verification loop is further, separate work,
 tracked here rather than silently assumed done.
+
+Fix C checklist item C3's second bullet (``must_reuse``/
+``must_be_consistent_with``, via Fix B's B3 shared-value registry) needs
+one more relation-specific parameter than ``must_reference``/
+``must_precede`` do: an explicit ``relevant_symbols`` allowlist per
+dependency -- ``shared_value_registry`` never guesses which symbols a
+dependency shares (see that module's own docstring for why). This
+provider accepts that allowlist as an optional constructor argument,
+defaulting to empty for every ``dependency_id`` -- a caller who doesn't
+pass one gets EXACTLY the pre-B3 UNKNOWN/NOT_REPRESENTABLE behavior,
+unchanged.
 """
 
 from __future__ import annotations
@@ -58,9 +69,15 @@ class DependencyConstraintProvider:
     representation.
     """
 
-    def __init__(self, report: DependencyMappingReport, store: ArtifactGraphStore) -> None:
+    def __init__(
+        self,
+        report: DependencyMappingReport,
+        store: ArtifactGraphStore,
+        relevant_symbols_by_dependency: Optional[Dict[str, List[str]]] = None,
+    ) -> None:
         self._report = report
         self._store = store
+        self._relevant_symbols_by_dependency = relevant_symbols_by_dependency or {}
 
     def _obligations_for(self, artifact_id: str) -> List[CrossSectionObligation]:
         return [
@@ -113,6 +130,9 @@ class DependencyConstraintProvider:
                 "relation": obligation.relation.value,
                 "allowed_labels": list(obligation.allowed_labels),
                 "order_hint": list(obligation.order_hint) if obligation.order_hint is not None else None,
+                "relevant_symbols": list(
+                    self._relevant_symbols_by_dependency.get(obligation.dependency_id, [])
+                ),
             }
         return {"dependency": dependency_context}
 

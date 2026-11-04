@@ -460,6 +460,169 @@ class TestRecomputeFromSource:
         assert evidence[0].input_versions == [source_ref]
 
 
+class TestRecomputeOperationsB2:
+    """Fix B checklist item B2: extending the single "sum" recompute
+    operation to the plan's own 사칙연산/비율·백분율 table row, plus
+    rounding, fraction-string parsing, and absolute/relative tolerance."""
+
+    def _store_with_source(self, content: str):
+        store = ArtifactGraphStore()
+        store.add_version("checked", ArtifactKind.BLOCK, content="x")
+        store.add_version("data_1", ArtifactKind.SOURCE_DATA, content=content)
+        return store, store.latest("checked").ref, store.latest("data_1").ref
+
+    def test_power_operation_catches_gold_labeling_sample_001(self) -> None:
+        # 0.998^999 miscalculated -- exactly the motivating repro.
+        store, checked, source_ref = self._store_with_source("[0.998, 999]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        wrong_observed = 0.5  # a wrong claimed result
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {
+                "source_ref": source_ref, "operation": "power", "observed": wrong_observed, "tolerance": 0.001,
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.FAIL
+        correct_observed = 0.998 ** 999
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {
+                "source_ref": source_ref, "operation": "power", "observed": correct_observed, "tolerance": 1e-6,
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+
+    def test_percentage_change_operation(self) -> None:
+        store, checked, source_ref = self._store_with_source("[80, 100]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {
+                "source_ref": source_ref, "operation": "percentage_change", "observed": 25.0, "tolerance": 0.01,
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+
+    def test_ratio_operation_requires_exactly_two_values(self) -> None:
+        store, checked, source_ref = self._store_with_source("[1, 2, 3]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "ratio", "observed": 0.5}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_ratio_division_by_zero_is_unknown_not_a_crash(self) -> None:
+        store, checked, source_ref = self._store_with_source("[5, 0]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "ratio", "observed": 1.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_fraction_strings_are_parsed(self) -> None:
+        store, checked, source_ref = self._store_with_source('["3/4", "1/4"]')
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {
+                "source_ref": source_ref, "operation": "sum", "observed": 1.0, "tolerance": 1e-9,
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+
+    def test_boolean_json_values_are_rejected_not_silently_coerced(self) -> None:
+        store, checked, source_ref = self._store_with_source("[1, true, 2]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "sum", "observed": 3.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_oversized_source_is_unknown_solver_timeout(self) -> None:
+        store, checked, source_ref = self._store_with_source(str(list(range(10_001))))
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "sum", "observed": 1.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.SOLVER_TIMEOUT
+
+    def test_round_to_applies_before_tolerance_comparison(self) -> None:
+        store, checked, source_ref = self._store_with_source("[1.004, 1.004]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        # sum = 2.008; observed claims the rounded-to-2dp value 2.01 --
+        # a tight absolute tolerance alone would FAIL without rounding.
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {
+                "source_ref": source_ref, "operation": "sum", "observed": 2.01,
+                "tolerance": 0.0, "round_to": 2,
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+
+    def test_relative_tolerance_scales_with_expected_value(self) -> None:
+        store, checked, source_ref = self._store_with_source("[1000]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        # 1% relative tolerance on expected=1000 -> allows up to 10 off.
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {
+                "source_ref": source_ref, "operation": "sum", "observed": 1009.0,
+                "tolerance": 0.01, "tolerance_mode": "relative",
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {
+                "source_ref": source_ref, "operation": "sum", "observed": 1020.0,
+                "tolerance": 0.01, "tolerance_mode": "relative",
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.FAIL
+
+    def test_unsupported_tolerance_mode_is_unknown_not_silently_absolute(self) -> None:
+        store, checked, source_ref = self._store_with_source("[10]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {
+                "source_ref": source_ref, "operation": "sum", "observed": 10.0, "tolerance_mode": "percent",
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_empty_source_array_is_unknown_not_representable(self) -> None:
+        store, checked, source_ref = self._store_with_source("[]")
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {"source_ref": source_ref, "operation": "sum", "observed": 0.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+
 class TestDependencyConstraint:
     """Coverage for ConstraintKind.DEPENDENCY (Fix C, checklist item C4) --
     _check_dependency adapts dependency_verifier's own must_reference/
@@ -532,6 +695,55 @@ class TestDependencyConstraint:
         )
         evidence = checker.check(
             target_ref, [constraint], context={"dependency": {"d1": {"relation": "must_reuse"}}}
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_must_be_consistent_with_passes_when_relevant_symbols_supplied_and_restatement_matches(self) -> None:
+        # Fix C checklist item C3's second bullet, now that Fix B's B3
+        # registry exists.
+        store = ArtifactGraphStore()
+        store.add_version("definition", ArtifactKind.SECTION, content="We fix $n = 10$ here.")
+        store.add_version("worked_examples", ArtifactKind.SECTION, content="Using $n = 10$, we proceed.")
+        source_ref = store.latest("definition").ref
+        target_ref = store.latest("worked_examples").ref
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {
+                "relation": "must_be_consistent_with", "relevant_symbols": ["n"],
+            }}},
+        )
+        assert evidence[0].outcome == CheckOutcome.PASS
+
+    def test_must_reuse_fails_on_a_mismatched_restated_value(self) -> None:
+        store = ArtifactGraphStore()
+        store.add_version("definition", ArtifactKind.SECTION, content="The coefficient is $k = 25$.")
+        store.add_version("worked_examples", ArtifactKind.SECTION, content="Using $k = 10$, we compute.")
+        source_ref = store.latest("definition").ref
+        target_ref = store.latest("worked_examples").ref
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {"relation": "must_reuse", "relevant_symbols": ["k"]}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.FAIL
+
+    def test_must_be_consistent_with_is_unknown_without_relevant_symbols_even_when_values_present(self) -> None:
+        store, source_ref, target_ref = self._store_with_source_and_target()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(
+            constraint_id="d1", kind=ConstraintKind.DEPENDENCY, description="x", applies_to=[source_ref]
+        )
+        evidence = checker.check(
+            target_ref, [constraint],
+            context={"dependency": {"d1": {"relation": "must_be_consistent_with"}}},
         )
         assert evidence[0].outcome == CheckOutcome.UNKNOWN
         assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE

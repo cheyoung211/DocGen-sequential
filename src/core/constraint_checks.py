@@ -90,11 +90,17 @@ Progress.ver2 under Stage 3, not forgotten.
 from __future__ import annotations
 
 import json
+import re
+from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.artifact_graph import ArtifactGraphStore
 from src.core.dependency_mapping import CrossSectionObligation, MappingStatus
-from src.core.dependency_verifier import _verify_must_precede, _verify_must_reference
+from src.core.dependency_verifier import (
+    _verify_must_precede,
+    _verify_must_reference,
+    _verify_shared_value_relation,
+)
 from src.core.schemas import (
     ArtifactRef,
     CheckOutcome,
@@ -105,12 +111,116 @@ from src.core.schemas import (
 )
 from src.dataset.schemas import DependencyRelation
 
-# The one recompute operation this checker actually implements -- "숫자
-# 재계산부터 구현하고" (checklist item 2) is satisfied by one concrete,
-# narrow case (summing a JSON array of numbers read from a stored source
-# artifact), not a general expression evaluator. Any other operation name
-# is UNKNOWN/NOT_REPRESENTABLE, exactly like an unimplemented ConstraintKind.
-_RECOMPUTE_OPERATIONS = {"sum": sum}
+def _product(numbers: List[float]) -> float:
+    result = 1.0
+    for n in numbers:
+        result *= n
+    return result
+
+
+def _mean(numbers: List[float]) -> float:
+    return sum(numbers) / len(numbers)
+
+
+def _difference(numbers: List[float]) -> float:
+    return numbers[0] - sum(numbers[1:])
+
+
+def _ratio(numbers: List[float]) -> float:
+    return numbers[0] / numbers[1]
+
+
+def _percentage(numbers: List[float]) -> float:
+    return (numbers[0] / numbers[1]) * 100.0
+
+
+def _percentage_change(numbers: List[float]) -> float:
+    old, new = numbers
+    return ((new - old) / old) * 100.0
+
+
+def _power(numbers: List[float]) -> float:
+    base, exponent = numbers
+    return base ** exponent
+
+
+# Revision (Additional verifiers) plan, Fix B checklist item B2: "기존 합계
+# 재계산을 필요한 연산으로 확장" -- the plan's own 사칙연산/합계/비율·백분율
+# table row, plus "power" for Gold Labeling's sample_001 (0.998^999
+# miscalculated). Deliberately still one narrow, named set of concrete
+# operations, never a general expression evaluator -- "값 대입" (value
+# substitution) in the plan's text is satisfied by these operations
+# themselves taking already-substituted source values, not by adding an
+# arbitrary-formula eval path (which would be a real code-execution
+# surface over source content, not a narrow deterministic tool). Any
+# operation name not listed here is UNKNOWN/NOT_REPRESENTABLE, exactly
+# like an unimplemented ConstraintKind.
+_RECOMPUTE_OPERATIONS = {
+    "sum": sum,
+    "mean": _mean,
+    "product": _product,
+    "difference": _difference,
+    "ratio": _ratio,
+    "percentage": _percentage,
+    "percentage_change": _percentage_change,
+    "power": _power,
+}
+
+# None = any length >= 1 (sum/mean/product: a reduction over the whole
+# array). An explicit int = exactly that many operands -- ratio/
+# percentage/percentage_change/power read as binary operations on
+# [a, b] (percentage_change and power are order-sensitive: [old, new]
+# and [base, exponent] respectively), not well-defined for any other
+# arity, so a mismatched count is UNKNOWN/NOT_REPRESENTABLE ("입력 부족"),
+# never silently padded/truncated or crashed on.
+_RECOMPUTE_OPERATION_ARITY: Dict[str, Optional[int]] = {
+    "sum": None,
+    "mean": None,
+    "product": None,
+    "difference": None,
+    "ratio": 2,
+    "percentage": 2,
+    "percentage_change": 2,
+    "power": 2,
+}
+
+# A hard bound on how many source numbers a single recompute call will
+# read, not a preemptive wall-clock timeout -- every operation above is a
+# single linear pass with no recursion, so the real risk this guards
+# against is a pathologically large stored artifact, not a slow
+# algorithm. Reported as UnknownReason.SOLVER_TIMEOUT (the plan's "실행
+# 시간 한도") since that is the closest honest fit in the existing
+# vocabulary; the docstring is deliberately exact about what is and isn't
+# actually enforced, per this project's own standing rule against
+# claiming a stronger guarantee than the literal code provides.
+_MAX_RECOMPUTE_INPUTS = 10_000
+
+_FRACTION_PATTERN = re.compile(r"^[+-]?\d+/\d+$")
+
+
+def _coerce_recompute_number(raw: Any) -> float:
+    """B2's "분수" handling: accepts a plain JSON number, a decimal
+    string (``"3.5"``), or a simple ``"a/b"`` fraction string
+    (``"3/4"``, ``"-1/2"``) -- never a percentage string (``"12%"``):
+    whether that means ``0.12`` or ``12`` is genuinely ambiguous without
+    more context than a source array gives, so it is deliberately left
+    unparsed (a parse error, same as any other unsupported shape) rather
+    than guessed; the ``"percentage"``/``"percentage_change"``
+    *operations* exist instead for percentage computation. JSON
+    booleans are explicitly rejected even though ``isinstance(True,
+    int)`` is true in Python -- without this, a stray ``true``/``false``
+    in the source array would silently become ``1.0``/``0.0``."""
+    if isinstance(raw, bool):
+        raise ValueError(f"boolean {raw!r} is not a recompute input")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if _FRACTION_PATTERN.match(stripped):
+            return float(Fraction(stripped))
+        return float(stripped)
+    raise ValueError(f"{raw!r} is not a number, decimal string, or 'a/b' fraction string")
+
 
 # The three constraint kinds this checker can actually evaluate; CSP_SMT
 # and SYMBOLIC still always fall through to the final "not implemented"
@@ -362,9 +472,13 @@ class BasicConstraintChecker:
 
         observed = float(values["observed"])
         tolerance = float(values.get("tolerance", 0.0))
+        tolerance_mode = values.get("tolerance_mode", "absolute")
+        round_to = values.get("round_to")
 
         if "source_ref" in values and "operation" in values:
-            return self._check_recompute_from_source(constraint, artifact, values, observed, tolerance)
+            return self._check_recompute_from_source(
+                constraint, artifact, values, observed, tolerance, tolerance_mode, round_to
+            )
 
         if "expected" in values:
             expected = float(values["expected"])
@@ -377,6 +491,7 @@ class BasicConstraintChecker:
             return self._recompute_verdict(
                 constraint, artifact, expected=expected, observed=observed, tolerance=tolerance,
                 input_versions=input_versions, missing_inputs=missing_inputs, mode="comparison",
+                tolerance_mode=tolerance_mode, round_to=round_to,
             )
 
         return Evidence(
@@ -397,6 +512,8 @@ class BasicConstraintChecker:
         values: Dict[str, Any],
         observed: float,
         tolerance: float,
+        tolerance_mode: str = "absolute",
+        round_to: Optional[int] = None,
     ) -> Evidence:
         """Actually recomputes ``expected`` from a stored source
         artifact's content -- the mode that earns "숫자 재계산" rather
@@ -455,30 +572,97 @@ class BasicConstraintChecker:
             )
 
         try:
-            numbers = json.loads(stored_source.content)
-            if not isinstance(numbers, list) or not all(isinstance(n, (int, float)) for n in numbers):
-                raise ValueError("not a JSON array of numbers")
-        except (ValueError, TypeError, json.JSONDecodeError):
+            raw_numbers = json.loads(stored_source.content)
+            if not isinstance(raw_numbers, list):
+                raise ValueError("not a JSON array")
+            numbers = [_coerce_recompute_number(n) for n in raw_numbers]
+        except (ValueError, TypeError, ZeroDivisionError, json.JSONDecodeError):
             input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
             return Evidence(
                 constraint_id=constraint.constraint_id,
                 outcome=CheckOutcome.UNKNOWN,
                 checked_artifact=artifact,
                 detail=(
-                    f"source artifact {source_ref.artifact_id}@v{source_ref.version}'s content "
-                    "is not a JSON array of numbers -- cannot recompute"
+                    f"source artifact {source_ref.artifact_id}@v{source_ref.version}'s content is "
+                    "not a JSON array of numbers (plain numbers, decimal strings, or 'a/b' fraction "
+                    "strings) -- cannot recompute"
                 ),
                 unknown_reason=UnknownReason.NOT_REPRESENTABLE,
                 input_versions=input_versions,
                 missing_inputs=missing_inputs,
             )
 
-        expected = float(_RECOMPUTE_OPERATIONS[operation](numbers))
+        if len(numbers) > _MAX_RECOMPUTE_INPUTS:
+            input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=(
+                    f"source artifact {source_ref.artifact_id}@v{source_ref.version} has "
+                    f"{len(numbers)} values, over this checker's {_MAX_RECOMPUTE_INPUTS}-value "
+                    "execution bound -- not recomputed"
+                ),
+                unknown_reason=UnknownReason.SOLVER_TIMEOUT,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
+
+        required_arity = _RECOMPUTE_OPERATION_ARITY[operation]
+        if required_arity is not None and len(numbers) != required_arity:
+            input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=(
+                    f"operation {operation!r} requires exactly {required_arity} source value(s), "
+                    f"source artifact {source_ref.artifact_id}@v{source_ref.version} has "
+                    f"{len(numbers)} -- insufficient input, not guessed at"
+                ),
+                unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
+        if required_arity is None and not numbers:
+            input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=(
+                    f"source artifact {source_ref.artifact_id}@v{source_ref.version} has no values "
+                    f"-- cannot recompute {operation!r} over an empty input"
+                ),
+                unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
+
+        try:
+            expected = float(_RECOMPUTE_OPERATIONS[operation](numbers))
+        except (ZeroDivisionError, ValueError, OverflowError, TypeError) as exc:
+            # Division by zero (ratio/percentage/percentage_change), a
+            # negative base with a fractional exponent (power -> complex,
+            # which float() then rejects), or an overflowing power -- all
+            # genuinely "cannot represent this result", never a crash and
+            # never silently coerced to some placeholder number.
+            input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=f"operation {operation!r} on {numbers!r} is not representable as a real number ({exc})",
+                unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
         input_versions, missing_inputs = self._resolve_input_refs(constraint, [source_ref])
         return self._recompute_verdict(
             constraint, artifact, expected=expected, observed=observed, tolerance=tolerance,
             input_versions=input_versions, missing_inputs=missing_inputs,
             mode=f"recomputed via {operation!r} from {source_ref.artifact_id}@v{source_ref.version}",
+            tolerance_mode=tolerance_mode, round_to=round_to,
         )
 
     def _recompute_verdict(
@@ -492,15 +676,54 @@ class BasicConstraintChecker:
         input_versions: List[ArtifactRef],
         missing_inputs: Optional[List[ArtifactRef]] = None,
         mode: str,
+        tolerance_mode: str = "absolute",
+        round_to: Optional[int] = None,
     ) -> Evidence:
+        """Compares ``expected``/``observed`` -- optionally rounded first
+        (B2's "반올림 자리"), with either an absolute tolerance (the
+        original, default behavior) or a tolerance relative to
+        ``abs(expected)`` (B2's "절대/상대 오차"). An unrecognized
+        ``tolerance_mode`` is UNKNOWN/NOT_REPRESENTABLE, never silently
+        treated as "absolute" -- a caller's typo in this parameter must
+        not quietly change what tolerance was actually applied."""
         missing_inputs = missing_inputs or []
-        diff = abs(expected - observed)
-        if diff <= tolerance:
+        if tolerance_mode not in ("absolute", "relative"):
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=f"unsupported tolerance_mode {tolerance_mode!r} -- only 'absolute'/'relative' implemented",
+                unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
+
+        compare_expected, compare_observed = expected, observed
+        rounding_note = ""
+        if round_to is not None:
+            compare_expected = round(expected, round_to)
+            compare_observed = round(observed, round_to)
+            rounding_note = f", rounded to {round_to} decimal place(s)"
+
+        effective_tolerance = tolerance
+        if tolerance_mode == "relative":
+            effective_tolerance = tolerance * abs(compare_expected)
+
+        diff = abs(compare_expected - compare_observed)
+        tolerance_note = (
+            f"tolerance={tolerance} ({tolerance_mode})"
+            if tolerance_mode == "absolute"
+            else f"tolerance={tolerance} relative to expected -> {effective_tolerance}"
+        )
+        if diff <= effective_tolerance:
             return Evidence(
                 constraint_id=constraint.constraint_id,
                 outcome=CheckOutcome.PASS,
                 checked_artifact=artifact,
-                detail=f"observed={observed} matches expected={expected} ({mode}) within tolerance={tolerance}",
+                detail=(
+                    f"observed={compare_observed} matches expected={compare_expected} ({mode}){rounding_note} "
+                    f"within {tolerance_note}"
+                ),
                 input_versions=input_versions,
                 missing_inputs=missing_inputs,
             )
@@ -509,8 +732,8 @@ class BasicConstraintChecker:
             outcome=CheckOutcome.FAIL,
             checked_artifact=artifact,
             detail=(
-                f"observed={observed} does not match expected={expected} ({mode}) "
-                f"(|diff|={diff} > tolerance={tolerance})"
+                f"observed={compare_observed} does not match expected={compare_expected} ({mode}){rounding_note} "
+                f"(|diff|={diff} > {tolerance_note})"
             ),
             input_versions=input_versions,
             missing_inputs=missing_inputs,
@@ -549,10 +772,17 @@ class BasicConstraintChecker:
         checker and the whole-document report must never be able to
         disagree about the same fact.
 
-        ``must_reuse``/``must_be_consistent_with`` stay UNKNOWN/
-        NOT_REPRESENTABLE -- Fix B's shared-value registry does not exist
-        on this branch yet (see this module's own ``_IMPLEMENTED_KINDS``
-        comment).
+        ``must_reuse``/``must_be_consistent_with`` (Fix C checklist item
+        C3's second bullet, now that Fix B's B3 registry exists) delegate
+        to ``dependency_verifier._verify_shared_value_relation`` the same
+        way -- but ONLY when the caller supplies a non-empty
+        ``relevant_symbols`` list in ``values``; an empty/absent one stays
+        UNKNOWN/NOT_REPRESENTABLE exactly as before this round, since a
+        shared-value check with no explicit symbol allowlist would have
+        to guess which symbols are shared, which this checker (and
+        ``shared_value_registry`` underneath it) never does -- see that
+        module's own docstring. Optional extra keys: ``value_scope``,
+        ``value_unit``, ``value_assumptions``, ``symbol_aliases``.
         """
         if not values or "relation" not in values:
             return Evidence(
@@ -594,25 +824,55 @@ class BasicConstraintChecker:
             order_hint=tuple(order_hint) if order_hint is not None else None,
         )
 
+        stored_target = self._store.get_version(artifact.artifact_id, artifact.version)
+        target_content = stored_target.content if stored_target is not None else None
+
         if relation == DependencyRelation.MUST_REFERENCE:
-            stored_target = self._store.get_version(artifact.artifact_id, artifact.version)
-            rendered = (
-                {artifact.artifact_id: stored_target.content}
-                if stored_target is not None and stored_target.content is not None
-                else {}
-            )
+            rendered = {artifact.artifact_id: target_content} if target_content is not None else {}
             record = _verify_must_reference(obligation, rendered)
         elif relation == DependencyRelation.MUST_PRECEDE:
             record = _verify_must_precede(obligation)
+        elif relation in (DependencyRelation.MUST_REUSE, DependencyRelation.MUST_BE_CONSISTENT_WITH):
+            relevant_symbols = values.get("relevant_symbols") or []
+            if not relevant_symbols:
+                return Evidence(
+                    constraint_id=constraint.constraint_id,
+                    outcome=CheckOutcome.UNKNOWN,
+                    checked_artifact=artifact,
+                    detail=(
+                        f"{relation.value} verification needs an explicit relevant_symbols "
+                        "allowlist in context['dependency'][...] -- never guessed, to avoid "
+                        "flagging an independently-scoped value as inconsistent."
+                    ),
+                    unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                    input_versions=input_versions,
+                    missing_inputs=missing_inputs,
+                )
+            source_ref_obj = constraint.applies_to[0] if constraint.applies_to else None
+            source_content = None
+            if source_ref_obj is not None:
+                stored_source = self._store.get_version(source_ref_obj.artifact_id, source_ref_obj.version)
+                source_content = stored_source.content if stored_source is not None else None
+            rendered = {}
+            if source_section_id and source_content is not None:
+                rendered[source_section_id] = source_content
+            if target_content is not None:
+                rendered[artifact.artifact_id] = target_content
+            record = _verify_shared_value_relation(
+                obligation,
+                rendered,
+                relevant_symbols,
+                scope=values.get("value_scope", "global"),
+                unit=values.get("value_unit"),
+                assumptions=values.get("value_assumptions", []),
+                symbol_aliases=values.get("symbol_aliases"),
+            )
         else:
             return Evidence(
                 constraint_id=constraint.constraint_id,
                 outcome=CheckOutcome.UNKNOWN,
                 checked_artifact=artifact,
-                detail=(
-                    f"{relation.value} verification is deferred to Fix B's shared-value "
-                    "registry/recompute checks, not implemented on this branch yet."
-                ),
+                detail=f"unrecognized dependency relation {relation.value!r}",
                 unknown_reason=UnknownReason.NOT_REPRESENTABLE,
                 input_versions=input_versions,
                 missing_inputs=missing_inputs,
