@@ -5,10 +5,13 @@ enabled``'s real-flag wiring added in Stage 1 / Fix A).
 Importing run_full_pipeline.py pulls in its real top-level dependencies
 (LLMClient, SDXLGenerator, FluxGenerator) -- this is the one module that
 genuinely needs them at import time, so this test is slow (tens of
-seconds) rather than light. See test_pipeline_dependency_ordering.py for
-a separate, pre-existing, unrelated import issue in the same module
-(stale reference to a renamed/removed `_dependency_ordered` helper) --
-not touched here, out of this stage's scope.
+seconds) rather than light. test_pipeline_dependency_ordering.py was
+previously excluded from the regression suite over an ImportError for
+`_dependency_ordered` -- a review found that function was never actually
+implemented (not "renamed/removed" as an earlier round here had assumed
+without checking git history, which shows no prior commit ever defined
+it); Fix C (C2) implemented it for real and that test file now passes
+and needs no `--ignore=` anymore.
 """
 
 from __future__ import annotations

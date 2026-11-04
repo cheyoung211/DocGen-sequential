@@ -482,11 +482,13 @@ class DocumentGraph(BaseModel):
 
         Mirrors ``src/core/controller.py::compute_ready_artifacts``'s
         "stale AND every live input not stale" definition, for this
-        legacy, single-version graph -- deliberately not called anywhere
-        in ``run_full_pipeline.py``'s own generation loop (today strictly
-        sequential, blueprint order), the same deliberate "define and test
-        the concept now, wire real concurrent dispatch later" choice that
-        function's own docstring describes for Stage 5's artifact graph.
+        legacy, single-version graph. A review found that NOT calling this
+        from ``run_full_pipeline.py``'s own generation loop (this method's
+        prior scope note) left the readiness concept defined and tested
+        but never actually preventing a target from drafting before its
+        source -- ``run_full_pipeline.py``'s loop now calls this, per
+        node, right before drafting it (see ``_dependency_ordered`` there
+        for the batch-ordering half of the same fix).
 
         A dependency naming a node id that doesn't exist counts as unmet
         (not vacuously satisfied) -- this can only happen from a bug
@@ -571,6 +573,11 @@ class DocumentGraph(BaseModel):
         current". A dependency whose source node has since disappeared
         entirely also counts as stale -- there is no way the node's
         content still reflects something that no longer exists.
+
+        Called from ``run_full_pipeline.py``'s ``_repair_and_recompile``
+        right after a compile-error repair regenerates a section, which is
+        the one point in that pipeline where an already-drafted section's
+        content can still change after something else already read it.
         """
         stale: Set[str] = set()
         for node_id in candidate_ids:

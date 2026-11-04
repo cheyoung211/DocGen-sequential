@@ -115,6 +115,38 @@ class DependencyContextPromptTest(unittest.TestCase):
         self.assertIn("[…]", prompt)
         self.assertNotIn("word " * 400, prompt)
 
+    def test_excerpt_selects_the_relevant_paragraph_even_when_it_is_not_near_the_start(self) -> None:
+        # A review found that always taking the first 500 chars could drop
+        # a required value placed later in a long source section entirely
+        # -- not even truncated, just absent. The excerpt selection must
+        # prefer the paragraph that actually matches the dependency's own
+        # description over an earlier, unrelated one.
+        graph = _graph_with(intro_status=NodeStatus.DRAFTED)
+        filler = "Unrelated filler text about something else entirely. " * 10  # > 500 chars alone
+        graph.nodes["sec_intro"].content = (
+            filler + "\n\n" +
+            "The crisis threshold constant is set to 0.42 standard deviations above the mean."
+        )
+        graph.nodes["sec_results"].spec["dependency_notes"][0]["description"] = (
+            "Results must reuse the exact crisis threshold constant defined in the introduction."
+        )
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        prompt = agent._build_prompt_from_node(graph.nodes["sec_results"], graph, layout_blocks=[])
+
+        self.assertIn("0.42 standard deviations", prompt)
+
+    def test_excerpt_falls_back_to_the_prefix_when_description_has_no_keyword_overlap(self) -> None:
+        # No shared keywords at all -> ties on score 0 everywhere -> the
+        # tie-break (original order) reproduces the old "take the prefix"
+        # behavior exactly, not an arbitrary reshuffling.
+        graph = _graph_with(intro_status=NodeStatus.DRAFTED)
+        graph.nodes["sec_intro"].content = "Alpha paragraph here.\n\nBeta paragraph here."
+        graph.nodes["sec_results"].spec["dependency_notes"][0]["description"] = "xyz123 nonmatching"
+        agent = TextAgent(llm_client=_STUB_LLM_CLIENT)
+        prompt = agent._build_prompt_from_node(graph.nodes["sec_results"], graph, layout_blocks=[])
+
+        self.assertIn("Alpha paragraph here.", prompt)
+
     def test_must_reference_is_surfaced_even_when_source_is_undrafted(self) -> None:
         # must_reference only needs the source's label (valid before
         # drafting) -- a legitimate forward reference must not be dropped

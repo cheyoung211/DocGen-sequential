@@ -165,6 +165,44 @@ against": a cascade candidate in that state is left exactly as-is
 (reported via ``RepairExecutionResult.left_stale``, never fabricated a
 verdict either way)."""
 
+
+def _context_for_check(
+    provider: ConstraintProvider, ref: ArtifactRef, base_context: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Builds the ``context`` a real ``CheckCall`` against ``ref`` should
+    carry: ``base_context`` (if any) merged with ``provider.context_for(ref)``
+    when ``provider`` actually offers one.
+
+    A review found that both real call sites driving a ``ConstraintProvider``
+    (``RepairOperationExecutor._check`` below, and ``RuleBasedController.
+    decide`` in ``controller.py``) always built a fixed/empty ``context``,
+    completely ignoring whatever the provider itself would say a specific
+    artifact's constraints need -- reproduced concretely for
+    ``DependencyConstraintProvider``: the exact same missing-citation
+    ``CrossSectionObligation`` came back FAIL when checked with
+    ``provider.context_for(ref)``, and UNKNOWN/``NOT_CHECKED`` when checked
+    with the empty context either call site actually passes. Every
+    provider-returned ``Constraint`` becomes practically unusable through
+    these two call sites without this -- not a hypothetical gap, since
+    this module's own tests drive a provider through them directly (its
+    docstring's "not wired into run_full_pipeline.py" scope boundary is
+    about the real *pipeline*, not about this class's own internal
+    correctness when something -- a test, or a future caller -- already
+    does construct and use it).
+
+    Duck-typed via ``getattr(provider, "context_for", None)`` rather than
+    a Protocol/``isinstance`` check: a plain function assigned as a
+    ``ConstraintProvider`` (the only kind this module had before Fix C's
+    ``DependencyConstraintProvider``) has no attributes at all to look
+    up, so this degrades to exactly the old fixed/empty ``context`` for
+    every such provider -- no existing caller's behavior changes."""
+    context = dict(base_context) if base_context else {}
+    context_for = getattr(provider, "context_for", None)
+    if callable(context_for):
+        context.update(context_for(ref))
+    return context
+
+
 def _classify_evidence(evidence: List[Evidence]) -> str:
     """One of ``"FAIL"``/``"PASS"``/``"UNKNOWN"`` -- the three-way split a
     review found missing (point 3 above). ``"PASS"`` requires at least one
@@ -633,7 +671,10 @@ class RepairOperationExecutor:
         verdict, which the existing ``_classify_evidence``/``UNKNOWN``
         path already handles honestly (left stale, never fabricated)
         without this method needing a third return state."""
-        call = CheckCall(artifact=ref, constraints=constraints, context=dict(self._base_context))
+        call = CheckCall(
+            artifact=ref, constraints=constraints,
+            context=_context_for_check(self._constraints_for, ref, self._base_context),
+        )
         observation = self._tool_executor.execute(call)
         if not observation.ok:
             assert observation.error is not None

@@ -45,8 +45,10 @@ from src.dataset.schemas import (
 )
 from src.evaluation.metrics.contract_satisfaction import (
     COMPONENT_TYPE_TO_LAYOUT_KIND,
+    _TOPIC_KEYWORD_WEIGHT,
     _keywords,
     _match_required_section,
+    _normalize_title,
 )
 
 #: Same literal string Stage 0 pinned as ``AdditionalVerifierRunMetadata.
@@ -77,6 +79,17 @@ class ComponentMapping(BaseModel):
     component_id: str
     status: MappingStatus
     placement_section_id: str
+    #: ``RequiredComponent.reference_required`` carried straight through,
+    #: regardless of ``status`` -- this is a fact about the benchmark's own
+    #: requirement (principle 4), not something matching produces, so it
+    #: must survive even an UNMATCHED/AMBIGUOUS/NOT_REPRESENTABLE/
+    #: DUPLICATE_ID component exactly as declared. A later round (C3/B)
+    #: checking "is this component actually cited somewhere" needs this
+    #: flag to know whether an absent citation is a FAIL or trivially a
+    #: PASS (principle 4: ``reference_required=False`` needs no citation
+    #: at all) -- without it, that distinction cannot be recovered from the
+    #: report alone.
+    reference_required: bool = False
     matched_section_id: Optional[str] = None
     matched_block_id: Optional[str] = None
     matched_label: Optional[str] = None
@@ -158,6 +171,54 @@ def _best_keyword_match(
     return None, True
 
 
+def _tied_section_candidates(
+    req: RequiredSection,
+    blueprint: DocumentBlueprint,
+    claimed_ids: Set[str],
+    topic_keywords: Set[str],
+    matched_via: str,
+) -> List[str]:
+    """Recomputes, for the SAME tier ``_match_required_section`` actually
+    matched on, whether more than one unclaimed section ties for that
+    match -- without re-implementing which section *wins* a tier (that
+    stays ``_match_required_section``'s own job, reused as-is). A review
+    found that reusing it as-is silently hid this: its title/keyword tiers
+    both resolve a tie by first-seen list order, so reversing the order of
+    two identically-titled (or identically-scoring) sections changes which
+    one a required section matches to, with both runs reporting MATCHED --
+    an unreported ambiguity. ``matched_via == "section_id"`` can never be
+    ambiguous (an exact ``section_id`` lookup names exactly one node) and
+    is not re-checked here."""
+    if matched_via == "title":
+        normalized_req_title = _normalize_title(req.title)
+        tied = [
+            s.section_id for s in blueprint.sections
+            if s.section_id not in claimed_ids and _normalize_title(s.title) == normalized_req_title
+        ]
+        return sorted(tied) if len(tied) > 1 else []
+
+    if matched_via == "keyword_overlap":
+        req_keywords = _keywords(req.title) | _keywords(req.purpose)
+        if not req_keywords:
+            return []
+        scored: List[Tuple[float, str]] = []
+        for section in blueprint.sections:
+            if section.section_id in claimed_ids:
+                continue
+            shared = req_keywords & _keywords(section.title)
+            score = sum(_TOPIC_KEYWORD_WEIGHT if kw in topic_keywords else 1.0 for kw in shared)
+            scored.append((score, section.section_id))
+        if not scored:
+            return []
+        max_score = max(score for score, _ in scored)
+        if max_score <= 0:
+            return []
+        tied = sorted(sid for score, sid in scored if score == max_score)
+        return tied if len(tied) > 1 else []
+
+    return []
+
+
 def build_section_mappings(benchmark_item: BenchmarkItem, graph: DocumentGraph) -> List[SectionMapping]:
     """Section-level mapping -- thin wrapper over the existing shared
     matcher (``_match_required_section``), not a reimplementation."""
@@ -187,6 +248,20 @@ def build_section_mappings(benchmark_item: BenchmarkItem, graph: DocumentGraph) 
                     section_id=req.section_id,
                     status=MappingStatus.UNMATCHED,
                     reason="no generated section matched via section_id, normalized title, or keyword overlap.",
+                )
+            )
+            continue
+        tied = _tied_section_candidates(req, blueprint, claimed_ids, topic_keywords, matched_via)
+        if tied:
+            mappings.append(
+                SectionMapping(
+                    section_id=req.section_id,
+                    status=MappingStatus.AMBIGUOUS,
+                    matched_via=matched_via,
+                    reason=(
+                        f"{len(tied)} unclaimed sections tie on {matched_via!r} for this required "
+                        "section, not claiming any of them by arbitrary order: " + ", ".join(tied)
+                    ),
                 )
             )
             continue
@@ -242,6 +317,7 @@ def build_dependency_mapping_report(
                     component_id=comp.component_id,
                     status=MappingStatus.DUPLICATE_ID,
                     placement_section_id=comp.placement,
+                    reference_required=comp.reference_required,
                     reason="this component_id is declared more than once in required_components; skipped rather than guessed.",
                 )
             )
@@ -254,6 +330,7 @@ def build_dependency_mapping_report(
                     component_id=comp.component_id,
                     status=MappingStatus.UNMATCHED,
                     placement_section_id=comp.placement,
+                    reference_required=comp.reference_required,
                     reason=(
                         f"placement section {comp.placement!r} did not resolve to a real generated "
                         "section (see its own SectionMapping entry for why)."
@@ -269,6 +346,7 @@ def build_dependency_mapping_report(
                     component_id=comp.component_id,
                     status=MappingStatus.NOT_REPRESENTABLE,
                     placement_section_id=comp.placement,
+                    reference_required=comp.reference_required,
                     matched_section_id=placement_mapping.matched_section_id,
                     reason=f"ComponentType.{comp.type.value} has no corresponding LayoutBlockKind in this pipeline.",
                 )
@@ -283,6 +361,7 @@ def build_dependency_mapping_report(
                     component_id=comp.component_id,
                     status=MappingStatus.UNMATCHED,
                     placement_section_id=comp.placement,
+                    reference_required=comp.reference_required,
                     matched_section_id=placement_mapping.matched_section_id,
                     reason=f"no unclaimed block of kind {layout_kind.value!r} in section {placement_mapping.matched_section_id!r}.",
                 )
@@ -299,6 +378,7 @@ def build_dependency_mapping_report(
                         component_id=comp.component_id,
                         status=MappingStatus.AMBIGUOUS,
                         placement_section_id=comp.placement,
+                        reference_required=comp.reference_required,
                         matched_section_id=placement_mapping.matched_section_id,
                         reason=(
                             f"{len(candidates)} unclaimed blocks of kind {layout_kind.value!r} in section "
@@ -317,6 +397,7 @@ def build_dependency_mapping_report(
                 component_id=comp.component_id,
                 status=MappingStatus.MATCHED,
                 placement_section_id=comp.placement,
+                reference_required=comp.reference_required,
                 matched_section_id=placement_mapping.matched_section_id,
                 matched_block_id=best.id,
                 matched_label=matched_label,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from src.core.artifact_graph import ArtifactGraphStore
 from src.core.constraint_checks import BasicConstraintChecker
+from src.core.controller import ControllerState, RuleBasedController
 from src.core.dependency_constraint_provider import DependencyConstraintProvider
 from src.core.dependency_mapping import CrossSectionObligation, DependencyMappingReport, MappingStatus
 from src.core.dependency_verifier import verify_cross_section_obligations
@@ -125,6 +126,41 @@ def test_a_missing_citation_fail_scopes_repair_to_the_target_section():
     assert actions[0].action_type == RepairActionType.REGENERATE_SECTION
     assert actions[0].target_artifacts == [target_ref]
     assert actions[0].triggering_constraint_id == "reference_key_result::summary"
+
+
+def test_rule_based_controller_decide_now_threads_context_so_the_check_actually_fails():
+    """A review found this exact repro: the same missing-citation
+    CrossSectionObligation came back FAIL when checked with
+    ``provider.context_for(ref)``, but UNKNOWN/``not_checked`` when
+    checked with the empty ``context`` ``RuleBasedController.decide()``
+    used to pass to its own ``CheckCall``. Drives the REAL
+    ``RuleBasedController.decide()`` (not a hand-built ``CheckCall``) to
+    confirm the ``repair_operations._context_for_check`` fix actually
+    reaches this controller path end to end."""
+    store = ArtifactGraphStore()
+    store.add_version("intro", ArtifactKind.SECTION, content="x")
+    store.add_version("summary", ArtifactKind.SECTION, content="no citation here")
+    obligation = CrossSectionObligation(
+        dependency_id="reference_key_result", relation=DependencyRelation.MUST_REFERENCE,
+        description="summary must cite intro", source_section_id="intro", target_section_id="summary",
+        status=MappingStatus.MATCHED, matched_source_section_id="intro", matched_target_section_id="summary",
+        allowed_labels=["sec:intro"],
+    )
+    provider = DependencyConstraintProvider(_report([obligation]), store)
+    target_ref = store.latest("summary").ref
+
+    policy = RuleBasedController(target_ref, provider, request_id="req1", output_dir="/tmp/x")
+    state = ControllerState(
+        document_ref=target_ref, checkpoint=store.save_checkpoint(), budget=Budget(cap=1000.0),
+        current_evidence=[], tracked_artifact_ids=set(), compiled=False,
+    )
+    call = policy.decide(state, store, _executor(store))
+
+    assert call.action.value == "check"
+    assert call.context == provider.context_for(target_ref)  # not {}
+
+    observation = _executor(store).execute(call)
+    assert observation.output.evidence[0].outcome == CheckOutcome.FAIL  # not UNKNOWN/NOT_CHECKED
 
 
 def test_unresolved_dependency_evidence_survives_checkpoint_and_resume():

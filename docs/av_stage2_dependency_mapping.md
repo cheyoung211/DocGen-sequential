@@ -444,3 +444,130 @@ executor/checkpoint 연결은 그대로 재사용된다.
   적어 둔 기존 gap(I1, production `ConstraintProvider` 부재)과 동일한 종류의 문제이고
   여기서 새로 풀지 않는다. `DependencyMappingReport`는 지금은 `BenchmarkItem` +
   `DocumentGraph`(블루프린트+label_registry)만 입력으로 받는 순수 함수로 만든다.
+  **(2026-11-04 갱신: `run_full_pipeline.py`의 readiness/cycle 연결은 §7에서 실제로
+  닫혔다 -- 단, `DependencyConstraintProvider`를 그 파이프라인의 실제 생성 루프에
+  연결하는 것 자체는 여전히 I1 범위다. 이 두 가지는 서로 다른 "연결"이다: §7이 고친
+  건 레거시 `DocumentGraph`/`planner.py`/`text_agent.py` 경로가 자신이 이미 짜 둔
+  `dependencies`를 실제로 지키게 만든 것이고, I1이 아직 닫지 않은 건 그 레거시
+  경로와 전혀 별개인 `ArtifactGraphStore`/`ToolExecutor`/`RuleBasedController` 스택을
+  `run_full_pipeline.py`에 아예 연결하는 것이다.)**
+
+## 7. 리뷰 발견 수정 (2026-11-04) -- C1/C2/C4 완료 후 외부 리뷰 5건
+
+C4-C5를 끝낸 뒤, 외부 리뷰(P1 3건, P2 2건)가 이 구현을 실제로 돌려 다섯 가지 결함을
+찾았다. 전부 코드를 다시 읽어 재현한 뒤 고쳤다 -- 아래 각 항목은 리뷰가 지목한 파일·
+줄을 직접 확인하고 수정한 것이다.
+
+**[P1 · C1] `reference_required`가 매핑 결과에서 사라짐.** `ComponentMapping`이
+`RequiredComponent.depends_on`은 반영하면서 `reference_required`는 전혀 읽지
+않았다 -- 리뷰가 지적한 그대로, 이 값을 True↔False로 바꿔도 보고서가 완전히
+동일했다. `ComponentMapping`에 `reference_required: bool` 필드를 추가하고 6개
+생성 지점(DUPLICATE_ID/UNMATCHED×2/NOT_REPRESENTABLE/AMBIGUOUS/MATCHED) 전부에서
+`comp.reference_required`를 그대로 보존하도록 고쳤다 -- 매칭 상태와 무관하게 "이
+요구사항이 원래 인용을 요구했는가"라는 사실 자체는 항상 살아남아야 하기 때문이다
+(원칙 4). `test_reference_required_is_preserved_on_component_mapping`이 리뷰의
+재현 그대로(True/False 두 리포트의 `model_dump()`가 달라야 함)를 검증한다.
+
+**[P2 · C1] 섹션 매핑의 동점을 MATCHED로 처리.** `build_section_mappings`가 재사용하는
+`_match_required_section`의 title/keyword 두 tier는 모두 "동점이면 리스트 순서상
+첫 번째"로 해소한다 -- 재사용 대상인 그 함수 자체를 바꾸지 않고(다른 호출자인
+planner.py 검증/contract_satisfaction.py 채점에 영향 주지 않기 위해), `_tied_section_
+candidates`를 새로 추가해 `_match_required_section`이 실제로 이긴 tier에서만 동점
+후보를 재계산한다. 동점이 있으면 `AMBIGUOUS`로 보고하고 어느 쪽도 claim하지 않는다.
+`matched_via == "section_id"`(정확한 id 일치)는 애초에 동점이 날 수 없으므로 재검사
+대상에서 제외. 섹션 순서를 뒤집어도 항상 AMBIGUOUS가 나오는지 확인하는 테스트
+(`test_section_mapping_reports_ambiguous_on_title_tie_regardless_of_list_order`)로
+리뷰의 재현을 그대로 검증했다.
+
+**[P2 · C2] 500자 절단이 요구사항과 무관한 접두사만 남길 수 있음.**
+`TextAgent._build_dependency_context`가 `source_node.content`의 앞 500자만 잘라
+붙였다 -- 필요한 값/수식/가정이 그 뒤에 있으면 아예 프롬프트에 들어가지 않았다.
+`_select_relevant_excerpt`(신규, static method)를 추가해: 빈 줄 기준으로 content를
+블록 단위로 나누고(`_render_draft_with_anchors`가 이미 그렇게 렌더링함), 각 블록을
+dependency의 `description`과의 키워드 overlap(`_keywords`, 재사용)으로 채점해 가장
+관련 있는 블록부터 예산(500자)을 채우고, 선택된 블록들을 원래 문서 순서로 되돌려
+이어붙인다. 하나의 최고 관련 블록만으로 예산을 넘으면 그 블록만 직접 자른다(재배치된
+텍스트의 앞부분을 맹목적으로 자르면 방금 골라낸 바로 그 내용이 잘려 나가는 버그를
+직접 재현해서 고쳤다 -- 처음 구현은 이 버그가 있었다). description에 겹치는 키워드가
+전혀 없거나 content에 빈 줄 구조가 전혀 없으면 예전과 동일한 "앞부분부터" 동작으로
+자연스럽게 축소된다.
+`test_excerpt_selects_the_relevant_paragraph_even_when_it_is_not_near_the_start`가
+500자보다 긴 무관한 내용 뒤에 숨은 필요한 값이 실제로 프롬프트에 나타나는지 확인한다.
+
+**[P1 · C4] 실제 controller/repair executor에서 dependency 검사가 항상 UNKNOWN/
+not_checked로 끝남.** `controller.py`의 `RuleBasedController.decide()` 두 지점과
+`repair_operations.py`의 `RepairOperationExecutor._check()`가 전부 `context={}`
+또는 고정된 `self._base_context`만 썼다 -- `DependencyConstraintProvider.context_for()`를
+전혀 호출하지 않는다. 리뷰가 재현한 그대로: 같은 인용 누락 obligation을
+`provider.context_for(ref)`로 체크하면 FAIL, 이 두 실제 호출 경로가 쓰는 빈
+context로 체크하면 UNKNOWN/NOT_CHECKED. `repair_operations.py`에 `_context_for_check(
+provider, ref, base_context)` 헬퍼를 추가했다 -- `base_context`에 `provider.
+context_for(ref)`(존재하면, `getattr` duck-typing)를 merge한다. 일반 함수로 된
+기존 `ConstraintProvider`(`context_for` 속성이 없음)는 정확히 예전과 동일한 동작으로
+축소되므로 다른 호출자의 동작은 바뀌지 않는다. 세 호출 지점(`RepairOperationExecutor.
+_check`, `RuleBasedController.decide`의 두 `CheckCall`)을 모두 이 헬퍼로 바꿨다.
+`test_rule_based_controller_decide_now_threads_context_so_the_check_actually_fails`
+(`test_dependency_controller_integration.py`)가 리뷰의 재현을 실제
+`RuleBasedController.decide()` + 실제 `ToolExecutor.execute()`로 end-to-end
+재확인한다 -- 더 이상 UNKNOWN이 아니라 FAIL이 나온다.
+
+이 수정은 "`repair_operations.py`/`controller.py`는 `run_full_pipeline.py`에 연결돼
+있지 않다"는 그 모듈들 자신의 기존 scope 선언과 충돌하지 않는다 -- 그 선언은 실제
+*파이프라인*에 대한 것이고, 이 버그는 그 클래스들이 (테스트에서든, 나중의 실제
+호출자에서든) 이미 구성되어 쓰일 때 스스로 내는 결과가 틀렸다는, 모듈 내부
+정확성 문제다.
+
+**[P1 · C2] 실제 생성 루프가 dependency를 전달하지도, readiness를 적용하지도 않음.**
+두 가지가 겹쳐 있었다:
+1. `run_full_pipeline.py`의 `PlannerInput(...)` 생성 지점이 `required_sections`만
+   넘기고 `cross_section_dependencies`는 항상 기본값 `[]`였다 -- C2가 `planner.py`/
+   `text_agent.py`에 짜 넣은 와이어링 전체가 이 파이프라인에서는 그냥 죽은 코드였다.
+   `benchmark_item.cross_section_dependencies`를 실제로 넘기도록 고쳤다.
+2. 그 다음 실행 루프가 매 iteration마다 PENDING/ERROR 노드를 전부 바로 처리했다 --
+   `_build_dependency_context`가 아직 drafted되지 않은 source를 프롬프트에서
+   생략하는 것은 모델이 그 내용을 지어내는 것만 막을 뿐, target이 너무 일찍 drafted
+   되는 것 자체는 전혀 막지 못한다(리뷰의 정확한 지적). 두 가지로 고쳤다:
+   - `DocumentGraph.find_dependency_cycles()`를 그래프 구성 직후 한 번 호출해,
+     기다려도 절대 풀리지 않는 순환을 생성 시작 전에 명확한 에러로 끝낸다("몇 번째
+     iteration에서 뭐가 안 끝났는지"만 보여주는 기존의 모호한 에러 대신).
+   - 배치(한 iteration의 pending_nodes) 처리 순서를 `_dependency_ordered`(신규)로
+     재배열해 같은 배치 안의 dependency가 먼저 오게 하고, 각 노드를 실제로 drafting
+     하기 직전에 `graph.compute_ready_sections({node.id})`를 **그 시점의 그래프
+     상태로 다시** 확인한다 -- 같은 루프 안에서 방금 drafted된 형제 노드를 즉시
+     반영하므로 흔한 경우(둘 다 이번 pass에서 성공)는 추가 iteration 없이 바로
+     풀리고, source가 이번 pass에 실패하면(ERROR로 재시도 필요) dependent는 여전히
+     이번 pass에서 제외되어 다음 iteration으로 미뤄진다(한 번의 snapshot만 보고
+     판단하는 방식이었다면 놓쳤을 경우).
+3. `_repair_and_recompile`(컴파일 에러 복구 루프)도 고쳤다 -- 이 경로는 이미
+   drafted된 섹션의 내용을 그 이후에 다시 바꿀 수 있는 유일한 지점이라,
+   `DocumentGraph.find_stale_dependents()`로 그 섹션을 must_reuse/must_be_
+   consistent_with로 읽었던 다른 섹션을 찾아 재조립 전에 다시 drafting한다 --
+   하지 않으면 더 이상 존재하지 않는 내용을 계속 인용/재사용하는 섹션이 조용히
+   남는다.
+
+**흥미로운 발견 (추정이 아니라 git 기록으로 확인)**: `_dependency_ordered`를 구현하며
+`test_pipeline_dependency_ordering.py`를 다시 보니, Stage 0 라운드에서 이 파일의
+import 실패를 "renamed/removed된 `_dependency_ordered`에 대한 stale 참조"라고
+**추정**해 두고 손대지 않았던 기록을 발견했다. `git log --all -S"_dependency_ordered"`로
+전체 히스토리를 확인한 결과 이 이름은 이 저장소 어디에도 커밋된 적이 없다 --
+"renamed/removed"가 아니라 애초에 구현된 적이 없는, C2 기능을 위해 미리 작성된
+스펙이었다(이 라운드 전의 `test_planner_cross_section_dependencies.py`/
+`test_text_agent_dependency_context.py`와 정확히 같은 패턴). 이번에 실제로
+구현해 4개 테스트가 모두 통과하고, `test/test_run_full_pipeline_additional_verifier_
+metadata.py`의 잘못된 추정 docstring도 함께 고쳤다. 더 이상 `--ignore=`가 필요 없다.
+
+**회귀 확인**: `pytest test/ -q`(이제 `test_pipeline_dependency_ordering.py`를
+ignore할 필요 없음) -- 기존 50개 무관 실패와 정확히 동일(diff로 확인, 신규 실패
+0건), 신규/확장 테스트 16개(dependency_mapping +5, text_agent dependency context +2,
+repair_operations +2, controller +2, dependency_controller_integration +1,
+pipeline_dependency_ordering +4) 전부 통과, 전체 1115 passed / 50 failed.
+
+**명시적으로 검증하지 않은 것**: `DocGenPipeline.run()`의 실행 루프와
+`_repair_and_recompile` 자체는 (이 수정 이전에도) 전용 단위 테스트가 없다 --
+planner/text_agent/image_agent/assembler/compiler를 전부 엮어야 하는 무거운
+통합 테스트가 필요해서다. 이번 수정이 실제로 쓰는 두 빌딩 블록(`_dependency_
+ordered`, `DocumentGraph.compute_ready_sections`)은 각각 충분히 테스트되어
+있지만, 이 둘을 `DocGenPipeline.run()`/`_repair_and_recompile` 안에서 **조합한
+결과** 자체를 실제로 실행해 확인한 테스트는 없다 -- import/문법 검사와 코드
+직접 검토로만 확인했다. 실제 Qwen3.6 파이프라인으로의 소규모 파일럿은 이
+라운드의 범위 밖(Stage 0/5가 이미 적어 둔 것과 같은 종류의 후속 과제)이다.

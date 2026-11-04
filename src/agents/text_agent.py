@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,7 @@ from src.common.schemas import (
 from src.common.state import DocumentGraph, LayoutBlock, LayoutBlockKind, NodeStatus, SectionLayout
 from src.dataset.schemas import DependencyRelation
 from src.evaluation.event_logger import AttemptTracker, EventLogger
+from src.evaluation.metrics.contract_satisfaction import _keywords
 from src.helpers.tools import pandas_csv_to_latex_table
 
 
@@ -996,6 +998,63 @@ class TextAgent:
     #: out this section's own instructions. See _build_dependency_context.
     _DEPENDENCY_EXCERPT_CHAR_CAP = 500
 
+    @staticmethod
+    def _select_relevant_excerpt(content: str, description: str, cap: int) -> str:
+        """A review found that always taking the first ``cap`` characters
+        of a source section can drop the exact value/formula/assumption a
+        dependency's ``description`` actually asks for, whenever that
+        content happens to sit later in a long source section (nothing
+        past the prefix is in the window at all, not even truncated).
+
+        Splits ``content`` on blank lines -- the paragraph/block boundary
+        ``_render_draft_with_anchors`` already renders with -- scores each
+        chunk by keyword overlap (``_keywords``, reused rather than
+        reimplemented) against ``description``, and keeps chunks
+        highest-scoring-first until the budget is spent, then puts the
+        kept chunks back in their original document order so the excerpt
+        still reads top-to-bottom. Degrades to the old "take the prefix"
+        behavior when ``description`` has no recognizable keywords or
+        ``content`` has no blank-line structure at all (a single
+        undifferentiated paragraph) -- there is no finer-grained block
+        boundary surviving in ``DocumentNode.content`` to select on in
+        that case (see also ``dependency_versions_used``'s own docstring
+        on this legacy graph's granularity limits)."""
+        if len(content) <= cap:
+            return content
+
+        chunks = [c for c in re.split(r"\n\s*\n", content) if c.strip()]
+        if not chunks:
+            chunks = [content]
+
+        description_keywords = _keywords(description)
+        ranked = sorted(
+            range(len(chunks)),
+            key=lambda i: (-len(description_keywords & _keywords(chunks[i])), i),
+        )
+
+        chosen: List[int] = []
+        used = 0
+        for i in ranked:
+            chunk = chunks[i]
+            if chosen and used + len(chunk) + 2 > cap:
+                # Already have at least one chunk; a lower-relevance chunk
+                # that would blow the remaining budget is skipped rather
+                # than chopped into a half-sentence fragment -- but later,
+                # smaller, still-lower-relevance chunks may still fit.
+                continue
+            chosen.append(i)
+            used += len(chunk) + 2  # +2 for the blank-line join below
+        chosen.sort()  # restore original document order for a coherent excerpt
+
+        excerpt = "\n\n".join(chunks[i] for i in chosen).strip()
+        if len(excerpt) > cap:
+            # Only reachable when the single highest-relevance chunk alone
+            # exceeds the cap -- truncate IT directly, not a blind prefix
+            # of the (reordered-to-original-position) joined text, which
+            # would cut the very content this method chose to keep.
+            excerpt = excerpt[:cap].rstrip()
+        return excerpt + " […]"
+
     def _build_dependency_context(self, node: Any, graph: DocumentGraph) -> str:
         """Surfaces, for a node's ``spec["dependency_notes"]`` (written by
         ``PlannerAgent._wire_cross_section_dependencies``), what each
@@ -1064,10 +1123,9 @@ class TextAgent:
                 continue
 
             content = source_node.content.strip()
-            if len(content) > self._DEPENDENCY_EXCERPT_CHAR_CAP:
-                excerpt = content[: self._DEPENDENCY_EXCERPT_CHAR_CAP].rstrip() + " […]"
-            else:
-                excerpt = content
+            excerpt = self._select_relevant_excerpt(
+                content, str(note.get("description") or ""), self._DEPENDENCY_EXCERPT_CHAR_CAP
+            )
             key_points = source_node.spec.get("key_points", [])
             lines.append(
                 f"- {source_id} ({source_node.title}) [{relation}]: {note.get('description')}\n"

@@ -56,6 +56,23 @@ def _constraint_provider(ref: ArtifactRef) -> List[Constraint]:
     return [Constraint(constraint_id="c0", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[ref])]
 
 
+class _ConstraintProviderWithContext:
+    """A ``ConstraintProvider`` that also exposes per-artifact
+    ``context_for`` -- the shape ``DependencyConstraintProvider`` (Fix C,
+    ``src/core/dependency_constraint_provider.py``) actually has,
+    reproduced here with no dependency on that module so this stage's own
+    tests stay self-contained."""
+
+    def __init__(self, context_by_artifact: Dict[str, Dict[str, Any]]) -> None:
+        self._context_by_artifact = context_by_artifact
+
+    def __call__(self, ref: ArtifactRef) -> List[Constraint]:
+        return [Constraint(constraint_id="c0", kind=ConstraintKind.SCHEMA_CONTRACT, description="x", applies_to=[ref])]
+
+    def context_for(self, ref: ArtifactRef) -> Dict[str, Any]:
+        return dict(self._context_by_artifact.get(ref.artifact_id, {}))
+
+
 class _FakeProducer:
     """Always SUCCEEDS with ``f"fixed:{artifact_id}"`` unless ``artifact_id``
     is in ``fail_ids``."""
@@ -501,6 +518,47 @@ def test_rule_based_controller_finishes_unresolved_rather_than_compiling() -> No
     assert call.action.value == "finish"
     assert call.reason == "unresolved_remaining"
     assert call.unresolved_artifact_ids == ["b"]
+
+
+def test_rule_based_controller_initial_check_threads_the_providers_own_context() -> None:
+    """A review found both ``CheckCall`` sites in ``RuleBasedController.
+    decide`` built ``context={}`` unconditionally, ignoring whatever the
+    constraint provider itself says a specific artifact's constraints
+    need -- so a provider like ``DependencyConstraintProvider`` was
+    unusable through this real controller path even though every other
+    piece (budget, resume, repair-scope selection) already worked."""
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="doc1").ref
+    provider = _ConstraintProviderWithContext({"doc": {"dependency": {"d1": {"relation": "must_reference"}}}})
+    policy = RuleBasedController(doc_ref, provider, request_id="req1", output_dir="/tmp/x")
+    state = ControllerState(
+        document_ref=doc_ref, checkpoint=store.save_checkpoint(), budget=Budget(cap=1000.0),
+        current_evidence=[], tracked_artifact_ids=set(), compiled=False,
+    )
+    tool_executor = ToolExecutor(store, _AlwaysFailValidator(), budget=Budget(cap=1000.0), max_actions=10)
+    call = policy.decide(state, store, tool_executor)
+    assert call.action.value == "check"
+    assert call.context == {"dependency": {"d1": {"relation": "must_reference"}}}
+
+
+def test_rule_based_controller_unresolved_check_threads_the_providers_own_context() -> None:
+    store = ArtifactGraphStore()
+    doc_ref = store.add_version("doc", ArtifactKind.DOCUMENT, content="doc1").ref
+    a_ref = store.add_version("a", ArtifactKind.DEFINITION, content="a1").ref
+    store.add_version("b", ArtifactKind.CLAIM, content="b1", read_input_versions=[a_ref])
+    store.add_version("a", ArtifactKind.DEFINITION, content="a2")  # marks "b" stale
+    provider = _ConstraintProviderWithContext({"b": {"dependency": {"d1": {"relation": "must_reference"}}}})
+    policy = RuleBasedController(doc_ref, provider, request_id="req1", output_dir="/tmp/x")
+    state = ControllerState(
+        document_ref=doc_ref, checkpoint=store.save_checkpoint(), budget=Budget(cap=1000.0),
+        current_evidence=[Evidence(constraint_id="c0", outcome=CheckOutcome.PASS, checked_artifact=doc_ref)],
+        tracked_artifact_ids={"doc", "b"}, compiled=False,
+    )
+    tool_executor = ToolExecutor(store, _AlwaysFailValidator(), budget=Budget(cap=1000.0), max_actions=10)
+    call = policy.decide(state, store, tool_executor)
+    assert call.action.value == "check"
+    assert call.artifact.artifact_id == "b"
+    assert call.context == {"dependency": {"d1": {"relation": "must_reference"}}}
 
 
 # -- Bug 3: UNKNOWN must never read as resolved; compiled must be reset ----

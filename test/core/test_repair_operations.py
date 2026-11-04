@@ -128,6 +128,41 @@ class _SequencedValidator:
         ]
 
 
+class _ContextRecordingValidator:
+    """Always PASS; records the ``context`` it actually received on each
+    call so a test can assert on it directly, instead of the fake having
+    opinions about what the context should contain."""
+
+    def __init__(self) -> None:
+        self.contexts: List[Dict[str, Any]] = []
+
+    def check(
+        self, artifact: ArtifactRef, constraints: List[Constraint], context: Optional[Dict[str, Any]] = None
+    ) -> List[Evidence]:
+        self.contexts.append(dict(context) if context is not None else {})
+        return [
+            Evidence(constraint_id=c.constraint_id, outcome=CheckOutcome.PASS, checked_artifact=artifact, detail="fake")
+            for c in constraints
+        ]
+
+
+class _ConstraintProviderWithContext:
+    """A ``ConstraintProvider`` that also exposes per-artifact
+    ``context_for`` -- the shape ``DependencyConstraintProvider``
+    (Fix C, ``src/core/dependency_constraint_provider.py``) actually has,
+    reproduced here with no dependency on that module so this stage's own
+    tests stay self-contained."""
+
+    def __init__(self, context_by_artifact: Dict[str, Dict[str, Any]]) -> None:
+        self._context_by_artifact = context_by_artifact
+
+    def __call__(self, ref: ArtifactRef) -> List[Constraint]:
+        return [Constraint(constraint_id=f"c:{ref.artifact_id}", kind=ConstraintKind.SCHEMA_CONTRACT, description="d")]
+
+    def context_for(self, ref: ArtifactRef) -> Dict[str, Any]:
+        return dict(self._context_by_artifact.get(ref.artifact_id, {}))
+
+
 class _RaisingValidator:
     """Always raises instead of returning Evidence -- models a real
     ``Validator.check()`` crash, which ``ToolExecutor`` reports as
@@ -185,6 +220,50 @@ def _action(action_type: RepairActionType, targets: List[ArtifactRef], feedback:
 # ---------------------------------------------------------------------------
 # RepairOperationExecutor -- the selective cascade.
 # ---------------------------------------------------------------------------
+
+
+def test_check_threads_the_providers_own_context_not_just_the_fixed_base_context() -> None:
+    """A review found ``_check`` always built ``context=dict(self._base_context)``,
+    completely ignoring whatever the constraint provider itself would say a
+    specific artifact's constraints need -- so any ``ConstraintProvider``
+    with a ``context_for`` method (Fix C's ``DependencyConstraintProvider``
+    shape) was unusable through this real executor path, even though this
+    stage's own machinery (budget, cascade, reverify) was otherwise
+    correct. The post-regeneration reverify inside ``_regenerate`` is what
+    calls ``_check`` for a direct single-target action, so a plain
+    PATCH_BLOCK on one target exercises it without needing a cascade."""
+    store = ArtifactGraphStore()
+    _store_with_chain(store, ("blkA", ArtifactKind.BLOCK))
+    provider = _ConstraintProviderWithContext({"blkA": {"dependency": {"d1::blkA": {"relation": "must_reference"}}}})
+    validator = _ContextRecordingValidator()
+    tool_executor = ToolExecutor(store, validator, budget=Budget(cap=1_000_000.0), max_actions=1_000_000)
+    executor = RepairOperationExecutor(
+        store, tool_executor, {ArtifactKind.BLOCK: _FakeProducer()}, provider,
+        base_context={"shared": "base"}, model_name="fake-model",
+    )
+    action = _action(RepairActionType.PATCH_BLOCK, [store.latest("blkA").ref])
+
+    executor.execute(action)
+
+    assert len(validator.contexts) == 1
+    assert validator.contexts[0]["shared"] == "base"  # the fixed base_context must still survive
+    assert validator.contexts[0]["dependency"] == {"d1::blkA": {"relation": "must_reference"}}
+
+
+def test_check_degrades_to_the_old_fixed_context_for_a_plain_callable_provider() -> None:
+    """A ``ConstraintProvider`` with no ``context_for`` (every provider
+    this stage had before Fix C) must see exactly the same ``context`` it
+    always did -- this fix must not change behavior for an existing
+    caller that never offered per-artifact context in the first place."""
+    store = ArtifactGraphStore()
+    _store_with_chain(store, ("blkA", ArtifactKind.BLOCK))
+    validator = _ContextRecordingValidator()
+    executor = _executor(store, {ArtifactKind.BLOCK: _FakeProducer()}, validator)
+    action = _action(RepairActionType.PATCH_BLOCK, [store.latest("blkA").ref])
+
+    executor.execute(action)
+
+    assert validator.contexts == [{}]  # base_context was {} in _executor(), and no context_for exists
 
 
 def test_regenerates_only_the_target_when_nothing_downstream_exists() -> None:

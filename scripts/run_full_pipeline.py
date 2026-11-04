@@ -328,6 +328,48 @@ def _warn_verifier_pairing_mismatches(
             )
 
 
+def _dependency_ordered(nodes: List[DocumentNode]) -> List[DocumentNode]:
+    """Orders ``nodes`` (one outer iteration's pending batch) so a
+    dependency (``DocumentNode.dependencies``, wired by
+    ``PlannerAgent._wire_cross_section_dependencies`` for must_reuse/
+    must_be_consistent_with only) that is ALSO in this same batch comes
+    before its dependent -- so the common case (both draft successfully
+    this same pass) needs no extra outer iteration for TextAgent's
+    dependency context to actually find something drafted (Fix C,
+    checklist item C2). A dependency naming a node id outside this batch
+    (already drafted in an earlier iteration, not tracked at all, or not
+    a real node) is not a blocker here and never affects ordering.
+
+    Repeated sweeps (Kahn's algorithm, not a single topological-sort
+    library call) rather than raising or hanging on a genuine cycle --
+    whatever is left unordered after a sweep makes no progress is
+    appended in its original relative order instead. A real cycle is a
+    separate, already-diagnosed problem (``DocumentGraph.
+    find_dependency_cycles``, checked once before this loop starts); this
+    utility's own job is just to never stall on one, not to detect it
+    again.
+
+    This orders the BATCH; it does not by itself guarantee a dependency
+    drafted successfully -- the caller still re-checks ``graph.
+    compute_ready_sections`` per node, fresh, right before drafting it."""
+    by_id = {n.id: n for n in nodes}
+    in_batch_deps = {n.id: [d for d in n.dependencies if d in by_id and d != n.id] for n in nodes}
+
+    ordered: List[DocumentNode] = []
+    placed: set = set()
+    remaining = list(nodes)
+    while remaining:
+        ready_this_sweep = [n for n in remaining if all(dep in placed for dep in in_batch_deps[n.id])]
+        if not ready_this_sweep:
+            ordered.extend(remaining)  # a cycle among what's left -- keep original order, never hang
+            break
+        for node in ready_this_sweep:
+            ordered.append(node)
+            placed.add(node.id)
+        remaining = [n for n in remaining if n.id not in placed]
+    return ordered
+
+
 class DocGenPipeline:
     def __init__(self,
                  planner_model: str,
@@ -450,6 +492,7 @@ class DocGenPipeline:
                 template=TemplateSpec(name=template_name, main_tex_template="main.tex"),
                 allow_figures=self.images_enabled,
                 required_sections=benchmark_item.required_sections if benchmark_item else [],
+                cross_section_dependencies=benchmark_item.cross_section_dependencies if benchmark_item else [],
             )
 
             print("[Pipeline] Phase 1: Planning Document Structure...")
@@ -471,6 +514,20 @@ class DocGenPipeline:
                     block.id for block in section_layout.blocks
                 ]
 
+            # Fix C (C2): a must_reuse/must_be_consistent_with dependency
+            # cycle can never resolve by waiting -- every member needs
+            # another member drafted first. Checked once, right after the
+            # dependency edges above are wired, so this fails fast with a
+            # precise diagnostic instead of silently burning every
+            # iteration below and surfacing as a generic "never finished
+            # drafting" error with no indication of why.
+            dependency_cycles = graph.find_dependency_cycles()
+            if dependency_cycles:
+                raise RuntimeError(
+                    "Cross-section dependency cycle(s) in the blueprint, cannot "
+                    f"generate: {dependency_cycles}"
+                )
+
             # 2. Execution Loop: Process nodes until all are DRAFTED
             max_iterations = iterations
             for i in range(max_iterations):
@@ -480,22 +537,62 @@ class DocGenPipeline:
                     print("[Pipeline] All nodes drafted successfully.")
                     break
 
-                print(f"[Pipeline] Iteration {i+1}: Processing {len(pending_nodes)} nodes...")
-
-                for node in pending_nodes:
-                    if node.type in [NodeType.SECTION, NodeType.SUBSECTION]:
+                # Fix C (C2): a SECTION/SUBSECTION with an unmet must_reuse/
+                # must_be_consistent_with dependency (DocumentNode.dependencies,
+                # wired by PlannerAgent._wire_cross_section_dependencies) must
+                # not draft with that content simply missing -- omitting it
+                # from the prompt (TextAgent._build_dependency_context) stops
+                # the model from inventing the source's content, but by
+                # itself does nothing to stop the target from drafting too
+                # early. _dependency_ordered puts an in-batch dependency
+                # before its dependent so the common case (both succeed this
+                # same pass) needs no extra iteration; graph.
+                # compute_ready_sections is still re-checked per node, right
+                # before drafting it, against the graph's current (not a
+                # stale start-of-iteration) state -- so a dependency that
+                # fails to draft this pass correctly defers its dependent to
+                # a later iteration instead of drafting it anyway. A node
+                # with no such dependency is trivially ready, so a benchmark
+                # item with no cross_section_dependencies at all sees no
+                # change here.
+                ordered_nodes = _dependency_ordered(pending_nodes)
+                processed_count = 0
+                blocked_ids: List[str] = []
+                for node in ordered_nodes:
+                    if node.type in (NodeType.SECTION, NodeType.SUBSECTION):
+                        if node.id not in graph.compute_ready_sections({node.id}):
+                            blocked_ids.append(node.id)
+                            continue
                         self.text_agent.process_node(
                             node.id, graph, request_id, output_dir=str(self.output_base),
                             event_logger=event_logger, usage_sink=token_usage_records,
                             outer_iteration=i + 1,
                         )
+                        processed_count += 1
                     elif node.type == NodeType.FIGURE:
                         self.image_agent.process_figure_node(
                             node.id, graph, request_id, output_dir=str(self.output_base),
                             event_logger=event_logger, usage_sink=token_usage_records,
                             outer_iteration=i + 1,
                         )
+                        processed_count += 1
                     # Tables are handled inside TextAgent via tools
+
+                if processed_count == 0:
+                    # The upfront find_dependency_cycles() check already
+                    # ruled out "can never become ready" -- this is just
+                    # "not yet", resolved once whatever these are waiting on
+                    # gets drafted in a later iteration.
+                    print(
+                        f"[Pipeline] Iteration {i+1}: {len(blocked_ids)} node(s) still waiting on an "
+                        "undrafted dependency; nothing else is ready this pass."
+                    )
+                    continue
+
+                print(
+                    f"[Pipeline] Iteration {i+1}: Processed {processed_count} node(s)"
+                    + (f" ({len(blocked_ids)} waiting on a dependency)" if blocked_ids else "") + "."
+                )
 
             # Phase 3 reads each SECTION/SUBSECTION's persisted blocks.json and each
             # FIGURE's registered asset off disk -- if a node never reached DRAFTED
@@ -647,6 +744,39 @@ class DocGenPipeline:
             if graph.nodes[location.section_id].status != NodeStatus.DRAFTED:
                 # regenerate_blocks()/process_node() already marked the node
                 # ERROR and logged its own failure -- nothing new to compile.
+                break
+
+            # Fix C (C2): this compile-repair regeneration just gave
+            # location.section_id a new attempt_count/last_updated -- any
+            # already-drafted section whose own must_reuse/must_be_
+            # consistent_with excerpt (DocumentNode.spec["dependency_versions_used"])
+            # was read from the section's *previous* content is now stale
+            # (find_stale_dependents), and must be redrafted against the
+            # repaired content before this round recompiles -- otherwise it
+            # silently keeps citing/reusing content that no longer exists.
+            drafted_ids = {n.id for n in graph.nodes.values() if n.status == NodeStatus.DRAFTED}
+            stale_dependents = graph.find_stale_dependents(drafted_ids)
+            redraft_failed = False
+            if stale_dependents:
+                print(
+                    f"[Pipeline] Compile repair to '{location.section_id}' invalidated "
+                    f"dependency content already drafted in: {sorted(stale_dependents)}; redrafting."
+                )
+                for dependent_id in sorted(stale_dependents):
+                    try:
+                        self.text_agent.process_node(
+                            dependent_id, graph, request_id,
+                            output_dir=str(self.output_base), event_logger=event_logger,
+                            usage_sink=token_usage_records,
+                        )
+                    except Exception as exc:
+                        print(f"[Pipeline] Redrafting stale dependent '{dependent_id}' failed: {exc}")
+                        redraft_failed = True
+                        break
+                    if graph.nodes[dependent_id].status != NodeStatus.DRAFTED:
+                        redraft_failed = True
+                        break
+            if redraft_failed:
                 break
 
             try:

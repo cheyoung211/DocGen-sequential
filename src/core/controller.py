@@ -313,7 +313,12 @@ from langgraph.graph import END, START, StateGraph
 
 from src.core.artifact_graph import ArtifactGraphStore
 from src.core.interfaces import Validator
-from src.core.repair_operations import ConstraintProvider, FixedGraphAwareRepairPolicy, ProducerRegistry
+from src.core.repair_operations import (
+    ConstraintProvider,
+    FixedGraphAwareRepairPolicy,
+    ProducerRegistry,
+    _context_for_check,
+)
 from src.core.schemas import (
     ArtifactKind,
     ArtifactRef,
@@ -854,7 +859,7 @@ class RuleBasedController:
             return CheckCall(
                 artifact=live_document_ref,
                 constraints=self._constraints_for(live_document_ref),
-                context={},
+                context=_context_for_check(self._constraints_for, live_document_ref),
             )
 
         classification = _classify(state.current_evidence)
@@ -873,7 +878,11 @@ class RuleBasedController:
         if not_yet_checked:
             target = store.latest(not_yet_checked[0])
             assert target is not None  # staleness only ever applies to an artifact that exists
-            return CheckCall(artifact=target.ref, constraints=self._constraints_for(target.ref), context={})
+            return CheckCall(
+                artifact=target.ref,
+                constraints=self._constraints_for(target.ref),
+                context=_context_for_check(self._constraints_for, target.ref),
+            )
 
         if unresolved:
             return FinishCall(reason="unresolved_remaining", unresolved_artifact_ids=sorted(_aggregate_unresolved(state, store)))

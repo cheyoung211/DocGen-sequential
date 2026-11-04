@@ -386,6 +386,120 @@ def test_duplicate_component_id_still_reports_its_depends_on_edges():
     assert all(o.depends_on_component_id == "base" for o in c1_obligations)
 
 
+def test_reference_required_is_preserved_on_component_mapping():
+    """A review found that flipping ``reference_required`` True->False left
+    the report byte-for-byte identical -- the obligation itself (not just
+    whether C3/B have gotten around to checking it) must survive mapping."""
+    def _report_for(reference_required: bool):
+        required_sections = [RequiredSection(section_id="s1", title="S1", purpose="p", target_words=50)]
+        required_components = [
+            RequiredComponent(
+                component_id="c1", type=ComponentType.DEFINITION, placement="s1",
+                description="d", reference_required=reference_required,
+            )
+        ]
+        benchmark_item = _benchmark_item(
+            required_sections=required_sections, required_components=required_components,
+            cross_section_dependencies=[
+                CrossSectionDependency(dependency_id="d1", source_section="s1", target_sections=["s1"], relation="must_precede", description="x")
+            ],
+        )
+        graph = _graph([SectionLayout(section_id="s1", title="S1", blocks=[LayoutBlock(id="b1", kind=LayoutBlockKind.DEFINITION)])])
+        return build_dependency_mapping_report(benchmark_item, graph)
+
+    report_true = _report_for(True)
+    report_false = _report_for(False)
+    assert report_true.component_mappings[0].reference_required is True
+    assert report_false.component_mappings[0].reference_required is False
+    assert report_true.model_dump() != report_false.model_dump()
+
+
+def test_reference_required_is_preserved_even_when_component_is_unmatched():
+    required_sections = [RequiredSection(section_id="s1", title="S1", purpose="p", target_words=50)]
+    required_components = [
+        RequiredComponent(
+            component_id="c1", type=ComponentType.THEOREM, placement="s1",
+            description="d", reference_required=True,
+        )
+    ]
+    benchmark_item = _benchmark_item(
+        required_sections=required_sections, required_components=required_components,
+        cross_section_dependencies=[
+            CrossSectionDependency(dependency_id="d1", source_section="s1", target_sections=["s1"], relation="must_precede", description="x")
+        ],
+    )
+    graph = _graph([SectionLayout(section_id="s1", title="S1", blocks=[])])  # no candidate block -> UNMATCHED
+    report = build_dependency_mapping_report(benchmark_item, graph)
+    mapping = report.component_mappings[0]
+    assert mapping.status == MappingStatus.UNMATCHED
+    assert mapping.reference_required is True
+
+
+def test_section_mapping_reports_ambiguous_on_title_tie_regardless_of_list_order():
+    """Two unclaimed sections with the same normalized title must both be
+    flagged AMBIGUOUS, not silently resolved to whichever happens to come
+    first in ``blueprint.sections`` -- a review found that reversing the
+    two sections' order changed which one a required section matched
+    while both runs still reported MATCHED."""
+    req = RequiredSection(section_id="req_sec", title="Worked Examples", purpose="p", target_words=50)
+    benchmark_item = _benchmark_item(
+        required_sections=[req],
+        required_components=[RequiredComponent(component_id="c1", type=ComponentType.DEFINITION, placement="req_sec", description="d")],
+        cross_section_dependencies=[
+            CrossSectionDependency(dependency_id="d1", source_section="req_sec", target_sections=["req_sec"], relation="must_precede", description="x")
+        ],
+    )
+    forward = [
+        SectionLayout(section_id="secA", title="Worked Examples", blocks=[]),
+        SectionLayout(section_id="secB", title="worked   examples", blocks=[]),
+    ]
+    for sections in (forward, list(reversed(forward))):
+        graph = _graph(sections)
+        mapping = build_section_mappings(benchmark_item, graph)[0]
+        assert mapping.status == MappingStatus.AMBIGUOUS
+        assert "secA" in mapping.reason and "secB" in mapping.reason
+        assert mapping.matched_section_id is None
+
+
+def test_section_mapping_reports_ambiguous_on_keyword_overlap_tie():
+    req = RequiredSection(section_id="req_sec", title="Alpha Beta", purpose="", target_words=50)
+    benchmark_item = _benchmark_item(
+        required_sections=[req],
+        required_components=[RequiredComponent(component_id="c1", type=ComponentType.DEFINITION, placement="req_sec", description="d")],
+        cross_section_dependencies=[
+            CrossSectionDependency(dependency_id="d1", source_section="req_sec", target_sections=["req_sec"], relation="must_precede", description="x")
+        ],
+    )
+    graph = _graph([
+        SectionLayout(section_id="secA", title="Gamma Alpha", blocks=[]),
+        SectionLayout(section_id="secB", title="Alpha Gamma", blocks=[]),
+    ])
+    mapping = build_section_mappings(benchmark_item, graph)[0]
+    assert mapping.status == MappingStatus.AMBIGUOUS
+    assert "secA" in mapping.reason and "secB" in mapping.reason
+
+
+def test_section_mapping_exact_id_match_is_never_ambiguous():
+    """``matched_via == "section_id"`` names exactly one node by
+    construction -- the tie-check must not second-guess it even when other,
+    unrelated sections happen to share a title with each other."""
+    req = RequiredSection(section_id="s1", title="Whatever", purpose="p", target_words=50)
+    benchmark_item = _benchmark_item(
+        required_sections=[req],
+        required_components=[RequiredComponent(component_id="c1", type=ComponentType.DEFINITION, placement="s1", description="d")],
+        cross_section_dependencies=[
+            CrossSectionDependency(dependency_id="d1", source_section="s1", target_sections=["s1"], relation="must_precede", description="x")
+        ],
+    )
+    graph = _graph([
+        SectionLayout(section_id="s1", title="Same Title", blocks=[]),
+        SectionLayout(section_id="s2", title="Same Title", blocks=[]),
+    ])
+    mapping = build_section_mappings(benchmark_item, graph)[0]
+    assert mapping.status == MappingStatus.MATCHED
+    assert mapping.matched_section_id == "s1"
+
+
 def test_duplicate_dependency_id_is_reported_for_every_target():
     required_sections = [
         RequiredSection(section_id="s1", title="S1", purpose="p", target_words=50),
