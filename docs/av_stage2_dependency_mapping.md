@@ -541,9 +541,32 @@ _check`, `RuleBasedController.decide`의 두 `CheckCall`)을 모두 이 헬퍼�
 3. `_repair_and_recompile`(컴파일 에러 복구 루프)도 고쳤다 -- 이 경로는 이미
    drafted된 섹션의 내용을 그 이후에 다시 바꿀 수 있는 유일한 지점이라,
    `DocumentGraph.find_stale_dependents()`로 그 섹션을 must_reuse/must_be_
-   consistent_with로 읽었던 다른 섹션을 찾아 재조립 전에 다시 drafting한다 --
-   하지 않으면 더 이상 존재하지 않는 내용을 계속 인용/재사용하는 섹션이 조용히
-   남는다.
+   consistent_with로 읽었던 다른 섹션을 찾아 재조립 전에 다시 drafting한다.
+
+**[P1 · 후속 리뷰, 2026-11-04 2차] 위 3번이 체인을 한 단계만 처리함.** 처음 구현은
+stale dependent 목록을 **한 번만** 계산해 그 목록만 redraft했다. `source -> A -> B`
+체인에서 `source`가 바뀌면 처음엔 `A`만 stale(원래 source를 읽었으므로)이고 `B`는
+아직 stale이 아니다(`A`가 아직 안 바뀌었으므로 B의 snapshot과 A의 현재 상태가 여전히
+일치). `A`를 redraft하면 `A` 자신의 attempt_count가 올라가 이제 `B`가 stale이
+되는데, 한 번만 계산한 목록은 이걸 다시 보지 않아 `B`가 더 이상 존재하지 않는 `A`의
+내용을 계속 인용한 채 재조립·컴파일로 넘어갈 수 있었다 -- 리뷰가 정확히 이 시나리오를
+지적했다. `repair_operations.py`의 `RepairOperationExecutor._execute_selective`가
+이미 쓰는 것과 같은 진짜 fixed-point sweep으로 고쳤다: `_redraft_stale_dependents_
+until_settled(graph, redraft_fn, log=...)`(신규, 모듈 레벨 함수로 분리)가 한 sweep이
+"stale 없음"을 보고할 때까지 `find_stale_dependents`를 매번 다시 호출하고 다시
+redraft한다. `len(graph.nodes) + 1` sweep으로 bound -- 순환 없는 그래프(그래프 구성
+직후의 `find_dependency_cycles` 체크가 이미 보장)에서 fixed point가 걸릴 수 있는
+최대치이며, 그걸 넘기면(이론상 도달 불가능해야 하지만) 조용히 넘어가지 않고 실패로
+보고한다.
+
+이 함수를 `DocGenPipeline`에서 분리해 모듈 레벨에 둔 것은, 리뷰가 지적한 또 다른
+문제 때문이다: "현재 추가된 다중 단계 재생성 테스트는 ArtifactGraph의 repair 경로용
+(`repair_operations.py`)이며, 이 `DocumentGraph`/`run_full_pipeline.py` 경로를
+검증하지는 않는다." 분리된 함수는 `DocGenPipeline`의 나머지(assembler/compiler/
+event_logger)를 전혀 몰라도 되므로, `test/test_pipeline_stale_dependent_redraft.py`
+(6개, 신규)가 `source -> A -> B` 체인 전파를 포함해 직접 단위 테스트로 재현·확인한다
+-- `_dependency_ordered`를 위한 기존 `test_pipeline_dependency_ordering.py`와 같은
+스타일(`DocGenPipeline` 없이 순수 함수만 테스트).
 
 **흥미로운 발견 (추정이 아니라 git 기록으로 확인)**: `_dependency_ordered`를 구현하며
 `test_pipeline_dependency_ordering.py`를 다시 보니, Stage 0 라운드에서 이 파일의
@@ -558,16 +581,21 @@ metadata.py`의 잘못된 추정 docstring도 함께 고쳤다. 더 이상 `--ig
 
 **회귀 확인**: `pytest test/ -q`(이제 `test_pipeline_dependency_ordering.py`를
 ignore할 필요 없음) -- 기존 50개 무관 실패와 정확히 동일(diff로 확인, 신규 실패
-0건), 신규/확장 테스트 16개(dependency_mapping +5, text_agent dependency context +2,
+0건), 신규/확장 테스트 22개(dependency_mapping +5, text_agent dependency context +2,
 repair_operations +2, controller +2, dependency_controller_integration +1,
-pipeline_dependency_ordering +4) 전부 통과, 전체 1115 passed / 50 failed.
+pipeline_dependency_ordering +4, pipeline_stale_dependent_redraft +6) 전부 통과,
+전체 1121 passed / 50 failed.
 
-**명시적으로 검증하지 않은 것**: `DocGenPipeline.run()`의 실행 루프와
-`_repair_and_recompile` 자체는 (이 수정 이전에도) 전용 단위 테스트가 없다 --
-planner/text_agent/image_agent/assembler/compiler를 전부 엮어야 하는 무거운
-통합 테스트가 필요해서다. 이번 수정이 실제로 쓰는 두 빌딩 블록(`_dependency_
-ordered`, `DocumentGraph.compute_ready_sections`)은 각각 충분히 테스트되어
-있지만, 이 둘을 `DocGenPipeline.run()`/`_repair_and_recompile` 안에서 **조합한
-결과** 자체를 실제로 실행해 확인한 테스트는 없다 -- import/문법 검사와 코드
-직접 검토로만 확인했다. 실제 Qwen3.6 파이프라인으로의 소규모 파일럿은 이
-라운드의 범위 밖(Stage 0/5가 이미 적어 둔 것과 같은 종류의 후속 과제)이다.
+**명시적으로 검증하지 않은 것**: `DocGenPipeline.run()`의 실행 루프 자체(2차 리뷰
+이전 버전)는 전용 단위 테스트가 없다 -- planner/text_agent/image_agent/assembler/
+compiler를 전부 엮어야 하는 무거운 통합 테스트가 필요해서다. 이번 수정이 실제로
+쓰는 두 빌딩 블록(`_dependency_ordered`, `DocumentGraph.compute_ready_sections`)은
+각각 충분히 테스트되어 있지만, 이 둘을 `DocGenPipeline.run()` 안에서 **조합한
+결과** 자체를 실제로 실행해 확인한 테스트는 없다 -- import/문법 검사와 코드 직접
+검토로만 확인했다. **`_repair_and_recompile`은 2차 리뷰 이후 다르다**: 체인 전파
+로직을 `_redraft_stale_dependents_until_settled`로 분리해 `DocGenPipeline`과
+무관하게(assembler/compiler/event_logger 없이) 직접 테스트했으므로, 그 핵심
+로직만큼은 이제 실제로 실행해 확인됐다 -- `_repair_and_recompile` 자체가 이 함수를
+올바른 시점(대상 섹션 재생성 직후, 재조립 전)에 호출하는지는 여전히 코드 직접
+검토로만 확인했다. 실제 Qwen3.6 파이프라인으로의 소규모 파일럿은 이 라운드의
+범위 밖(Stage 0/5가 이미 적어 둔 것과 같은 종류의 후속 과제)이다.

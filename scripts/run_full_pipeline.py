@@ -7,7 +7,7 @@ import sys
 import traceback
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
 from datetime import datetime
 
 from tqdm import tqdm
@@ -368,6 +368,59 @@ def _dependency_ordered(nodes: List[DocumentNode]) -> List[DocumentNode]:
             placed.add(node.id)
         remaining = [n for n in remaining if n.id not in placed]
     return ordered
+
+
+def _redraft_stale_dependents_until_settled(
+    graph: DocumentGraph,
+    redraft: Callable[[str], None],
+    *,
+    log: Callable[[str], None] = lambda _msg: None,
+) -> bool:
+    """Repeatedly finds (``DocumentGraph.find_stale_dependents``) and
+    redrafts every already-drafted section whose must_reuse/must_be_
+    consistent_with excerpt no longer matches its source's CURRENT
+    content, until one sweep finds nothing stale -- a real fixed point,
+    not a single computed-once list.
+
+    A review found the one-shot version misses a chain: source -> A -> B
+    (A must_reuse source, B must_reuse A). After source changes, the
+    first sweep correctly finds A stale and redrafts it -- but redrafting
+    A bumps ITS OWN attempt_count, which makes B stale too (B's snapshot
+    of A is now outdated). A one-shot list computed before A was touched
+    never includes B, so B would silently keep citing/reusing A's
+    now-superseded content through the rest of this repair and into
+    reassembly/recompile. Re-finding stale dependents fresh every sweep
+    (mirroring ``RepairOperationExecutor._execute_selective``'s own
+    re-sweep loop in ``repair_operations.py``, the analogous fixed-point
+    for the *other* ("Graph artifacts") revision's artifact-graph repair
+    path -- that module's own multi-step regeneration tests cover that
+    path only, not this ``DocumentGraph``/``run_full_pipeline.py`` one)
+    closes exactly that gap.
+
+    Returns ``True`` once a sweep finds nothing left stale. Returns
+    ``False`` the moment ``redraft`` raises, leaves a node not
+    ``NodeStatus.DRAFTED``, or the fixed point isn't reached within
+    ``len(graph.nodes) + 1`` sweeps -- the most a fixed point over an
+    acyclic dependency graph (guaranteed by the caller's own upfront
+    ``find_dependency_cycles()`` check; nothing here adds a new
+    dependency edge) could ever need. Exhausting that bound without
+    settling is reported as failure rather than silently letting the
+    caller proceed to reassemble/recompile possibly-stale content."""
+    for _ in range(len(graph.nodes) + 1):
+        drafted_ids = {n.id for n in graph.nodes.values() if n.status == NodeStatus.DRAFTED}
+        stale_dependents = graph.find_stale_dependents(drafted_ids)
+        if not stale_dependents:
+            return True
+        log(f"Invalidated dependency content already drafted in: {sorted(stale_dependents)}; redrafting.")
+        for dependent_id in sorted(stale_dependents):
+            try:
+                redraft(dependent_id)
+            except Exception as exc:
+                log(f"Redrafting stale dependent '{dependent_id}' failed: {exc}")
+                return False
+            if graph.nodes[dependent_id].status != NodeStatus.DRAFTED:
+                return False
+    return False
 
 
 class DocGenPipeline:
@@ -752,31 +805,27 @@ class DocGenPipeline:
             # consistent_with excerpt (DocumentNode.spec["dependency_versions_used"])
             # was read from the section's *previous* content is now stale
             # (find_stale_dependents), and must be redrafted against the
-            # repaired content before this round recompiles -- otherwise it
-            # silently keeps citing/reusing content that no longer exists.
-            drafted_ids = {n.id for n in graph.nodes.values() if n.status == NodeStatus.DRAFTED}
-            stale_dependents = graph.find_stale_dependents(drafted_ids)
-            redraft_failed = False
-            if stale_dependents:
-                print(
-                    f"[Pipeline] Compile repair to '{location.section_id}' invalidated "
-                    f"dependency content already drafted in: {sorted(stale_dependents)}; redrafting."
+            # repaired content before this round recompiles -- see
+            # _redraft_stale_dependents_until_settled's own docstring for
+            # why this has to be a real fixed-point sweep, not a one-shot
+            # redraft of a single computed list (a review found a
+            # source -> A -> B chain where redrafting A, itself found
+            # stale from source's change, silently left B reusing A's now-
+            # outdated content, since a one-shot list never revisits B).
+            def _redraft(node_id: str) -> None:
+                self.text_agent.process_node(
+                    node_id, graph, request_id, output_dir=str(self.output_base),
+                    event_logger=event_logger, usage_sink=token_usage_records,
                 )
-                for dependent_id in sorted(stale_dependents):
-                    try:
-                        self.text_agent.process_node(
-                            dependent_id, graph, request_id,
-                            output_dir=str(self.output_base), event_logger=event_logger,
-                            usage_sink=token_usage_records,
-                        )
-                    except Exception as exc:
-                        print(f"[Pipeline] Redrafting stale dependent '{dependent_id}' failed: {exc}")
-                        redraft_failed = True
-                        break
-                    if graph.nodes[dependent_id].status != NodeStatus.DRAFTED:
-                        redraft_failed = True
-                        break
-            if redraft_failed:
+
+            def _log(message: str) -> None:
+                print(f"[Pipeline] Compile repair to '{location.section_id}': {message}")
+
+            if not _redraft_stale_dependents_until_settled(graph, _redraft, log=_log):
+                print(
+                    f"[Pipeline] Compile repair to '{location.section_id}': could not settle "
+                    "every stale dependent; aborting this repair attempt."
+                )
                 break
 
             try:
