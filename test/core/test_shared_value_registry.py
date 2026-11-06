@@ -140,6 +140,129 @@ def test_different_scope_values_are_not_compared_unless_named_relevant():
     assert record.outcome == CheckOutcome.UNKNOWN
 
 
+def test_one_resolved_symbol_does_not_let_an_unresolved_sibling_hide_behind_a_pass():
+    # Regression: n matches cleanly, but k has no source definition at
+    # all -- the obligation must not read as PASS just because n did.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10, nothing about k",
+        config=_config(relevant_symbols=["n", "k"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+    assert "n" in record.checked_semantic_ids
+    assert "k" not in record.checked_semantic_ids
+
+
+def test_an_ambiguous_symbol_is_not_hidden_by_a_different_symbols_success():
+    # Regression: n matches cleanly, but k's source definition is itself
+    # ambiguous -- must not be buried by n's success into an overall PASS.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10, k = 25 ... later k = 99", target_text="n = 10, k = 25",
+        config=_config(relevant_symbols=["n", "k"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+    assert "inconsistent" in record.detail
+    assert "k" in record.detail
+
+
+def test_not_applicable_symbol_is_excluded_from_the_decision_and_reported_separately():
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10",
+        config=_config(relevant_symbols=["n", "k"], not_applicable_symbols=["k"]),
+    )
+    assert record.outcome == CheckOutcome.PASS
+    assert record.not_applicable_semantic_ids == ["k"]
+    assert "k" not in record.checked_semantic_ids
+
+
+def test_all_symbols_not_applicable_is_unknown_not_a_vacuous_pass():
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10",
+        config=_config(relevant_symbols=["n"], not_applicable_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_must_reuse_never_passes_from_a_numeric_match_alone():
+    # A restated matching number is necessary but not sufficient evidence
+    # that the source's definition/formula was actually applied.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_REUSE,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="using n = 10 here",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+    assert "n" in record.checked_semantic_ids  # it WAS compared, just insufficient to confirm reuse
+
+
+def test_must_reuse_still_fails_on_a_genuine_mismatch():
+    # A wrong restated number is still real, sufficient negative evidence
+    # for must_reuse, even though a correct match alone can't confirm it.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_REUSE,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="using n = 15 here",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.FAIL
+
+
+def test_declared_unit_mismatch_between_source_and_target_is_a_fail():
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="L = 5", target_text="L = 5",
+        config=_config(relevant_symbols=["L"], source_unit="meters", target_unit="feet"),
+    )
+    assert record.outcome == CheckOutcome.FAIL
+    assert "unit" in record.detail
+
+
+def test_unit_declared_on_only_one_side_is_unknown():
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="L = 5", target_text="L = 5",
+        config=_config(relevant_symbols=["L"], source_unit="meters"),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_declared_assumptions_mismatch_is_a_fail_even_when_values_match():
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10",
+        config=_config(
+            relevant_symbols=["n"],
+            source_assumptions=["n is prime"], target_assumptions=["n is even"],
+        ),
+    )
+    assert record.outcome == CheckOutcome.FAIL
+    assert "assumptions" in record.detail
+
+
+def test_matching_declared_assumptions_still_allow_pass():
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10",
+        config=_config(
+            relevant_symbols=["n"],
+            source_assumptions=["n is prime"], target_assumptions=["n is prime"],
+        ),
+    )
+    assert record.outcome == CheckOutcome.PASS
+
+
 def test_one_symbol_can_pass_while_another_fails_in_the_same_obligation():
     record = check_shared_value_consistency(
         dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,

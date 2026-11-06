@@ -253,12 +253,115 @@ end-to-end.
   `constraint_checks` branches), but nothing yet calls them from a live generation
   run.
 
+## 5.1. Review round 1 (2026-11-04, same day, uncommitted) -- 4 real bugs found
+
+A user review against the real code (not just the passing tests) found 4 real
+bugs on the first pass, each reproduced directly before fixing.
+
+1. **A dependency's overall PASS could hide a sibling symbol that was never
+   actually resolved.** `check_shared_value_consistency` originally `continue`d
+   silently past a `relevant_symbols` entry with no source definition, an
+   ambiguous source definition, or no target restatement -- so with
+   `relevant_symbols=["n", "k"]`, "n" matching cleanly produced an overall PASS
+   even when "k" had no source definition at all, or an ambiguous one. Reproduced
+   directly (`check_shared_value_consistency(relevant_symbols=["n","k"], ...)`
+   with only "n" resolvable -> `CheckOutcome.PASS`, confirmed wrong). Fixed: every
+   relevant symbol is now tracked into exactly one of three buckets --
+   `checked_semantic_ids` (both sides resolved, match or mismatch), a new
+   `not_applicable_semantic_ids` (explicitly declared out-of-scope for this
+   specific obligation via the new `SharedValueCheckConfig.not_applicable_symbols`,
+   never silently inferred), or unresolved (tracked internally, forces the whole
+   record to UNKNOWN). Priority is now: any mismatch -> FAIL; any unresolved
+   symbol -> UNKNOWN; all relevant/applicable symbols resolved and agreed -> PASS
+   (or the must_reuse exception below); all symbols N/A -> UNKNOWN, never a
+   vacuous PASS. 4 new regression tests.
+2. **`must_reuse`'s PASS never actually confirmed reuse.** The checker treated
+   `must_reuse` and `must_be_consistent_with` identically -- a clean numeric
+   restatement match produced PASS for both, but a target literally stating the
+   same number as the source is not evidence that the source's definition/
+   formula was actually *applied* (the plan's own "인용 한 개가 있다는 사실만으로
+   자동 PASS하지 않는다" extends to a bare numeric match too). Fixed: a full,
+   clean numeric match now yields PASS only for `must_be_consistent_with`;
+   `must_reuse` stays UNKNOWN/`NOT_REPRESENTABLE` even on a full match, with a
+   detail explicitly naming that this checker only verifies the numeric-
+   restatement component, never general semantic reuse -- a genuine MISMATCH is
+   still FAIL for `must_reuse` too (a wrong restated number is real negative
+   evidence either way). Separately, `SharedValueCheckConfig` gained
+   `source_scope`/`target_scope` (default `"global"`/`"global"`, so undeclared
+   scope never triggers a mismatch), `source_unit`/`target_unit`, and
+   `source_assumptions`/`target_assumptions` (all `Optional`, previously a single
+   shared `scope`/`unit`/`assumptions` field was silently copied onto both sides,
+   so a genuine source-vs-target assumption difference could never be detected at
+   all) -- compared once per obligation by the new `_compare_declared_context`:
+   a confirmed difference on either side is FAIL; a field declared on only one
+   side is UNKNOWN ("지원하지 않는 항목"); both undeclared is simply not compared
+   (zero behavior change for every existing caller that never sets these). 7 new
+   regression tests (must_reuse-match-stays-UNKNOWN, must_reuse-mismatch-still-
+   FAILs, unit mismatch/one-sided, assumptions mismatch/match).
+   `_verify_shared_value_relation` and its one real caller
+   (`constraint_checks._check_dependency`) were refactored to pass a whole
+   `SharedValueCheckConfig` object through instead of unpacked scope/unit/
+   assumptions kwargs, specifically so this module and its caller can never drift
+   apart on the config's actual field set again.
+3. **Recompute input parsing could crash instead of returning UNKNOWN, and
+   NaN/Infinity were silently mis-classified.** `_check_recompute` called
+   `float(values["observed"])`/`float(values["expected"])` with no exception
+   handling at all -- a non-numeric `observed` (reproduced:
+   `observed="not-a-number"`) raised an uncaught `ValueError` instead of
+   producing Evidence. Separately, Python's `json.loads` accepts the bare tokens
+   `NaN`/`Infinity` by default, and `float("nan")`/`float(nan)` parse without
+   error -- comparing a NaN with `<=` is always `False` (never raises), so a NaN
+   `observed` silently fell through to the FAIL branch instead of being
+   recognized as "not comparable at all" (reproduced and confirmed). Fixed:
+   `observed`/`tolerance`/`expected` are now parsed via the same
+   `_coerce_recompute_number` the source array already used (reused, not
+   duplicated), wrapped in `try/except` at each call site -> UNKNOWN/
+   `NOT_REPRESENTABLE`, never an uncaught exception; `_coerce_recompute_number`
+   itself now rejects any non-finite result (catches NaN/Infinity from BOTH a
+   source array string token AND a directly-supplied bool/number); `_recompute_
+   verdict` (the one funnel point both RECOMPUTE modes' `expected` passes
+   through) additionally validates `expected`/`observed`/`tolerance` are finite
+   right before comparing -- needed because a legitimate operation on
+   all-finite inputs can still overflow to `inf` with no exception raised at all
+   (`1e308 + 1e308` silently becomes `inf` in Python). `round_to` is now
+   validated as a real (non-bool) `int` before use, UNKNOWN/`NOT_REPRESENTABLE`
+   otherwise. 8 new regression tests, including one reproducing the exact crash
+   and one for an `inf` arising from legitimate-looking direct-comparison-mode
+   input.
+4. **B1's shared-value `MathClaim`s fabricated their provenance.**
+   `math_claims_for_shared_value_record` hardcoded `artifact_version=1`
+   regardless of the real target section's actual version, and never attached a
+   `source_ref` at all -- a claim about a since-regenerated artifact would
+   silently misreport which version it was actually checking. Fixed:
+   `MathClaim.artifact_version` is now `Optional[int] = None` (never a fabricated
+   placeholder -- the same "honest not-reported" discipline `ProductionResult`
+   already established); `math_claims_for_shared_value_record` gained optional
+   `target_ref`/`source_ref: ArtifactRef` parameters, using the real version when
+   supplied and honestly `None` when not. This created a second, correctness
+   question: `MathClaimCoverageReport.externally_sourced_count` was defined as
+   "any claim with `source_ref is None`" -- which would now wrongly count every
+   SHARED_VALUE claim whose caller simply didn't pass `source_ref` as
+   "externally sourced" (a CALCULATION-only concept: an externally-asserted fact
+   with no computable source at all). Fixed by restricting that count to
+   `MathClaimKind.CALCULATION` claims specifically -- a SHARED_VALUE claim always
+   has a real source SECTION by construction (`check_shared_value_consistency`
+   always takes one), so a missing ref there is a reporting gap, never the "no
+   source exists" fact the count is for. 3 new regression tests.
+
+All 4 fixes reproduced directly against the actual code before being fixed (not
+assumed from reading alone). 22 new regression tests across the 3 affected test
+files (all passing); full suite re-confirmed: same 50 pre-existing unrelated
+failures byte-identical via `git stash`, 1187 passed (was 1165). `pyflakes`-clean.
+
 ## 6. Regression
 
-44 new tests (`test_shared_value_registry.py` 14, `test_math_claims.py` 6,
-`test_dependency_verifier.py` +6, `test_dependency_constraint_provider.py` +2,
+First pass: 44 new tests (`test_shared_value_registry.py` 14, `test_math_claims.py`
+6, `test_dependency_verifier.py` +6, `test_dependency_constraint_provider.py` +2,
 `test_constraint_checks.py` +11 B2 operations +3 DEPENDENCY must_reuse/
-must_be_consistent_with wiring, +2 from the pre-existing count correction), all
-passing. Full suite: 1165 passed / 50 failed, the exact same 50 pre-existing
-unrelated failures confirmed byte-identical (not just count) via `git stash` before/
-after comparison -- same discipline every prior stage in this revision has applied.
+must_be_consistent_with wiring). After §5.1's review-fix round: 22 more (10 in
+`test_shared_value_registry.py`, 3 in `test_math_claims.py`, 9 in
+`test_constraint_checks.py`), 66 new tests total, all passing. Full suite: 1187
+passed / 50 failed, the exact same 50 pre-existing unrelated failures confirmed
+byte-identical (not just count) via `git stash` before/after comparison, both
+before and after the review-fix round -- same discipline every prior stage in
+this revision has applied. `pyflakes`-clean throughout.

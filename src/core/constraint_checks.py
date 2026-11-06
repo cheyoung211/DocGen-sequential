@@ -90,6 +90,7 @@ Progress.ver2 under Stage 3, not forgotten.
 from __future__ import annotations
 
 import json
+import math
 import re
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
@@ -101,6 +102,7 @@ from src.core.dependency_verifier import (
     _verify_must_reference,
     _verify_shared_value_relation,
 )
+from src.core.shared_value_registry import SharedValueCheckConfig
 from src.core.schemas import (
     ArtifactRef,
     CheckOutcome,
@@ -209,17 +211,28 @@ def _coerce_recompute_number(raw: Any) -> float:
     *operations* exist instead for percentage computation. JSON
     booleans are explicitly rejected even though ``isinstance(True,
     int)`` is true in Python -- without this, a stray ``true``/``false``
-    in the source array would silently become ``1.0``/``0.0``."""
+    in the source array would silently become ``1.0``/``0.0``. NaN/
+    Infinity are also rejected here (Python's ``json.loads`` accepts the
+    bare tokens ``NaN``/``Infinity``/``-Infinity`` by default, and
+    ``float("nan")``/``float("inf")`` happily parse too) -- a non-finite
+    source value would otherwise silently poison every downstream
+    comparison (see ``_recompute_verdict``'s own finiteness check for why
+    that is dangerous, not just unusual)."""
     if isinstance(raw, bool):
         raise ValueError(f"boolean {raw!r} is not a recompute input")
     if isinstance(raw, (int, float)):
-        return float(raw)
-    if isinstance(raw, str):
+        value = float(raw)
+    elif isinstance(raw, str):
         stripped = raw.strip()
         if _FRACTION_PATTERN.match(stripped):
-            return float(Fraction(stripped))
-        return float(stripped)
-    raise ValueError(f"{raw!r} is not a number, decimal string, or 'a/b' fraction string")
+            value = float(Fraction(stripped))
+        else:
+            value = float(stripped)
+    else:
+        raise ValueError(f"{raw!r} is not a number, decimal string, or 'a/b' fraction string")
+    if not math.isfinite(value):
+        raise ValueError(f"{raw!r} is not a finite number (NaN/Infinity are not valid recompute inputs)")
+    return value
 
 
 # The three constraint kinds this checker can actually evaluate; CSP_SMT
@@ -470,8 +483,17 @@ class BasicConstraintChecker:
                 unknown_reason=UnknownReason.NOT_CHECKED,
             )
 
-        observed = float(values["observed"])
-        tolerance = float(values.get("tolerance", 0.0))
+        try:
+            observed = _coerce_recompute_number(values["observed"])
+            tolerance = _coerce_recompute_number(values.get("tolerance", 0.0))
+        except (ValueError, TypeError) as exc:
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=f"observed/tolerance in context['recompute'][{constraint.constraint_id!r}] is not a finite number ({exc})",
+                unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+            )
         tolerance_mode = values.get("tolerance_mode", "absolute")
         round_to = values.get("round_to")
 
@@ -481,7 +503,16 @@ class BasicConstraintChecker:
             )
 
         if "expected" in values:
-            expected = float(values["expected"])
+            try:
+                expected = _coerce_recompute_number(values["expected"])
+            except (ValueError, TypeError) as exc:
+                return Evidence(
+                    constraint_id=constraint.constraint_id,
+                    outcome=CheckOutcome.UNKNOWN,
+                    checked_artifact=artifact,
+                    detail=f"expected in context['recompute'][{constraint.constraint_id!r}] is not a finite number ({exc})",
+                    unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                )
             raw_source_refs = values.get("source_refs") or []
             source_refs = [
                 ref if isinstance(ref, ArtifactRef) else ArtifactRef.model_validate(ref)
@@ -685,14 +716,46 @@ class BasicConstraintChecker:
         ``abs(expected)`` (B2's "절대/상대 오차"). An unrecognized
         ``tolerance_mode`` is UNKNOWN/NOT_REPRESENTABLE, never silently
         treated as "absolute" -- a caller's typo in this parameter must
-        not quietly change what tolerance was actually applied."""
+        not quietly change what tolerance was actually applied. This is
+        also the one funnel point both RECOMPUTE modes' ``expected``
+        value passes through, so it is where a final finiteness check
+        lives: ``expected`` can still end up non-finite here even after
+        every individual source value was validated (e.g. a legitimate
+        overflow from summing many large finite numbers produces ``inf``
+        with no exception raised at all) -- comparing a NaN/Infinity with
+        ``<=`` never raises, it just silently resolves to a wrong
+        FAIL/PASS (``nan <= anything`` is always ``False`` in Python),
+        which this check must never do."""
         missing_inputs = missing_inputs or []
+        if round_to is not None and (isinstance(round_to, bool) or not isinstance(round_to, int)):
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=f"round_to must be an integer, got {round_to!r}",
+                unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
         if tolerance_mode not in ("absolute", "relative"):
             return Evidence(
                 constraint_id=constraint.constraint_id,
                 outcome=CheckOutcome.UNKNOWN,
                 checked_artifact=artifact,
                 detail=f"unsupported tolerance_mode {tolerance_mode!r} -- only 'absolute'/'relative' implemented",
+                unknown_reason=UnknownReason.NOT_REPRESENTABLE,
+                input_versions=input_versions,
+                missing_inputs=missing_inputs,
+            )
+        if not (math.isfinite(expected) and math.isfinite(observed) and math.isfinite(tolerance)):
+            return Evidence(
+                constraint_id=constraint.constraint_id,
+                outcome=CheckOutcome.UNKNOWN,
+                checked_artifact=artifact,
+                detail=(
+                    f"expected={expected}, observed={observed}, or tolerance={tolerance} is not a "
+                    "finite real number -- not compared"
+                ),
                 unknown_reason=UnknownReason.NOT_REPRESENTABLE,
                 input_versions=input_versions,
                 missing_inputs=missing_inputs,
@@ -781,8 +844,11 @@ class BasicConstraintChecker:
         shared-value check with no explicit symbol allowlist would have
         to guess which symbols are shared, which this checker (and
         ``shared_value_registry`` underneath it) never does -- see that
-        module's own docstring. Optional extra keys: ``value_scope``,
-        ``value_unit``, ``value_assumptions``, ``symbol_aliases``.
+        module's own docstring. Optional extra keys, all forwarded into a
+        ``SharedValueCheckConfig``: ``symbol_aliases``,
+        ``not_applicable_symbols``, ``source_scope``/``target_scope``,
+        ``source_unit``/``target_unit``, ``source_assumptions``/
+        ``target_assumptions``.
         """
         if not values or "relation" not in values:
             return Evidence(
@@ -858,15 +924,18 @@ class BasicConstraintChecker:
                 rendered[source_section_id] = source_content
             if target_content is not None:
                 rendered[artifact.artifact_id] = target_content
-            record = _verify_shared_value_relation(
-                obligation,
-                rendered,
-                relevant_symbols,
-                scope=values.get("value_scope", "global"),
-                unit=values.get("value_unit"),
-                assumptions=values.get("value_assumptions", []),
-                symbol_aliases=values.get("symbol_aliases"),
+            shared_value_config = SharedValueCheckConfig(
+                relevant_symbols=relevant_symbols,
+                symbol_aliases=values.get("symbol_aliases") or {},
+                not_applicable_symbols=values.get("not_applicable_symbols") or [],
+                source_scope=values.get("source_scope", "global"),
+                target_scope=values.get("target_scope", "global"),
+                source_unit=values.get("source_unit"),
+                target_unit=values.get("target_unit"),
+                source_assumptions=values.get("source_assumptions"),
+                target_assumptions=values.get("target_assumptions"),
             )
+            record = _verify_shared_value_relation(obligation, rendered, shared_value_config)
         else:
             return Evidence(
                 constraint_id=constraint.constraint_id,

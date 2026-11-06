@@ -30,6 +30,24 @@ Deliberately narrow, deterministic, and explicit rather than inferential:
   the plan explicitly warns against assuming the upstream value is
   correct ("원자료·요구사항·가정으로 수정 대상을 판단한다", not this
   module's job to decide).
+- **Every relevant symbol must individually resolve before the whole
+  obligation can PASS.** One symbol's successful comparison must never
+  silently carry a dependency to PASS while a different relevant symbol
+  was ambiguous, undefined, or never restated -- that other symbol's
+  unresolved state would otherwise disappear from the result entirely. A
+  symbol genuinely out of scope for THIS specific obligation (as opposed
+  to merely unresolved) is tracked as its own, separate "N/A" category
+  (``SharedValueCheckConfig.not_applicable_symbols``) -- never silently
+  dropped from the result, and never conflated with "could not check".
+- **A numeric match alone never confirms ``must_reuse``.** Restating the
+  same number is necessary but not sufficient evidence that a target
+  actually applied the source's definition/formula -- a numeric
+  MISMATCH is still real, sufficient evidence AGAINST either
+  ``must_reuse`` or ``must_be_consistent_with`` (a wrong restated number
+  is a real problem either way), but a numeric match can only confirm
+  ``must_be_consistent_with`` (literally the question being asked);
+  ``must_reuse`` stays UNKNOWN even on a full match, honestly naming that
+  this checker cannot confirm actual application from restatement alone.
 """
 
 from __future__ import annotations
@@ -99,16 +117,34 @@ class SharedValueCheckConfig(BaseModel):
     """What a caller explicitly declares for ONE ``CrossSectionObligation``
     before this module will check anything -- see this module's own
     docstring for why every field here is deliberately opt-in, never
-    inferred."""
+    inferred.
+
+    ``source_scope``/``target_scope`` default to the same value
+    (``"global"``) so two obligations that never mention scope at all
+    never trigger a scope mismatch -- only an EXPLICIT difference is a
+    finding. ``source_unit``/``target_unit`` and ``source_assumptions``/
+    ``target_assumptions`` default to ``None`` (not declared); a mismatch
+    is only reported when BOTH sides are explicitly given and genuinely
+    differ, and it is reported as UNKNOWN (not skipped, not assumed
+    equal) when only ONE side is given -- "지원하지 않는 항목", this
+    checker has no basis to confirm or deny the undeclared side.
+    """
 
     relevant_symbols: List[str] = Field(default_factory=list)
     #: semantic_id -> the literal symbol spellings that denote it. A
     #: ``relevant_symbols`` entry with no key here is its own sole alias
     #: (i.e. compared against itself, literally).
     symbol_aliases: Dict[str, List[str]] = Field(default_factory=dict)
-    scope: str = "global"
-    unit: Optional[str] = None
-    assumptions: List[str] = Field(default_factory=list)
+    #: Symbols explicitly declared out of scope for THIS specific
+    #: obligation -- excluded from the PASS/FAIL/UNKNOWN decision
+    #: entirely and reported separately as N/A, never silently dropped.
+    not_applicable_symbols: List[str] = Field(default_factory=list)
+    source_scope: str = "global"
+    target_scope: str = "global"
+    source_unit: Optional[str] = None
+    target_unit: Optional[str] = None
+    source_assumptions: Optional[List[str]] = None
+    target_assumptions: Optional[List[str]] = None
 
     def aliases_for(self, semantic_id: str) -> List[str]:
         return self.symbol_aliases.get(semantic_id) or [semantic_id]
@@ -144,7 +180,20 @@ class SharedValueConsistencyRecord(BaseModel):
     obligation's numeric-restatement component specifically -- never a
     claim about general semantic reuse (formula/classification reuse
     without a literal number is explicitly out of this module's scope,
-    deferred to B6's logic review)."""
+    deferred to B6's logic review).
+
+    ``checked_semantic_ids`` lists every symbol where BOTH a source
+    definition AND a target restatement were actually found -- regardless
+    of whether they agreed (a mismatched symbol is still "checked", just
+    with its own entry in ``mismatches`` too). ``not_applicable_semantic_ids``
+    is the separate, explicit "this symbol does not apply to this
+    obligation" category (never conflated with "could not be resolved").
+    Any ``relevant_symbols`` entry missing from BOTH lists was unresolved
+    (no source definition, an ambiguous source definition, or no target
+    restatement) -- that unresolved state is what forces the record's
+    overall outcome to UNKNOWN rather than letting some OTHER symbol's
+    success silently stand in for it.
+    """
 
     dependency_id: str
     relation: DependencyRelation
@@ -153,6 +202,7 @@ class SharedValueConsistencyRecord(BaseModel):
     unknown_reason: Optional[UnknownReason] = None
     detail: str = ""
     checked_semantic_ids: List[str] = Field(default_factory=list)
+    not_applicable_semantic_ids: List[str] = Field(default_factory=list)
     mismatches: List[str] = Field(default_factory=list)
     source_definitions: List[SharedValueDefinition] = Field(default_factory=list)
     target_usages: List[SharedValueUsage] = Field(default_factory=list)
@@ -160,6 +210,51 @@ class SharedValueConsistencyRecord(BaseModel):
     def model_post_init(self, __context: object) -> None:
         if self.outcome == CheckOutcome.UNKNOWN and self.unknown_reason is None:
             raise ValueError("SharedValueConsistencyRecord with outcome=UNKNOWN requires unknown_reason.")
+
+
+def _compare_declared_context(
+    config: SharedValueCheckConfig,
+) -> Tuple[Optional[CheckOutcome], str]:
+    """Compares the OBLIGATION-level (not per-symbol) scope/unit/assumptions
+    a caller explicitly declared for the source vs. the target side.
+    Returns ``(None, "")`` when there is nothing to report (the common
+    case: neither side declared anything beyond the default scope).
+    FAIL outranks UNKNOWN -- a confirmed difference is reported even if
+    another field on the same call couldn't be compared."""
+    fail_parts: List[str] = []
+    unknown_parts: List[str] = []
+
+    if config.source_scope != config.target_scope:
+        fail_parts.append(
+            f"scope differs: source={config.source_scope!r} vs. target={config.target_scope!r}."
+        )
+
+    if config.source_unit is not None and config.target_unit is not None:
+        if config.source_unit != config.target_unit:
+            fail_parts.append(
+                f"unit differs: source={config.source_unit!r} vs. target={config.target_unit!r}."
+            )
+    elif config.source_unit is not None or config.target_unit is not None:
+        unknown_parts.append(
+            "unit declared on only one side -- cannot confirm the other side's unit matches."
+        )
+
+    if config.source_assumptions is not None and config.target_assumptions is not None:
+        if set(config.source_assumptions) != set(config.target_assumptions):
+            fail_parts.append(
+                f"assumptions differ: source={sorted(config.source_assumptions)} vs. "
+                f"target={sorted(config.target_assumptions)}."
+            )
+    elif config.source_assumptions is not None or config.target_assumptions is not None:
+        unknown_parts.append(
+            "assumptions declared on only one side -- cannot confirm the other side's assumptions match."
+        )
+
+    if fail_parts:
+        return CheckOutcome.FAIL, " ".join(fail_parts)
+    if unknown_parts:
+        return CheckOutcome.UNKNOWN, " ".join(unknown_parts)
+    return None, ""
 
 
 def check_shared_value_consistency(
@@ -172,12 +267,16 @@ def check_shared_value_consistency(
     target_text: str,
     config: SharedValueCheckConfig,
 ) -> SharedValueConsistencyRecord:
-    """The real check: for every ``config.relevant_symbols`` entry, does
-    the target restate the same value the source defines (via any
-    declared alias)? Never vacuously PASSes from zero actually-compared
-    symbols (mirrors the artifact-graph review's "no FAIL is not PASS"
-    discipline) -- PASS requires at least one symbol where BOTH a source
-    definition and a target restatement were actually found and agree."""
+    """The real check: for every ``config.relevant_symbols`` entry (minus
+    any ``not_applicable_symbols``), does the target restate the same
+    value the source defines (via any declared alias)? Every one of them
+    must individually resolve -- a mismatch anywhere is FAIL; an
+    unresolved symbol anywhere (no source definition, an ambiguous source
+    definition, or no target restatement) is UNKNOWN, regardless of
+    whether some OTHER symbol matched cleanly; PASS requires every
+    relevant, applicable symbol to have been actually compared and agree.
+    ``must_reuse`` additionally never reaches PASS from this numeric
+    check alone (see this module's own docstring)."""
     if not config.relevant_symbols:
         return SharedValueConsistencyRecord(
             dependency_id=dependency_id,
@@ -194,20 +293,29 @@ def check_shared_value_consistency(
         )
 
     checked_ids: List[str] = []
+    not_applicable_ids: List[str] = []
     mismatches: List[str] = []
-    ambiguous_source_details: List[str] = []
+    unresolved_details: List[str] = []
+    unresolved_reasons: List[UnknownReason] = []
     source_definitions: List[SharedValueDefinition] = []
     target_usages: List[SharedValueUsage] = []
-    any_target_usage_found = False
 
     for semantic_id in config.relevant_symbols:
+        if semantic_id in config.not_applicable_symbols:
+            not_applicable_ids.append(semantic_id)
+            continue
+
         aliases = config.aliases_for(semantic_id)
 
         source_hits: List[Tuple[str, SharedValueOccurrence]] = []
         for alias in aliases:
             source_hits.extend((alias, occ) for occ in find_symbol_value_occurrences(source_text, alias))
         if not source_hits:
-            continue  # source never defines this id -- nothing to compare against
+            unresolved_reasons.append(UnknownReason.MISSING_DEPENDENCY)
+            unresolved_details.append(
+                f"{semantic_id}: source section {source_section_id!r} never defines this symbol."
+            )
+            continue
 
         distinct_source_values: Set[float] = {round(occ.value, 9) for _, occ in source_hits}
         if len(distinct_source_values) > 1:
@@ -219,7 +327,8 @@ def check_shared_value_consistency(
             # 추측해 덮어쓰지 않는다" cuts against guessing in either
             # direction).
             values_detail = ", ".join(str(v) for v in sorted(distinct_source_values))
-            ambiguous_source_details.append(
+            unresolved_reasons.append(UnknownReason.NOT_REPRESENTABLE)
+            unresolved_details.append(
                 f"{semantic_id}: source section {source_section_id!r} itself states inconsistent "
                 f"values ({values_detail}) -- not used as a basis for comparison, the correct "
                 "one is not guessed."
@@ -231,17 +340,22 @@ def check_shared_value_consistency(
         for alias in aliases:
             target_hits.extend((alias, occ) for occ in find_symbol_value_occurrences(target_text, alias))
         if not target_hits:
-            continue  # target never restates this id -- no evidence either way
+            unresolved_reasons.append(UnknownReason.NOT_CHECKED)
+            unresolved_details.append(
+                f"{semantic_id}: target section {target_section_id!r} never restates this symbol."
+            )
+            continue
 
-        any_target_usage_found = True
+        # Both sides resolved -- this symbol is now actually "checked",
+        # whether or not it turns out to match.
         checked_ids.append(semantic_id)
         source_definitions.append(
             SharedValueDefinition(
                 semantic_id=semantic_id,
                 source_section_id=source_section_id,
-                scope=config.scope,
-                unit=config.unit,
-                assumptions=list(config.assumptions),
+                scope=config.source_scope,
+                unit=config.source_unit,
+                assumptions=list(config.source_assumptions or []),
                 value=source_occ.value,
                 raw_text=source_occ.raw_text,
                 matched_at_line=source_occ.line,
@@ -263,50 +377,99 @@ def check_shared_value_consistency(
                     f"target {target_section_id!r}={occ.value} (line {occ.line})."
                 )
 
-    if mismatches:
+    context_outcome, context_detail = _compare_declared_context(config)
+
+    if mismatches or context_outcome == CheckOutcome.FAIL:
+        detail_parts = list(mismatches)
+        if context_outcome == CheckOutcome.FAIL:
+            detail_parts.append(context_detail)
         return SharedValueConsistencyRecord(
             dependency_id=dependency_id,
             relation=relation,
             target_section_id=target_section_id,
             outcome=CheckOutcome.FAIL,
-            detail="; ".join(mismatches),
+            detail="; ".join(detail_parts),
             checked_semantic_ids=checked_ids,
+            not_applicable_semantic_ids=not_applicable_ids,
             mismatches=mismatches,
             source_definitions=source_definitions,
             target_usages=target_usages,
         )
-    if any_target_usage_found:
+
+    if unresolved_details or context_outcome == CheckOutcome.UNKNOWN:
+        detail_parts = list(unresolved_details)
+        if context_outcome == CheckOutcome.UNKNOWN:
+            detail_parts.append(context_detail)
+        # One record carries one unknown_reason; an obligation checking
+        # several symbols can have several different unresolved reasons
+        # at once (one missing from source, another never restated) --
+        # the first one encountered (relevant_symbols order) is reported,
+        # same "don't average/guess, report the first real fact found"
+        # discipline the rest of this module already applies.
+        reason = unresolved_reasons[0] if unresolved_reasons else UnknownReason.NOT_REPRESENTABLE
         return SharedValueConsistencyRecord(
             dependency_id=dependency_id,
             relation=relation,
             target_section_id=target_section_id,
-            outcome=CheckOutcome.PASS,
-            detail=f"consistent restated value(s) for {checked_ids}.",
+            outcome=CheckOutcome.UNKNOWN,
+            unknown_reason=reason,
+            detail="; ".join(detail_parts),
             checked_semantic_ids=checked_ids,
+            not_applicable_semantic_ids=not_applicable_ids,
             source_definitions=source_definitions,
             target_usages=target_usages,
         )
-    if ambiguous_source_details:
+
+    if not checked_ids:
+        # Every relevant_symbols entry was N/A -- nothing was ever
+        # actually confirmed, so this can never read as PASS (the same
+        # "no FAIL is not PASS" principle applied to "no comparison
+        # happened" rather than "no mismatch happened").
+        return SharedValueConsistencyRecord(
+            dependency_id=dependency_id,
+            relation=relation,
+            target_section_id=target_section_id,
+            outcome=CheckOutcome.UNKNOWN,
+            unknown_reason=UnknownReason.NOT_CHECKED,
+            detail="every relevant_symbols entry was marked not-applicable to this obligation -- nothing checked.",
+            not_applicable_semantic_ids=not_applicable_ids,
+        )
+
+    # Every relevant, applicable symbol resolved and agreed, and no
+    # declared-context mismatch was found.
+    if relation != DependencyRelation.MUST_BE_CONSISTENT_WITH:
+        # must_reuse (and, defensively, anything else routed through this
+        # numeric-only checker): a clean numeric match is necessary but
+        # not sufficient evidence that the source's definition/formula
+        # was actually applied -- see this module's own docstring. Stays
+        # UNKNOWN, never PASS, from this check alone.
         return SharedValueConsistencyRecord(
             dependency_id=dependency_id,
             relation=relation,
             target_section_id=target_section_id,
             outcome=CheckOutcome.UNKNOWN,
             unknown_reason=UnknownReason.NOT_REPRESENTABLE,
-            detail="; ".join(ambiguous_source_details),
+            detail=(
+                f"numeric restatement is consistent for {checked_ids}, but a numeric match alone "
+                f"does not confirm {relation.value} was actually satisfied -- this checker only "
+                "verifies the numeric-restatement component, never general semantic reuse."
+            ),
+            checked_semantic_ids=checked_ids,
+            not_applicable_semantic_ids=not_applicable_ids,
+            source_definitions=source_definitions,
+            target_usages=target_usages,
         )
+
     return SharedValueConsistencyRecord(
         dependency_id=dependency_id,
         relation=relation,
         target_section_id=target_section_id,
-        outcome=CheckOutcome.UNKNOWN,
-        unknown_reason=UnknownReason.NOT_CHECKED,
-        detail=(
-            f"none of {config.relevant_symbols} were restated as a plain number in target section "
-            f"{target_section_id!r} -- cannot confirm or deny numeric reuse/consistency from literal "
-            "restatement alone (the target may still reuse the definition/formula without repeating "
-            "its number, which this check cannot see)."
-        ),
+        outcome=CheckOutcome.PASS,
+        detail=f"consistent restated value(s) for {checked_ids}.",
+        checked_semantic_ids=checked_ids,
+        not_applicable_semantic_ids=not_applicable_ids,
+        source_definitions=source_definitions,
+        target_usages=target_usages,
     )
 
 

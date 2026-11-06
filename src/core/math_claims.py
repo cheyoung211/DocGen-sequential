@@ -66,7 +66,13 @@ class MathClaim(BaseModel):
     kind: MathClaimKind
     criterion_id: MathCriterionId
     artifact_id: str
-    artifact_version: int
+    #: ``None`` means "version unknown to whoever built this claim" --
+    #: never a placeholder like ``1``. A fabricated version would silently
+    #: misrepresent provenance for exactly the artifacts this schema
+    #: exists to track honestly (see this module's own docstring and
+    #: ``ProductionResult``'s identical "honest not-reported" discipline,
+    #: ``src/core/schemas.py``).
+    artifact_version: Optional[int] = None
     raw_text: str = ""
     matched_at_line: Optional[int] = None
     operation: Optional[str] = None
@@ -115,10 +121,19 @@ class MathClaimCoverageReport(BaseModel):
 
     @property
     def externally_sourced_count(self) -> int:
-        """Claims with no computable source at all -- distinct from a
-        sourced claim that happened to come out UNKNOWN for some other
-        reason (see this module's docstring)."""
-        return sum(1 for c in self.claims if c.source_ref is None)
+        """CALCULATION claims with no computable source at all --
+        distinct from a sourced claim that happened to come out UNKNOWN
+        for some other reason (see this module's docstring). Restricted
+        to ``MathClaimKind.CALCULATION``: a SHARED_VALUE claim always has
+        a real source SECTION by construction (``check_shared_value_
+        consistency`` always takes a ``source_section_id``) -- a caller
+        that simply didn't pass a resolved ``ArtifactRef`` into
+        ``math_claims_for_shared_value_record`` is a reporting gap, not
+        the same "no source exists at all" fact this count is for."""
+        return sum(
+            1 for c in self.claims
+            if c.kind == MathClaimKind.CALCULATION and c.source_ref is None
+        )
 
 
 def math_claim_for_recompute(
@@ -163,7 +178,12 @@ def math_claim_for_recompute(
     )
 
 
-def math_claims_for_shared_value_record(record: "SharedValueConsistencyRecord") -> List[MathClaim]:
+def math_claims_for_shared_value_record(
+    record: "SharedValueConsistencyRecord",
+    *,
+    target_ref: Optional[ArtifactRef] = None,
+    source_ref: Optional[ArtifactRef] = None,
+) -> List[MathClaim]:
     """Builds B3 ``MathClaim`` entries, one per semantic_id the record
     actually checked (not per obligation) -- a dependency with several
     relevant symbols can have one PASS and one FAIL among them, and
@@ -174,16 +194,31 @@ def math_claims_for_shared_value_record(record: "SharedValueConsistencyRecord") 
     case -- no relevant_symbols configured, or nothing restated anywhere)
     still produces exactly one claim, so the claim-level coverage total
     never silently drops an obligation that generated no per-symbol
-    detail."""
+    detail.
+
+    ``target_ref``/``source_ref`` are the REAL, already-resolved
+    ``ArtifactRef``s for the target/source sections this record checked
+    -- the caller (whoever ran ``check_shared_value_consistency``
+    against a real ``ArtifactGraphStore``) already has these; this
+    function never fabricates a version number when they are omitted
+    (``MathClaim.artifact_version`` stays honestly ``None`` instead of a
+    guessed ``1`` -- the exact bug a review caught in an earlier version
+    of this function). A SHARED_VALUE claim's ``source_ref`` is passed
+    straight through (possibly ``None``, if the caller genuinely doesn't
+    have it yet) -- never read as "externally sourced" the way a
+    CALCULATION claim's missing ``source_ref`` is, since a shared-value
+    obligation always has a real source SECTION by construction; see
+    ``MathClaimCoverageReport.externally_sourced_count``."""
     if not record.checked_semantic_ids:
         return [
             MathClaim(
                 claim_id=f"{record.dependency_id}::{record.target_section_id}",
                 kind=MathClaimKind.SHARED_VALUE,
                 criterion_id=MathCriterionId.VALUE_CONSISTENCY,
-                artifact_id=record.target_section_id,
-                artifact_version=1,
+                artifact_id=target_ref.artifact_id if target_ref else record.target_section_id,
+                artifact_version=target_ref.version if target_ref else None,
                 raw_text=record.detail,
+                source_ref=source_ref,
                 outcome=record.outcome,
                 unknown_reason=record.unknown_reason,
             )
@@ -211,13 +246,14 @@ def math_claims_for_shared_value_record(record: "SharedValueConsistencyRecord") 
                 claim_id=f"{record.dependency_id}::{record.target_section_id}::{semantic_id}",
                 kind=MathClaimKind.SHARED_VALUE,
                 criterion_id=MathCriterionId.VALUE_CONSISTENCY,
-                artifact_id=record.target_section_id,
-                artifact_version=1,
+                artifact_id=target_ref.artifact_id if target_ref else record.target_section_id,
+                artifact_version=target_ref.version if target_ref else None,
                 raw_text=usages[0].raw_text if usages else (definition.raw_text if definition else ""),
                 matched_at_line=usages[0].matched_at_line if usages else None,
                 symbol=semantic_id,
                 observed_value=usages[0].value if usages else None,
                 expected_value=definition.value if definition else None,
+                source_ref=source_ref,
                 scope=definition.scope if definition else "global",
                 unit=definition.unit if definition else None,
                 assumptions=list(definition.assumptions) if definition else [],

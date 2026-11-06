@@ -97,6 +97,51 @@ def test_shared_value_record_produces_one_claim_per_checked_symbol_with_per_symb
     assert all(c.criterion_id == MathCriterionId.VALUE_CONSISTENCY for c in claims)
 
 
+def test_shared_value_claim_version_defaults_to_unknown_not_a_fabricated_one():
+    # Regression: artifact_version used to be hardcoded to 1 regardless
+    # of the real target section's version.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10",
+        config=SharedValueCheckConfig(relevant_symbols=["n"]),
+    )
+    claims = math_claims_for_shared_value_record(record)
+    assert claims[0].artifact_version is None
+    assert claims[0].source_ref is None
+
+
+def test_shared_value_claim_carries_the_real_target_and_source_refs_when_supplied():
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10",
+        config=SharedValueCheckConfig(relevant_symbols=["n"]),
+    )
+    target_ref = ArtifactRef(artifact_id="b", version=3, kind=ArtifactKind.SECTION)
+    source_ref = ArtifactRef(artifact_id="a", version=5, kind=ArtifactKind.SECTION)
+    claims = math_claims_for_shared_value_record(record, target_ref=target_ref, source_ref=source_ref)
+    assert claims[0].artifact_id == "b"
+    assert claims[0].artifact_version == 3
+    assert claims[0].source_ref == source_ref
+
+
+def test_shared_value_claim_without_a_source_ref_is_not_counted_as_externally_sourced():
+    # A SHARED_VALUE claim always has a real source SECTION by
+    # construction -- a caller simply not passing the resolved ref is a
+    # reporting gap, not the same fact as a CALCULATION claim with no
+    # computable source at all.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10",
+        config=SharedValueCheckConfig(relevant_symbols=["n"]),
+    )
+    claims = math_claims_for_shared_value_record(record)  # no source_ref supplied
+    report = MathClaimCoverageReport(claims=claims)
+    assert report.externally_sourced_count == 0
+
+
 def test_logical_validity_criterion_is_declared_but_never_auto_produced():
     # B6 (symbolic/logic review) is explicit follow-up, not started on
     # this branch -- nothing in B1-B3's own builders ever stamps this

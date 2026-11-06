@@ -44,7 +44,7 @@ here; wrapping this as a ``Validator`` is explicit, deferred follow-up work
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
 
@@ -174,15 +174,7 @@ def _verify_one(
 
     config = shared_value_configs.get(obligation.dependency_id)
     if config is not None and config.relevant_symbols:
-        return _verify_shared_value_relation(
-            obligation,
-            rendered_sections,
-            config.relevant_symbols,
-            scope=config.scope,
-            unit=config.unit,
-            assumptions=config.assumptions,
-            symbol_aliases=config.symbol_aliases,
-        )
+        return _verify_shared_value_relation(obligation, rendered_sections, config)
 
     return DependencyVerificationRecord(
         dependency_id=obligation.dependency_id,
@@ -202,18 +194,16 @@ def _verify_one(
 def _verify_shared_value_relation(
     obligation: CrossSectionObligation,
     rendered_sections: Dict[str, str],
-    relevant_symbols: Sequence[str],
-    *,
-    scope: str = "global",
-    unit: Optional[str] = None,
-    assumptions: Sequence[str] = (),
-    symbol_aliases: Optional[Dict[str, List[str]]] = None,
+    config: SharedValueCheckConfig,
 ) -> DependencyVerificationRecord:
     """Adapter from ``shared_value_registry.check_shared_value_consistency``
     (B3's real check) into this module's ``DependencyVerificationRecord``
     vocabulary -- mirrors ``_verify_must_reference``/``_verify_must_precede``:
     the decision is made once, in ``shared_value_registry``, never
-    reimplemented here."""
+    reimplemented here. Takes the whole ``SharedValueCheckConfig`` object
+    (not its fields unpacked into separate kwargs) so this module and
+    ``shared_value_registry`` can never drift apart on what fields that
+    config actually has."""
     source_text = rendered_sections.get(obligation.matched_source_section_id or "")
     target_text = rendered_sections.get(obligation.matched_target_section_id or "")
     if source_text is None or target_text is None:
@@ -231,13 +221,6 @@ def _verify_shared_value_relation(
             detail=f"no rendered text supplied for: {', '.join(missing)}.",
         )
 
-    config = SharedValueCheckConfig(
-        relevant_symbols=list(relevant_symbols),
-        symbol_aliases=symbol_aliases or {},
-        scope=scope,
-        unit=unit,
-        assumptions=list(assumptions),
-    )
     record = check_shared_value_consistency(
         dependency_id=obligation.dependency_id,
         relation=obligation.relation,
