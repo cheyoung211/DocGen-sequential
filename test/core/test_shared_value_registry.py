@@ -277,3 +277,53 @@ def test_one_symbol_can_pass_while_another_fails_in_the_same_obligation():
     assert "k" in record.checked_semantic_ids
     assert not any(m.startswith("n:") for m in record.mismatches)
     assert any(m.startswith("k:") for m in record.mismatches)
+
+
+def test_a_fraction_right_hand_side_is_not_truncated_to_its_numerator():
+    # Regression: the old regex matched only the leading digit(s) of the
+    # right-hand side and used a lookahead that only rejected a following
+    # DIGIT, so "n = 1/2" silently read as n=1 and "n = 1/3" as n=1 --
+    # both "matching" and PASSing despite being genuinely different
+    # fractions. A fraction is not a supported restatement shape, so
+    # neither side should produce an occurrence at all.
+    occurrences = find_symbol_value_occurrences("n = 1/2", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 1/2", target_text="n = 1/3",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+    assert record.outcome != CheckOutcome.PASS
+
+
+def test_a_scientific_notation_right_hand_side_is_not_truncated_to_its_leading_digit():
+    # Same bug class as the fraction case: "n = 1e3" and "n = 1e6" both
+    # used to read as n=1 (the lookahead only rejected a following
+    # digit, not a following "e"/"E").
+    occurrences = find_symbol_value_occurrences("n = 1e3", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 1e3", target_text="n = 1e6",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+    assert record.outcome != CheckOutcome.PASS
+
+
+def test_a_sentence_ending_period_right_after_the_number_still_matches():
+    # The fix must reject a continuation of the numeric literal itself
+    # (digit, "/", "e"/"E"+digit, a second "."+digit) without becoming
+    # so strict that an ordinary sentence-ending period right after the
+    # number (no space) stops matching.
+    occurrences = find_symbol_value_occurrences("n = 10.", "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 10.0
+
+
+def test_a_double_decimal_point_right_hand_side_is_rejected():
+    occurrences = find_symbol_value_occurrences("n = 10.5.3", "n")
+    assert occurrences == []

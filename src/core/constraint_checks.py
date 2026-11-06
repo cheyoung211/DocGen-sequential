@@ -225,7 +225,15 @@ def _coerce_recompute_number(raw: Any) -> float:
     elif isinstance(raw, str):
         stripped = raw.strip()
         if _FRACTION_PATTERN.match(stripped):
-            value = float(Fraction(stripped))
+            try:
+                value = float(Fraction(stripped))
+            except ZeroDivisionError as exc:
+                # Fraction("1/0") raises ZeroDivisionError, not ValueError
+                # -- re-raised as ValueError so every call site that
+                # already catches (ValueError, TypeError) around this
+                # function (never just the source-array parse path) gets
+                # a clean UNKNOWN instead of an uncaught crash.
+                raise ValueError(f"{raw!r} has a zero denominator") from exc
         else:
             value = float(stripped)
     else:

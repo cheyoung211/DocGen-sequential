@@ -184,17 +184,35 @@ def math_claims_for_shared_value_record(
     target_ref: Optional[ArtifactRef] = None,
     source_ref: Optional[ArtifactRef] = None,
 ) -> List[MathClaim]:
-    """Builds B3 ``MathClaim`` entries, one per semantic_id the record
-    actually checked (not per obligation) -- a dependency with several
-    relevant symbols can have one PASS and one FAIL among them, and
-    collapsing that into a single claim would lose exactly the kind of
-    partial-result information Fix C's own per-target obligations were
-    designed to preserve (``docs/av_stage2_dependency_mapping.md`` §2).
-    A record with zero checked semantic_ids (the whole-obligation UNKNOWN
-    case -- no relevant_symbols configured, or nothing restated anywhere)
-    still produces exactly one claim, so the claim-level coverage total
-    never silently drops an obligation that generated no per-symbol
-    detail.
+    """Builds B3 ``MathClaim`` entries from a ``SharedValueConsistencyRecord``.
+    Three independent kinds of fact, each preserved as its own claim(s)
+    rather than one collapsing into or hiding another:
+
+    1. One claim per symbol in ``checked_semantic_ids`` (both a source
+       definition and a target restatement were found) -- PASS or FAIL
+       depending on whether that symbol's own numbers agreed.
+    2. One UNKNOWN claim per symbol in ``unresolved_semantic_ids`` (no
+       source definition, an ambiguous source definition, or no target
+       restatement). A review caught an earlier version of this function
+       silently dropping these: it iterated only ``checked_semantic_ids``,
+       so a dependency where ``n`` matched but a second required symbol
+       ``k`` had no source definition converted to a single PASS claim
+       for ``n`` with the record's own overall UNKNOWN nowhere to be
+       found in the claims.
+    3. One claim for the declared scope/unit/assumptions comparison
+       (``record.context_outcome``), when there was anything to compare
+       at all -- kept separate from any one symbol's numeric claim so
+       "the numbers agree but the declared assumptions differ" cannot
+       collapse into a bare PASS (the same review's second finding: a
+       record that came out FAIL purely from a context mismatch, with
+       every checked symbol's own numbers agreeing, converted to nothing
+       but PASS claims).
+
+    If none of the three produce anything (e.g. no ``relevant_symbols``
+    configured at all, or every one was marked not-applicable), exactly
+    one claim carrying the record's own aggregate outcome is produced
+    instead, so the claim-level coverage total never silently drops an
+    obligation that generated no per-symbol or per-context detail.
 
     ``target_ref``/``source_ref`` are the REAL, already-resolved
     ``ArtifactRef``s for the target/source sections this record checked
@@ -202,27 +220,15 @@ def math_claims_for_shared_value_record(
     against a real ``ArtifactGraphStore``) already has these; this
     function never fabricates a version number when they are omitted
     (``MathClaim.artifact_version`` stays honestly ``None`` instead of a
-    guessed ``1`` -- the exact bug a review caught in an earlier version
-    of this function). A SHARED_VALUE claim's ``source_ref`` is passed
-    straight through (possibly ``None``, if the caller genuinely doesn't
-    have it yet) -- never read as "externally sourced" the way a
-    CALCULATION claim's missing ``source_ref`` is, since a shared-value
-    obligation always has a real source SECTION by construction; see
-    ``MathClaimCoverageReport.externally_sourced_count``."""
-    if not record.checked_semantic_ids:
-        return [
-            MathClaim(
-                claim_id=f"{record.dependency_id}::{record.target_section_id}",
-                kind=MathClaimKind.SHARED_VALUE,
-                criterion_id=MathCriterionId.VALUE_CONSISTENCY,
-                artifact_id=target_ref.artifact_id if target_ref else record.target_section_id,
-                artifact_version=target_ref.version if target_ref else None,
-                raw_text=record.detail,
-                source_ref=source_ref,
-                outcome=record.outcome,
-                unknown_reason=record.unknown_reason,
-            )
-        ]
+    guessed ``1`` -- the exact bug an earlier review caught in an even
+    earlier version of this function). A SHARED_VALUE claim's
+    ``source_ref`` is passed straight through (possibly ``None``, if the
+    caller genuinely doesn't have it yet) -- never read as "externally
+    sourced" the way a CALCULATION claim's missing ``source_ref`` is,
+    since a shared-value obligation always has a real source SECTION by
+    construction; see ``MathClaimCoverageReport.externally_sourced_count``."""
+    artifact_id = target_ref.artifact_id if target_ref else record.target_section_id
+    artifact_version = target_ref.version if target_ref else None
 
     definitions_by_id = {d.semantic_id: d for d in record.source_definitions}
     usages_by_id: dict = {}
@@ -230,6 +236,33 @@ def math_claims_for_shared_value_record(
         usages_by_id.setdefault(usage.semantic_id, []).append(usage)
 
     claims: List[MathClaim] = []
+
+    for semantic_id in record.unresolved_semantic_ids:
+        definition = definitions_by_id.get(semantic_id)
+        usages = usages_by_id.get(semantic_id, [])
+        claims.append(
+            MathClaim(
+                claim_id=f"{record.dependency_id}::{record.target_section_id}::{semantic_id}",
+                kind=MathClaimKind.SHARED_VALUE,
+                criterion_id=MathCriterionId.VALUE_CONSISTENCY,
+                artifact_id=artifact_id,
+                artifact_version=artifact_version,
+                raw_text=record.unresolved_detail_by_id.get(semantic_id, ""),
+                matched_at_line=usages[0].matched_at_line if usages else None,
+                symbol=semantic_id,
+                observed_value=usages[0].value if usages else None,
+                expected_value=definition.value if definition else None,
+                source_ref=source_ref,
+                scope=definition.scope if definition else "global",
+                unit=definition.unit if definition else None,
+                assumptions=list(definition.assumptions) if definition else [],
+                outcome=CheckOutcome.UNKNOWN,
+                unknown_reason=record.unresolved_reason_by_id.get(
+                    semantic_id, UnknownReason.NOT_REPRESENTABLE
+                ),
+            )
+        )
+
     for semantic_id in record.checked_semantic_ids:
         definition = definitions_by_id.get(semantic_id)
         usages = usages_by_id.get(semantic_id, [])
@@ -246,8 +279,8 @@ def math_claims_for_shared_value_record(
                 claim_id=f"{record.dependency_id}::{record.target_section_id}::{semantic_id}",
                 kind=MathClaimKind.SHARED_VALUE,
                 criterion_id=MathCriterionId.VALUE_CONSISTENCY,
-                artifact_id=target_ref.artifact_id if target_ref else record.target_section_id,
-                artifact_version=target_ref.version if target_ref else None,
+                artifact_id=artifact_id,
+                artifact_version=artifact_version,
                 raw_text=usages[0].raw_text if usages else (definition.raw_text if definition else ""),
                 matched_at_line=usages[0].matched_at_line if usages else None,
                 symbol=semantic_id,
@@ -265,6 +298,46 @@ def math_claims_for_shared_value_record(
                 outcome=claim_outcome,
             )
         )
+
+    if record.context_outcome is not None:
+        claims.append(
+            MathClaim(
+                claim_id=f"{record.dependency_id}::{record.target_section_id}::context",
+                kind=MathClaimKind.SHARED_VALUE,
+                criterion_id=MathCriterionId.VALUE_CONSISTENCY,
+                artifact_id=artifact_id,
+                artifact_version=artifact_version,
+                raw_text=record.context_detail,
+                source_ref=source_ref,
+                outcome=record.context_outcome,
+                unknown_reason=(
+                    UnknownReason.NOT_REPRESENTABLE
+                    if record.context_outcome == CheckOutcome.UNKNOWN
+                    else None
+                ),
+            )
+        )
+
+    if not claims:
+        # Nothing checked, nothing unresolved, no declared-context
+        # mismatch either -- e.g. no relevant_symbols configured at all,
+        # or every relevant_symbols entry was marked not-applicable. The
+        # obligation itself must still produce exactly one claim so the
+        # claim-level coverage total never silently drops it.
+        claims.append(
+            MathClaim(
+                claim_id=f"{record.dependency_id}::{record.target_section_id}",
+                kind=MathClaimKind.SHARED_VALUE,
+                criterion_id=MathCriterionId.VALUE_CONSISTENCY,
+                artifact_id=artifact_id,
+                artifact_version=artifact_version,
+                raw_text=record.detail,
+                source_ref=source_ref,
+                outcome=record.outcome,
+                unknown_reason=record.unknown_reason,
+            )
+        )
+
     return claims
 
 

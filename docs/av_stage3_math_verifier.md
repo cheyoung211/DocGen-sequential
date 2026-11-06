@@ -353,6 +353,73 @@ assumed from reading alone). 22 new regression tests across the 3 affected test
 files (all passing); full suite re-confirmed: same 50 pre-existing unrelated
 failures byte-identical via `git stash`, 1187 passed (was 1165). `pyflakes`-clean.
 
+## 5.2. Review round 2 (2026-11-06, same branch, uncommitted) -- 3 more real bugs found
+
+A second review pass on the round-1 code caught 3 more concrete bugs, again each
+reproduced directly against the real code before fixing:
+
+1. **The value regex read only the number-looking prefix of the right-hand
+   side, not the whole thing.** `_occurrence_pattern`'s trailing lookahead was
+   `(?!\d)` -- it only rejected a FOLLOWING DIGIT, so `n = 1/2` and `n = 1/3`
+   both silently read as `n=1` (the `/2`/`/3` simply never consumed), and
+   `n = 1e3` / `n = 1e6` both read as `n=1` the same way (the `e3`/`e6` never
+   consumed) -- all four cases then compared as a clean numeric match and
+   PASSed, despite being genuinely different values in an unsupported
+   notation. This directly contradicted the module's own docstring claim ("a
+   right-hand side that isn't a plain... literal number is simply not
+   matched, never guessed at") -- the claim was already written, the regex
+   just didn't implement it. Fixed: the lookahead now also rejects a
+   following `/` (fraction), a following `e`/`E` plus sign/digit (scientific
+   notation), and a following `.` plus digit (a second decimal point) --
+   `(?![\d/]|[eE][+-]?\d|\.\d)`. An ordinary sentence-ending period right
+   after the number with no following digit (`n = 10.`) is deliberately NOT
+   rejected, since that is not a continuation of the number at all (verified
+   with a dedicated regression test, since this was the main risk of being
+   too aggressive). 4 new regression tests (fraction, scientific notation,
+   sentence-ending period still matches, double-decimal-point rejected).
+2. **`math_claims_for_shared_value_record` dropped unresolved symbols and
+   context mismatches during conversion.** The function iterated only
+   `record.checked_semantic_ids` and derived each claim's outcome only from
+   `record.mismatches` (purely numeric). Two concrete cases silently lost the
+   record's real verdict: (a) `n` matches but a second required symbol `k`
+   has no source definition at all -- record outcome UNKNOWN, but conversion
+   produced a single PASS claim for `n` with `k`'s UNKNOWN nowhere in the
+   claims; (b) the numbers agree but `source_assumptions`/`target_assumptions`
+   declared and differ -- record outcome FAIL (from `_compare_declared_
+   context`), but conversion produced a single PASS claim since the per-symbol
+   `mismatches` list genuinely was empty. Fixed by giving
+   `SharedValueConsistencyRecord` two new pieces of state that were already
+   being computed internally but never exposed: `unresolved_semantic_ids`
+   (+ `unresolved_reason_by_id`/`unresolved_detail_by_id`, populated at each
+   of the 3 unresolved sites in the main loop) and `context_outcome`/
+   `context_detail` (the `_compare_declared_context` result, previously only
+   folded into the aggregate detail string). `math_claims_for_shared_value_
+   record` now emits three independent kinds of claim -- one UNKNOWN claim
+   per unresolved symbol, one PASS/FAIL claim per checked symbol (unchanged),
+   and one separate claim for the context comparison when there was anything
+   to compare -- so none of the three can hide behind another, and a
+   single fallback claim covers the case where none of the three produced
+   anything (e.g. no `relevant_symbols` configured, or all marked N/A). 2 new
+   regression tests, each reproducing one of the two concrete cases above.
+3. **A zero-denominator fraction string still crashed instead of resolving
+   UNKNOWN.** `"1/0"` matches `_FRACTION_PATTERN`, so `_coerce_recompute_
+   number` reached `Fraction("1/0")`, which raises `ZeroDivisionError` -- a
+   type none of the `except (ValueError, TypeError)` clauses around its call
+   sites in `_check_recompute` caught (round 1 only added `ZeroDivisionError`
+   to the source-ARRAY parsing path's except clause, not these two). Fixed at
+   the single conversion function itself (not each call site) by catching
+   `ZeroDivisionError` around the `Fraction(...)` call and re-raising as
+   `ValueError` -- every existing and future caller that already catches
+   `(ValueError, TypeError)` around `_coerce_recompute_number` is covered
+   without having to enumerate call sites. 2 new regression tests (`"1/0"` as
+   `observed`, `"1/0"` as `expected`).
+
+All 3 fixes reproduced directly against the actual code before being fixed. 8
+new regression tests (4 in `test_shared_value_registry.py`, 2 in
+`test_math_claims.py`, 2 in `test_constraint_checks.py`), 1195 passed (was
+1187), same 50 pre-existing unrelated failures confirmed byte-identical via
+`git stash`. `pyflakes`-clean.
+
 ## 6. Regression
 
 First pass: 44 new tests (`test_shared_value_registry.py` 14, `test_math_claims.py`
@@ -360,8 +427,10 @@ First pass: 44 new tests (`test_shared_value_registry.py` 14, `test_math_claims.
 `test_constraint_checks.py` +11 B2 operations +3 DEPENDENCY must_reuse/
 must_be_consistent_with wiring). After §5.1's review-fix round: 22 more (10 in
 `test_shared_value_registry.py`, 3 in `test_math_claims.py`, 9 in
-`test_constraint_checks.py`), 66 new tests total, all passing. Full suite: 1187
-passed / 50 failed, the exact same 50 pre-existing unrelated failures confirmed
-byte-identical (not just count) via `git stash` before/after comparison, both
-before and after the review-fix round -- same discipline every prior stage in
+`test_constraint_checks.py`), 66 new tests. After §5.2's second review-fix
+round: 8 more (4 in `test_shared_value_registry.py`, 2 in `test_math_claims.py`,
+2 in `test_constraint_checks.py`), 74 new tests total, all passing. Full suite:
+1195 passed / 50 failed, the exact same 50 pre-existing unrelated failures
+confirmed byte-identical (not just count) via `git stash` before/after
+comparison, across all three rounds -- same discipline every prior stage in
 this revision has applied. `pyflakes`-clean throughout.

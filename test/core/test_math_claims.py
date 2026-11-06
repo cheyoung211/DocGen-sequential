@@ -142,6 +142,47 @@ def test_shared_value_claim_without_a_source_ref_is_not_counted_as_externally_so
     assert report.externally_sourced_count == 0
 
 
+def test_unresolved_sibling_symbol_survives_claim_conversion_as_its_own_unknown():
+    # Regression: the old conversion iterated only checked_semantic_ids,
+    # so a dependency where n matched but k had no source definition at
+    # all converted to a single PASS claim for n -- k's UNKNOWN (and the
+    # record's own overall UNKNOWN) were nowhere in the claims.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10, nothing about k",
+        config=SharedValueCheckConfig(relevant_symbols=["n", "k"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+    claims = math_claims_for_shared_value_record(record)
+    by_symbol = {c.symbol: c for c in claims}
+    assert by_symbol["n"].outcome == CheckOutcome.PASS
+    assert by_symbol["k"].outcome == CheckOutcome.UNKNOWN
+    assert by_symbol["k"].unknown_reason is not None
+
+
+def test_declared_assumption_mismatch_survives_claim_conversion_as_its_own_fail():
+    # Regression: a record that came out FAIL purely from a declared
+    # scope/unit/assumptions mismatch (every checked symbol's own number
+    # agreed) converted to nothing but PASS claims, losing the FAIL fact
+    # entirely.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10",
+        config=SharedValueCheckConfig(
+            relevant_symbols=["n"],
+            source_assumptions=["steady_state"], target_assumptions=["transient"],
+        ),
+    )
+    assert record.outcome == CheckOutcome.FAIL
+    claims = math_claims_for_shared_value_record(record)
+    outcomes = {c.outcome for c in claims}
+    assert CheckOutcome.FAIL in outcomes
+    by_symbol = {c.symbol: c for c in claims if c.symbol is not None}
+    assert by_symbol["n"].outcome == CheckOutcome.PASS
+
+
 def test_logical_validity_criterion_is_declared_but_never_auto_produced():
     # B6 (symbolic/logic review) is explicit follow-up, not started on
     # this branch -- nothing in B1-B3's own builders ever stamps this

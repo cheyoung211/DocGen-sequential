@@ -75,7 +75,21 @@ def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
     fuzzy/substring match. A backslash-led LaTeX command (``\\alpha``) only
     needs a lookahead boundary (the leading backslash is itself already a
     left boundary); a plain identifier (``n``, ``n_0``, ``R_g``) needs both
-    boundaries, so ``n`` never matches inside ``n_0`` or ``xn``."""
+    boundaries, so ``n`` never matches inside ``n_0`` or ``xn``.
+
+    The value side only matches when the ENTIRE right-hand side is a plain
+    (optionally signed, optionally decimal) literal -- the trailing
+    lookahead rejects a following digit (an already-consumed-prefix
+    problem), a following ``/`` (a fraction, e.g. ``1/2``), a following
+    ``e``/``E`` plus sign/digit (scientific notation, e.g. ``1e3``), and a
+    following ``.`` plus digit (a second decimal point). Without this, a
+    naive ``\\d+(?:\\.\\d+)?`` would silently match just the leading ``1``
+    of ``n = 1/2`` or ``n = 1e3`` and misreport the wrong value as a clean
+    restatement -- this module's own docstring already promises "a
+    right-hand side that isn't a plain... literal number is simply not
+    matched, never guessed at"; a sentence-ending period with no following
+    digit (``n = 10.``) is NOT rejected, since that is not a continuation
+    of the number at all."""
     escaped = re.escape(symbol)
     if symbol.startswith("\\"):
         left_boundary = ""
@@ -85,7 +99,7 @@ def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
         right_boundary = r"(?![A-Za-z0-9_])"
     return re.compile(
         left_boundary + escaped + right_boundary
-        + r"\s*=\s*(?P<value>-?\d+(?:\.\d+)?)(?!\d)"
+        + r"\s*=\s*(?P<value>-?\d+(?:\.\d+)?)(?![\d/]|[eE][+-]?\d|\.\d)"
     )
 
 
@@ -188,11 +202,22 @@ class SharedValueConsistencyRecord(BaseModel):
     with its own entry in ``mismatches`` too). ``not_applicable_semantic_ids``
     is the separate, explicit "this symbol does not apply to this
     obligation" category (never conflated with "could not be resolved").
-    Any ``relevant_symbols`` entry missing from BOTH lists was unresolved
-    (no source definition, an ambiguous source definition, or no target
-    restatement) -- that unresolved state is what forces the record's
-    overall outcome to UNKNOWN rather than letting some OTHER symbol's
-    success silently stand in for it.
+    Any ``relevant_symbols`` entry missing from BOTH lists is in
+    ``unresolved_semantic_ids`` instead (no source definition, an
+    ambiguous source definition, or no target restatement) -- that
+    unresolved state is what forces the record's overall outcome to
+    UNKNOWN rather than letting some OTHER symbol's success silently
+    stand in for it, and is also what lets a MathClaim be built per
+    unresolved symbol instead of that symbol's UNKNOWN fact disappearing
+    during claim conversion (``unresolved_reason_by_id``/
+    ``unresolved_detail_by_id`` carry the specific reason/detail text for
+    each one). ``context_outcome``/``context_detail`` are the separate,
+    OBLIGATION-level (not per-symbol) verdict from comparing the caller's
+    declared scope/unit/assumptions (``None`` when nothing was declared
+    on either side, the common case) -- kept distinct from the per-symbol
+    numeric ``mismatches`` so a MathClaim can represent "the numbers
+    agree but the declared assumptions don't" as its own claim rather
+    than letting a clean numeric match silently absorb it.
     """
 
     dependency_id: str
@@ -203,6 +228,11 @@ class SharedValueConsistencyRecord(BaseModel):
     detail: str = ""
     checked_semantic_ids: List[str] = Field(default_factory=list)
     not_applicable_semantic_ids: List[str] = Field(default_factory=list)
+    unresolved_semantic_ids: List[str] = Field(default_factory=list)
+    unresolved_reason_by_id: Dict[str, UnknownReason] = Field(default_factory=dict)
+    unresolved_detail_by_id: Dict[str, str] = Field(default_factory=dict)
+    context_outcome: Optional[CheckOutcome] = None
+    context_detail: str = ""
     mismatches: List[str] = Field(default_factory=list)
     source_definitions: List[SharedValueDefinition] = Field(default_factory=list)
     target_usages: List[SharedValueUsage] = Field(default_factory=list)
@@ -295,10 +325,20 @@ def check_shared_value_consistency(
     checked_ids: List[str] = []
     not_applicable_ids: List[str] = []
     mismatches: List[str] = []
+    unresolved_ids: List[str] = []
+    unresolved_reason_by_id: Dict[str, UnknownReason] = {}
+    unresolved_detail_by_id: Dict[str, str] = {}
     unresolved_details: List[str] = []
     unresolved_reasons: List[UnknownReason] = []
     source_definitions: List[SharedValueDefinition] = []
     target_usages: List[SharedValueUsage] = []
+
+    def _mark_unresolved(semantic_id: str, reason: UnknownReason, detail: str) -> None:
+        unresolved_ids.append(semantic_id)
+        unresolved_reason_by_id[semantic_id] = reason
+        unresolved_detail_by_id[semantic_id] = detail
+        unresolved_reasons.append(reason)
+        unresolved_details.append(detail)
 
     for semantic_id in config.relevant_symbols:
         if semantic_id in config.not_applicable_symbols:
@@ -311,9 +351,9 @@ def check_shared_value_consistency(
         for alias in aliases:
             source_hits.extend((alias, occ) for occ in find_symbol_value_occurrences(source_text, alias))
         if not source_hits:
-            unresolved_reasons.append(UnknownReason.MISSING_DEPENDENCY)
-            unresolved_details.append(
-                f"{semantic_id}: source section {source_section_id!r} never defines this symbol."
+            _mark_unresolved(
+                semantic_id, UnknownReason.MISSING_DEPENDENCY,
+                f"{semantic_id}: source section {source_section_id!r} never defines this symbol.",
             )
             continue
 
@@ -327,11 +367,11 @@ def check_shared_value_consistency(
             # 추측해 덮어쓰지 않는다" cuts against guessing in either
             # direction).
             values_detail = ", ".join(str(v) for v in sorted(distinct_source_values))
-            unresolved_reasons.append(UnknownReason.NOT_REPRESENTABLE)
-            unresolved_details.append(
+            _mark_unresolved(
+                semantic_id, UnknownReason.NOT_REPRESENTABLE,
                 f"{semantic_id}: source section {source_section_id!r} itself states inconsistent "
                 f"values ({values_detail}) -- not used as a basis for comparison, the correct "
-                "one is not guessed."
+                "one is not guessed.",
             )
             continue
 
@@ -340,9 +380,9 @@ def check_shared_value_consistency(
         for alias in aliases:
             target_hits.extend((alias, occ) for occ in find_symbol_value_occurrences(target_text, alias))
         if not target_hits:
-            unresolved_reasons.append(UnknownReason.NOT_CHECKED)
-            unresolved_details.append(
-                f"{semantic_id}: target section {target_section_id!r} never restates this symbol."
+            _mark_unresolved(
+                semantic_id, UnknownReason.NOT_CHECKED,
+                f"{semantic_id}: target section {target_section_id!r} never restates this symbol.",
             )
             continue
 
@@ -391,6 +431,11 @@ def check_shared_value_consistency(
             detail="; ".join(detail_parts),
             checked_semantic_ids=checked_ids,
             not_applicable_semantic_ids=not_applicable_ids,
+            unresolved_semantic_ids=unresolved_ids,
+            unresolved_reason_by_id=unresolved_reason_by_id,
+            unresolved_detail_by_id=unresolved_detail_by_id,
+            context_outcome=context_outcome,
+            context_detail=context_detail,
             mismatches=mismatches,
             source_definitions=source_definitions,
             target_usages=target_usages,
@@ -416,6 +461,11 @@ def check_shared_value_consistency(
             detail="; ".join(detail_parts),
             checked_semantic_ids=checked_ids,
             not_applicable_semantic_ids=not_applicable_ids,
+            unresolved_semantic_ids=unresolved_ids,
+            unresolved_reason_by_id=unresolved_reason_by_id,
+            unresolved_detail_by_id=unresolved_detail_by_id,
+            context_outcome=context_outcome,
+            context_detail=context_detail,
             source_definitions=source_definitions,
             target_usages=target_usages,
         )
@@ -433,6 +483,8 @@ def check_shared_value_consistency(
             unknown_reason=UnknownReason.NOT_CHECKED,
             detail="every relevant_symbols entry was marked not-applicable to this obligation -- nothing checked.",
             not_applicable_semantic_ids=not_applicable_ids,
+            context_outcome=context_outcome,
+            context_detail=context_detail,
         )
 
     # Every relevant, applicable symbol resolved and agreed, and no
@@ -456,6 +508,9 @@ def check_shared_value_consistency(
             ),
             checked_semantic_ids=checked_ids,
             not_applicable_semantic_ids=not_applicable_ids,
+            unresolved_semantic_ids=unresolved_ids,
+            context_outcome=context_outcome,
+            context_detail=context_detail,
             source_definitions=source_definitions,
             target_usages=target_usages,
         )
@@ -468,6 +523,9 @@ def check_shared_value_consistency(
         detail=f"consistent restated value(s) for {checked_ids}.",
         checked_semantic_ids=checked_ids,
         not_applicable_semantic_ids=not_applicable_ids,
+        unresolved_semantic_ids=unresolved_ids,
+        context_outcome=context_outcome,
+        context_detail=context_detail,
         source_definitions=source_definitions,
         target_usages=target_usages,
     )

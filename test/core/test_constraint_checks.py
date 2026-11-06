@@ -557,6 +557,33 @@ class TestRecomputeInputRobustness:
         assert evidence[0].outcome == CheckOutcome.UNKNOWN
         assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
 
+    def test_zero_denominator_fraction_observed_is_unknown_not_a_crash(self) -> None:
+        # Regression: "1/0" matches the fraction-string pattern, so
+        # _coerce_recompute_number reached Fraction("1/0"), which raises
+        # ZeroDivisionError -- a type the (ValueError, TypeError) except
+        # clauses around every call site did not catch, crashing instead
+        # of returning UNKNOWN.
+        store, checked, _ = self._store_with_source()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {"observed": "1/0", "expected": 1.0}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
+    def test_zero_denominator_fraction_expected_is_unknown_not_a_crash(self) -> None:
+        store, checked, _ = self._store_with_source()
+        checker = BasicConstraintChecker(store)
+        constraint = Constraint(constraint_id="r1", kind=ConstraintKind.RECOMPUTE, description="x")
+        evidence = checker.check(
+            checked, [constraint],
+            context={"recompute": {"r1": {"observed": 1.0, "expected": "1/0"}}},
+        )
+        assert evidence[0].outcome == CheckOutcome.UNKNOWN
+        assert evidence[0].unknown_reason == UnknownReason.NOT_REPRESENTABLE
+
 
 class TestRecomputeOperationsB2:
     """Fix B checklist item B2: extending the single "sum" recompute
