@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, List, Optional
 from pydantic import BaseModel, Field
 
 from src.core.schemas import ArtifactRef, CheckOutcome, UnknownReason
+from src.core.shared_value_registry import NUMERIC_MATCH_TOLERANCE
 
 if TYPE_CHECKING:
     from src.core.shared_value_registry import SharedValueConsistencyRecord
@@ -188,9 +189,14 @@ def math_claims_for_shared_value_record(
     Three independent kinds of fact, each preserved as its own claim(s)
     rather than one collapsing into or hiding another:
 
-    1. One claim per symbol in ``checked_semantic_ids`` (both a source
-       definition and a target restatement were found) -- PASS or FAIL
-       depending on whether that symbol's own numbers agreed.
+    1. One claim per TARGET USAGE of a symbol in ``checked_semantic_ids``
+       (both a source definition and at least one target restatement were
+       found) -- PASS or FAIL depending on whether THAT SPECIFIC usage's
+       own number agreed with the source, never one claim per symbol
+       covering every usage at once (a symbol restated more than once,
+       e.g. once correctly then once wrong, needs its own claim per
+       occurrence so a FAIL claim's evidence always points at the actual
+       mismatching restatement, not an arbitrary one).
     2. One UNKNOWN claim per symbol in ``unresolved_semantic_ids`` (no
        source definition, an ambiguous source definition, or no target
        restatement). A review caught an earlier version of this function
@@ -266,38 +272,55 @@ def math_claims_for_shared_value_record(
     for semantic_id in record.checked_semantic_ids:
         definition = definitions_by_id.get(semantic_id)
         usages = usages_by_id.get(semantic_id, [])
-        # A per-symbol verdict, not the obligation's aggregate outcome: a
-        # dependency checking two symbols where only one mismatches must
-        # still report the OTHER symbol's own claim as PASS, not drag it
-        # down to the record's overall FAIL (the same "don't collapse a
-        # per-target obligation's partial result" discipline C1/C3 already
-        # apply one level up, applied here one level down to each symbol).
-        own_mismatches = [m for m in record.mismatches if m.startswith(f"{semantic_id}:")]
-        claim_outcome = CheckOutcome.FAIL if own_mismatches else CheckOutcome.PASS
-        claims.append(
-            MathClaim(
-                claim_id=f"{record.dependency_id}::{record.target_section_id}::{semantic_id}",
-                kind=MathClaimKind.SHARED_VALUE,
-                criterion_id=MathCriterionId.VALUE_CONSISTENCY,
-                artifact_id=artifact_id,
-                artifact_version=artifact_version,
-                raw_text=usages[0].raw_text if usages else (definition.raw_text if definition else ""),
-                matched_at_line=usages[0].matched_at_line if usages else None,
-                symbol=semantic_id,
-                observed_value=usages[0].value if usages else None,
-                expected_value=definition.value if definition else None,
-                source_ref=source_ref,
-                scope=definition.scope if definition else "global",
-                unit=definition.unit if definition else None,
-                assumptions=list(definition.assumptions) if definition else [],
-                # checked_semantic_ids only ever contains a symbol once
-                # both a source definition and a target usage were
-                # actually found (check_shared_value_consistency's own
-                # construction) -- so a per-symbol claim here is always
-                # PASS or FAIL, never UNKNOWN.
-                outcome=claim_outcome,
+        # One claim PER TARGET USAGE, not one claim per symbol: a symbol
+        # restated more than once in the target (e.g. "n = 10" then later
+        # "n = 20") used to collapse into a single claim built from
+        # usages[0] alone, with its outcome decided by whether ANY usage
+        # mismatched -- so a claim could read outcome=FAIL while its own
+        # observed_value/raw_text/matched_at_line still pointed at the
+        # FIRST, MATCHING usage, self-contradictory evidence that can't
+        # actually locate the real mismatch for a reader or a later
+        # selective-repair step. Each usage's own outcome is recomputed
+        # directly against the source definition's value, using the exact
+        # same comparison and tolerance `check_shared_value_consistency`
+        # itself already used to decide whether to record that usage in
+        # `mismatches` -- never re-derived by string-matching that
+        # aggregate list, which ties a PASS/FAIL outcome to a specific
+        # usage's own evidence only by coincidence of ordering.
+        for usage in usages:
+            usage_outcome = (
+                CheckOutcome.FAIL
+                if definition is not None
+                and abs(usage.value - definition.value) > NUMERIC_MATCH_TOLERANCE
+                else CheckOutcome.PASS
             )
-        )
+            claims.append(
+                MathClaim(
+                    claim_id=(
+                        f"{record.dependency_id}::{record.target_section_id}::"
+                        f"{semantic_id}::line{usage.matched_at_line}"
+                    ),
+                    kind=MathClaimKind.SHARED_VALUE,
+                    criterion_id=MathCriterionId.VALUE_CONSISTENCY,
+                    artifact_id=artifact_id,
+                    artifact_version=artifact_version,
+                    raw_text=usage.raw_text,
+                    matched_at_line=usage.matched_at_line,
+                    symbol=semantic_id,
+                    observed_value=usage.value,
+                    expected_value=definition.value if definition else None,
+                    source_ref=source_ref,
+                    scope=definition.scope if definition else "global",
+                    unit=definition.unit if definition else None,
+                    assumptions=list(definition.assumptions) if definition else [],
+                    # checked_semantic_ids only ever contains a symbol once
+                    # both a source definition and a target usage were
+                    # actually found (check_shared_value_consistency's own
+                    # construction) -- so a per-usage claim here is always
+                    # PASS or FAIL, never UNKNOWN.
+                    outcome=usage_outcome,
+                )
+            )
 
     if record.context_outcome is not None:
         claims.append(

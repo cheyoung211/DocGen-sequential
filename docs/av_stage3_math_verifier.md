@@ -418,6 +418,54 @@ All 3 fixes reproduced directly against the actual code before being fixed. 8
 new regression tests (4 in `test_shared_value_registry.py`, 2 in
 `test_math_claims.py`, 2 in `test_constraint_checks.py`), 1195 passed (was
 1187), same 50 pre-existing unrelated failures confirmed byte-identical via
+`git stash`. `pyflakes`-clean. **Committed as `3a995ec` "stage3 revision2"**
+(discovered after the fact -- same pattern as every prior stage's rounds: this
+session never ran `git commit`; confirmed via `git log`/`git status` matching
+this round's exact diff before starting round 3 below).
+
+## 5.3. Review round 3 (2026-11-06, on top of `3a995ec`, uncommitted) -- 2 more real bugs found
+
+A third review pass -- on the code AFTER round 2's fixes were committed -- found
+round 2's own fraction/exponent fix was still incomplete, plus a second,
+independent bug in how a FAIL claim's evidence gets attached:
+
+1. **The fraction/product fix only caught an operator with NO space before
+   it.** Round 2 fixed `n = 1/2` and `n = 1e3` (operator/exponent glued
+   directly to the digit), but `n = 1 / 2` and `n = 10 * 2` (a space before
+   the operator) still silently read as `n=1`/`n=10` -- the trailing
+   lookahead only inspected the character immediately adjacent to the
+   matched digits, and a space there isn't a digit, `/`, `e`/`E`, or a second
+   `.`, so it passed through untouched. Confirmed through the full
+   `BasicConstraintChecker`/dependency-check path too, not just the bare
+   registry function. Fixed: added a second trailing lookahead,
+   `(?![ \t]*[\d/*+^-])`, that skips plain spaces/tabs (deliberately NOT
+   `\s*`, which also matches a newline -- a markdown `-` bullet starting the
+   NEXT line must never be misread as a subtraction continuation of THIS
+   line's number; covered by a dedicated regression test) and then checks
+   for a following digit or one of `/ * + - ^`. 3 new regression tests
+   (spaced fraction, spaced product, and the bullet-on-next-line negative
+   case confirming the fix didn't become too aggressive).
+2. **A FAIL claim's observed value/raw text/line could point at a DIFFERENT,
+   matching usage instead of the one that actually mismatched.** When a
+   symbol was restated more than once in the target (e.g. `n = 10` then
+   later `n = 20`), `math_claims_for_shared_value_record` built exactly ONE
+   claim per checked symbol from `usages[0]` alone, with its outcome decided
+   by whether ANY usage appeared in `record.mismatches` -- so the claim could
+   read `outcome=FAIL` while `observed_value=10`/`line=1` (the first,
+   MATCHING usage), never surfacing the actual `n=20` mismatch at all. Fixed
+   by generating one claim PER TARGET USAGE instead of per symbol, each
+   outcome recomputed directly against the source definition's value using
+   the same comparison and tolerance the registry itself uses to decide
+   `mismatches` in the first place (`NUMERIC_MATCH_TOLERANCE`, newly exported
+   from `shared_value_registry.py` so the two modules can never silently
+   drift onto two different epsilons). 1 new regression test confirming a
+   mixed PASS+FAIL pair of claims, each with its own correct
+   observed_value/line/raw_text.
+
+Both fixes reproduced directly against the actual code before being fixed
+(including the dependency-check path for bug 1). 4 new regression tests (3 in
+`test_shared_value_registry.py`, 1 in `test_math_claims.py`); full suite 1199
+passed / 50 failed, same pre-existing failures confirmed byte-identical via
 `git stash`. `pyflakes`-clean.
 
 ## 6. Regression
@@ -429,8 +477,10 @@ must_be_consistent_with wiring). After §5.1's review-fix round: 22 more (10 in
 `test_shared_value_registry.py`, 3 in `test_math_claims.py`, 9 in
 `test_constraint_checks.py`), 66 new tests. After §5.2's second review-fix
 round: 8 more (4 in `test_shared_value_registry.py`, 2 in `test_math_claims.py`,
-2 in `test_constraint_checks.py`), 74 new tests total, all passing. Full suite:
-1195 passed / 50 failed, the exact same 50 pre-existing unrelated failures
-confirmed byte-identical (not just count) via `git stash` before/after
-comparison, across all three rounds -- same discipline every prior stage in
-this revision has applied. `pyflakes`-clean throughout.
+2 in `test_constraint_checks.py`), 74 new tests. After §5.3's third review-fix
+round: 4 more (3 in `test_shared_value_registry.py`, 1 in `test_math_claims.py`),
+78 new tests total, all passing. Full suite: 1199 passed / 50 failed, the exact
+same 50 pre-existing unrelated failures confirmed byte-identical (not just
+count) via `git stash` before/after comparison, across all four rounds -- same
+discipline every prior stage in this revision has applied. `pyflakes`-clean
+throughout.

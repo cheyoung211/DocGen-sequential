@@ -327,3 +327,39 @@ def test_a_sentence_ending_period_right_after_the_number_still_matches():
 def test_a_double_decimal_point_right_hand_side_is_rejected():
     occurrences = find_symbol_value_occurrences("n = 10.5.3", "n")
     assert occurrences == []
+
+
+def test_a_spaced_fraction_right_hand_side_is_not_truncated_to_its_numerator():
+    # Regression: the round-1 fix only rejected an operator with NO space
+    # before it ("1/2"); "n = 1 / 2" still silently read as n=1, since the
+    # character immediately after "1" was a space, not "/".
+    occurrences = find_symbol_value_occurrences("n = 1 / 2", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 1 / 2", target_text="n = 1 / 3",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_spaced_product_right_hand_side_is_not_truncated_to_its_first_factor():
+    occurrences = find_symbol_value_occurrences("n = 10 * 2", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10 * 2", target_text="n = 10 * 3",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_following_markdown_bullet_on_the_next_line_is_not_mistaken_for_a_continuation():
+    # The spaced-operator rejection must not cross a newline -- a "-"
+    # bullet starting the NEXT line is not a subtraction continuation of
+    # THIS line's restated number.
+    occurrences = find_symbol_value_occurrences("n = 10\n- some bullet point", "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 10.0

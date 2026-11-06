@@ -60,6 +60,13 @@ from pydantic import BaseModel, Field
 from src.core.schemas import CheckOutcome, UnknownReason
 from src.dataset.schemas import DependencyRelation
 
+#: Shared with math_claims.py -- a single named tolerance for "two restated
+#: numbers count as the same value," so a per-usage MathClaim's own outcome
+#: (recomputed independently against the source definition) can never
+#: disagree with this module's own mismatch detection over a float-precision
+#: edge case.
+NUMERIC_MATCH_TOLERANCE = 1e-9
+
 
 class SharedValueOccurrence(BaseModel):
     """One ``symbol = number`` restatement actually found in rendered
@@ -89,7 +96,15 @@ def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
     right-hand side that isn't a plain... literal number is simply not
     matched, never guessed at"; a sentence-ending period with no following
     digit (``n = 10.``) is NOT rejected, since that is not a continuation
-    of the number at all."""
+    of the number at all.
+
+    A SEPARATE lookahead additionally rejects an arithmetic continuation
+    separated from the number by plain spaces/tabs (never a newline, so a
+    markdown ``-`` bullet starting the NEXT line is never mistaken for a
+    continuation of THIS line's number) -- a following digit, or one of
+    ``/ * + - ^``. Without this, ``n = 1 / 2`` and ``n = 10 * 2`` would
+    still silently read as ``n=1``/``n=10`` (the digit-adjacency checks
+    above only catch an operator with NO space before it)."""
     escaped = re.escape(symbol)
     if symbol.startswith("\\"):
         left_boundary = ""
@@ -99,7 +114,8 @@ def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
         right_boundary = r"(?![A-Za-z0-9_])"
     return re.compile(
         left_boundary + escaped + right_boundary
-        + r"\s*=\s*(?P<value>-?\d+(?:\.\d+)?)(?![\d/]|[eE][+-]?\d|\.\d)"
+        + r"\s*=\s*(?P<value>-?\d+(?:\.\d+)?)"
+        + r"(?![\d/]|[eE][+-]?\d|\.\d)(?![ \t]*[\d/*+^-])"
     )
 
 
@@ -411,7 +427,7 @@ def check_shared_value_consistency(
                     matched_at_line=occ.line,
                 )
             )
-            if abs(occ.value - source_occ.value) > 1e-9:
+            if abs(occ.value - source_occ.value) > NUMERIC_MATCH_TOLERANCE:
                 mismatches.append(
                     f"{semantic_id}: source {source_section_id!r}={source_occ.value} vs. "
                     f"target {target_section_id!r}={occ.value} (line {occ.line})."
@@ -532,6 +548,7 @@ def check_shared_value_consistency(
 
 
 __all__ = [
+    "NUMERIC_MATCH_TOLERANCE",
     "SharedValueOccurrence",
     "find_symbol_value_occurrences",
     "SharedValueCheckConfig",

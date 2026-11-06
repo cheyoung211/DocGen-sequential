@@ -183,6 +183,33 @@ def test_declared_assumption_mismatch_survives_claim_conversion_as_its_own_fail(
     assert by_symbol["n"].outcome == CheckOutcome.PASS
 
 
+def test_a_fail_claim_points_at_the_actual_mismatching_usage_not_an_arbitrary_one():
+    # Regression: when a symbol is restated more than once in the target
+    # (once correctly, once wrong), the old code built ONE claim from
+    # usages[0] alone but decided its outcome from whether ANY usage
+    # mismatched -- so a FAIL claim could carry observed_value/raw_text/
+    # matched_at_line from the FIRST, MATCHING usage, self-contradictory
+    # evidence that can't actually locate the real mismatch.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10\nn = 20",
+        config=SharedValueCheckConfig(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.FAIL
+    claims = math_claims_for_shared_value_record(record)
+    n_claims = [c for c in claims if c.symbol == "n"]
+    assert len(n_claims) == 2
+    passing = [c for c in n_claims if c.outcome == CheckOutcome.PASS]
+    failing = [c for c in n_claims if c.outcome == CheckOutcome.FAIL]
+    assert len(passing) == 1 and len(failing) == 1
+    assert passing[0].observed_value == 10.0
+    assert passing[0].matched_at_line == 1
+    assert failing[0].observed_value == 20.0
+    assert failing[0].matched_at_line == 2
+    assert "20" in failing[0].raw_text
+
+
 def test_logical_validity_criterion_is_declared_but_never_auto_produced():
     # B6 (symbolic/logic review) is explicit follow-up, not started on
     # this branch -- nothing in B1-B3's own builders ever stamps this
