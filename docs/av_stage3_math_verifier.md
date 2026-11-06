@@ -466,7 +466,50 @@ Both fixes reproduced directly against the actual code before being fixed
 (including the dependency-check path for bug 1). 4 new regression tests (3 in
 `test_shared_value_registry.py`, 1 in `test_math_claims.py`); full suite 1199
 passed / 50 failed, same pre-existing failures confirmed byte-identical via
-`git stash`. `pyflakes`-clean.
+`git stash`. `pyflakes`-clean. **Committed as `4aec19f` "stage3 revision3"**
+(discovered after the fact -- same pattern as every prior round; confirmed via
+`git log`/`git status` before starting round 4 below).
+
+## 5.4. Review round 4 (2026-11-06, on top of `4aec19f`, uncommitted) -- 2 more real bugs found
+
+A fourth review pass found round 3's spaced-operator fix still didn't cover
+LaTeX operator commands, plus a second claim_id collision round 3's own fix
+for the first collision didn't fully close:
+
+1. **The spaced-operator rejection only covered ASCII operators, not LaTeX
+   operator commands.** `n = 10 \times 2` and `n = 10 \cdot 2` both still
+   silently read as `n=10` -- `\times`/`\cdot` start with a backslash, which
+   round 3's `[ \t]*[\d/*+^-]` class never included. Confirmed through the
+   full `BasicConstraintChecker` dependency-check path for the `\times` case
+   too. Rather than add `\times`/`\cdot` by name (the third round in a row
+   of enumerating one more operator -- the exact whack-a-mole this function
+   had already hit twice), the fix is a blanket one: the class now also
+   rejects a bare backslash, so ANY LaTeX command immediately following the
+   number (across plain spaces/tabs) reads as "not a bare literal," full
+   stop -- never requiring this function to know every operator command
+   LaTeX has. The accepted tradeoff, stated explicitly in the function's own
+   docstring now: a unit annotation with no delimiter of its own
+   (`n = 10 \text{m}`) also reads UNKNOWN rather than a confirmed `10` --
+   intentional lost recall in exchange for never risking a false PASS on an
+   actual operator, the same "never guess" discipline this module has
+   applied everywhere else. 2 new regression tests (`\times`, `\cdot`).
+2. **Two usages of the same symbol on the SAME line still got a colliding
+   claim_id.** Round 3 fixed the *per-symbol* collision (one claim per
+   symbol regardless of usage count) by moving to one claim per usage, but
+   the new claim_id (`dependency::target::symbol::line<N>`) only
+   disambiguated by line number -- two usages on the exact same line (one
+   sentence restating a symbol twice, e.g. "n = 10, then n = 20") still
+   produced two claims with the identical id. A caller storing claims keyed
+   by claim_id (exactly the use case claim_ids exist for) would silently
+   drop one of the two. Fixed by adding the usage's position within that
+   symbol's usage list (`occ{occurrence_index}`) to the id, guaranteeing
+   uniqueness regardless of whether usages share a line. 1 new regression
+   test confirming two same-line usages get distinct ids.
+
+Both fixes reproduced directly against the actual code before being fixed. 3
+new regression tests (2 in `test_shared_value_registry.py`, 1 in
+`test_math_claims.py`); full suite 1202 passed / 50 failed, same pre-existing
+failures confirmed byte-identical via `git stash`. `pyflakes`-clean.
 
 ## 6. Regression
 
@@ -479,8 +522,10 @@ must_be_consistent_with wiring). After §5.1's review-fix round: 22 more (10 in
 round: 8 more (4 in `test_shared_value_registry.py`, 2 in `test_math_claims.py`,
 2 in `test_constraint_checks.py`), 74 new tests. After §5.3's third review-fix
 round: 4 more (3 in `test_shared_value_registry.py`, 1 in `test_math_claims.py`),
-78 new tests total, all passing. Full suite: 1199 passed / 50 failed, the exact
-same 50 pre-existing unrelated failures confirmed byte-identical (not just
-count) via `git stash` before/after comparison, across all four rounds -- same
+78 new tests. After §5.4's fourth review-fix round: 3 more (2 in
+`test_shared_value_registry.py`, 1 in `test_math_claims.py`), 81 new tests
+total, all passing. Full suite: 1202 passed / 50 failed, the exact same 50
+pre-existing unrelated failures confirmed byte-identical (not just count) via
+`git stash` before/after comparison, across all five rounds -- same
 discipline every prior stage in this revision has applied. `pyflakes`-clean
 throughout.

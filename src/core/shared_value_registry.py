@@ -101,10 +101,25 @@ def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
     A SEPARATE lookahead additionally rejects an arithmetic continuation
     separated from the number by plain spaces/tabs (never a newline, so a
     markdown ``-`` bullet starting the NEXT line is never mistaken for a
-    continuation of THIS line's number) -- a following digit, or one of
-    ``/ * + - ^``. Without this, ``n = 1 / 2`` and ``n = 10 * 2`` would
-    still silently read as ``n=1``/``n=10`` (the digit-adjacency checks
-    above only catch an operator with NO space before it)."""
+    continuation of THIS line's number) -- a following digit, one of
+    ``/ * + - ^``, or a backslash. Without this, ``n = 1 / 2`` and
+    ``n = 10 * 2`` would still silently read as ``n=1``/``n=10`` (the
+    digit-adjacency checks above only catch an operator with NO space
+    before it). The backslash case is deliberately a BLANKET rejection
+    rather than naming specific LaTeX operator commands (``\\times``,
+    ``\\cdot``, ``\\div``, ``\\pm``, ...): enumerating operator names one
+    at a time is exactly the whack-a-mole this function has already been
+    through twice (bare operator, then spaced operator) -- any backslash
+    immediately following the number (with only plain spaces/tabs, if
+    anything, in between) means the right-hand side is not a bare literal,
+    full stop, so it reads as "this symbol's source/target restatement
+    could not be confirmed" (UNKNOWN) rather than risk silently accepting
+    some future LaTeX operator command never explicitly tested for. This
+    also means a LaTeX unit annotation with no delimiter of its own
+    (``n = 10 \\text{m}``) reads UNKNOWN rather than a confirmed ``10`` --
+    an accepted, deliberate loss of recall in exchange for never risking a
+    false PASS on an actual operator, consistent with this module's
+    standing "never guess" discipline."""
     escaped = re.escape(symbol)
     if symbol.startswith("\\"):
         left_boundary = ""
@@ -115,7 +130,7 @@ def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
     return re.compile(
         left_boundary + escaped + right_boundary
         + r"\s*=\s*(?P<value>-?\d+(?:\.\d+)?)"
-        + r"(?![\d/]|[eE][+-]?\d|\.\d)(?![ \t]*[\d/*+^-])"
+        + r"(?![\d/]|[eE][+-]?\d|\.\d)(?![ \t]*[\d/*+^\\-])"
     )
 
 

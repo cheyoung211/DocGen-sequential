@@ -287,7 +287,15 @@ def math_claims_for_shared_value_record(
         # `mismatches` -- never re-derived by string-matching that
         # aggregate list, which ties a PASS/FAIL outcome to a specific
         # usage's own evidence only by coincidence of ordering.
-        for usage in usages:
+        #
+        # ``occurrence_index`` (not just ``matched_at_line``) is part of
+        # the claim_id: two usages of the SAME symbol on the SAME line
+        # (e.g. "n = 10, then n = 20" restated in one sentence) produced
+        # colliding IDs before this index was added -- a real bug, since a
+        # caller storing claims keyed by claim_id would silently drop one
+        # of the two (a PASS and a FAIL for the same symbol) depending on
+        # write order.
+        for occurrence_index, usage in enumerate(usages):
             usage_outcome = (
                 CheckOutcome.FAIL
                 if definition is not None
@@ -298,7 +306,7 @@ def math_claims_for_shared_value_record(
                 MathClaim(
                     claim_id=(
                         f"{record.dependency_id}::{record.target_section_id}::"
-                        f"{semantic_id}::line{usage.matched_at_line}"
+                        f"{semantic_id}::line{usage.matched_at_line}::occ{occurrence_index}"
                     ),
                     kind=MathClaimKind.SHARED_VALUE,
                     criterion_id=MathCriterionId.VALUE_CONSISTENCY,

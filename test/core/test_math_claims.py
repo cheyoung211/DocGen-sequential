@@ -210,6 +210,26 @@ def test_a_fail_claim_points_at_the_actual_mismatching_usage_not_an_arbitrary_on
     assert "20" in failing[0].raw_text
 
 
+def test_two_usages_on_the_same_line_get_distinct_claim_ids():
+    # Regression: two usages of the same symbol on the SAME line (one
+    # sentence restating it twice) produced identical claim_ids
+    # (dependency::target::symbol::line<N>) since the id only included
+    # matched_at_line -- a caller storing claims keyed by claim_id would
+    # silently drop one of the two (here, a PASS and a FAIL for the same
+    # symbol) depending on write order.
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10", target_text="n = 10, then n = 20",
+        config=SharedValueCheckConfig(relevant_symbols=["n"]),
+    )
+    claims = math_claims_for_shared_value_record(record)
+    n_claims = [c for c in claims if c.symbol == "n"]
+    assert len(n_claims) == 2
+    ids = [c.claim_id for c in n_claims]
+    assert len(ids) == len(set(ids))
+
+
 def test_logical_validity_criterion_is_declared_but_never_auto_produced():
     # B6 (symbolic/logic review) is explicit follow-up, not started on
     # this branch -- nothing in B1-B3's own builders ever stamps this
