@@ -81,16 +81,34 @@ class SharedValueOccurrence(BaseModel):
 #: Punctuation that signals an arithmetic/grouping continuation but is NOT
 #: classified under Unicode category "Sm" (Math Symbol) -- "/" and "*" are
 #: "Po" (Other Punctuation), "(" is "Ps" (Open Punctuation), "-" (ASCII
-#: hyphen-minus) is "Pd" (Dash Punctuation), "[" is "Ps" too, and "·"
-#: (middle dot, a common plain-text stand-in for \cdot) is "Po". "^" is
+#: hyphen-minus) is "Pd" (Dash Punctuation), "[" and "{" are "Ps" too, and
+#: "·" (middle dot, a common plain-text stand-in for \cdot) is "Po". "^" is
 #: NOT listed here -- it is already category "Sk" (Modifier Symbol), so
 #: the categorical check below covers it without enumeration. Verified
 #: empirically via ``unicodedata.category()``, not assumed. The matching
-#: CLOSE brackets (")", "]") are deliberately NOT included -- a close
+#: CLOSE brackets (")", "]", "}") are deliberately NOT included -- a close
 #: bracket right after a number reads as ending a parenthetical remark
 #: (``"(as shown, n = 10)"``), not continuing an expression, the same way
 #: a trailing comma or period is not rejected either.
-_NON_SM_CONTINUATION_CHARS = frozenset("/*([-·")
+_NON_SM_CONTINUATION_CHARS = frozenset("/*([{-·")
+
+#: LaTeX environment names (``\begin{name}...\end{name}``) this module
+#: recognizes as math mode -- the common display-math environments, plus
+#: their starred variants. Deliberately a short, explicit list rather than
+#: an attempt to recognize every environment LaTeX ships (e.g. "array",
+#: "matrix" are intentionally excluded: those commonly appear inside an
+#: already-recognized outer math region, e.g. ``$\begin{matrix}...
+#: \end{matrix}$``, so this module does not need to recognize them on
+#: their own to get the outer span right).
+_MATH_ENVIRONMENTS = frozenset({
+    "equation", "equation*",
+    "align", "align*",
+    "alignat", "alignat*",
+    "gather", "gather*",
+    "multline", "multline*",
+    "eqnarray", "eqnarray*",
+    "math", "displaymath",
+})
 
 
 def _is_arithmetic_continuation_char(ch: str) -> bool:
@@ -113,37 +131,78 @@ def _is_arithmetic_continuation_char(ch: str) -> bool:
     return ch in _NON_SM_CONTINUATION_CHARS or unicodedata.category(ch) in ("Sm", "Sk")
 
 
-def _math_spans(text: str) -> List[Tuple[int, int]]:
-    """Every ``(start, end)`` span of ``text`` delimited by ``$...$``,
-    ``\\(...\\)``, or ``\\[...\\]`` -- used only to decide whether a
-    ``symbol = number`` restatement sits inside a LaTeX formula, where a
-    space-separated letter right after the number is algebraic
-    multiplication (``$n = 2 x$`` means ``n = 2 * x``, not "n is 2, for
-    some reason named x") rather than ordinary prose (``n = 10 kg`` is
-    not inside math delimiters at all). A ``\\$`` is never treated as an
-    opening/closing delimiter (an escaped dollar sign is literal text, the
-    same escape-awareness `src/agents/latex_assembler.py`'s own math-span
-    handling already established was necessary -- re-implemented locally
-    here, deliberately NOT imported from that module, since ``src/core``
-    does not depend on ``src/agents`` and this module only needs this one
-    narrow fact, not that module's full literal/texttt masking). Not a
-    LaTeX parser: an unterminated delimiter is simply skipped rather than
-    treated as opening an unbounded span to the end of the text (under-
-    detecting math here only falls back to this module's existing,
-    already-reviewed non-math behavior for that position, never a new
-    false PASS)."""
-    spans: List[Tuple[int, int]] = []
+def _math_spans(text: str) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """Scans ``text`` for LaTeX math delimiters -- ``$...$``, ``$$...$$``,
+    ``\\(...\\)``, ``\\[...\\]``, and a known math environment's
+    ``\\begin{name}...\\end{name}`` (see ``_MATH_ENVIRONMENTS``) -- and
+    returns ``(confirmed, unparseable)``, two separate lists of
+    ``(start, end)`` spans:
+
+    - ``confirmed``: both the opening AND a matching closing delimiter
+      were actually found. A ``symbol = number`` restatement inside one
+      of these is checked under math-mode grammar -- a space-separated
+      letter right after the number is algebraic multiplication
+      (``$n = 2 x$`` means ``n = 2 * x``, not "n is 2, for some reason
+      named x"), not the ordinary-prose shape that identical text would
+      be outside any math delimiter (``n = 10 kg``); see
+      ``_is_continuation_at``'s ``in_math`` parameter.
+    - ``unparseable``: an opening delimiter was found with NO matching
+      close anywhere in the rest of ``text``. An EARLIER version of this
+      function silently skipped an unmatched opener and let whatever
+      followed it fall back to ordinary, non-math rules -- which is its
+      own bug, not a safe default: an opening delimiter this function
+      cannot even find the end of means we genuinely do not know what the
+      rest of that formula says, so a restatement found anywhere inside
+      an ``unparseable`` span must be discarded outright, unconditionally,
+      regardless of what character follows it (see ``find_symbol_value_
+      occurrences``) -- never read as a confirmed plain value just
+      because the specific trailing character it happens to be followed
+      by isn't one this module's letter/operator rules already reject.
+      Each unparseable span extends from its opening delimiter to the END
+      of ``text`` (not just the current line): once a delimiter cannot be
+      resolved, nothing after it in this string can be trusted to be
+      outside that same unresolved formula either, so scanning stops
+      there entirely.
+
+    A ``\\$`` is never treated as an opening/closing delimiter (an escaped
+    dollar sign is literal text, the same escape-awareness ``src/agents/
+    latex_assembler.py``'s own math-span handling already established was
+    necessary -- re-implemented locally here, deliberately NOT imported
+    from that module, since ``src/core`` does not depend on ``src/agents``
+    and this module only needs this one narrow fact, not that module's
+    full literal/texttt masking). Not a LaTeX parser -- a best-effort
+    delimiter scan, not a validator of what's actually well-formed LaTeX
+    inside a span it does confirm."""
+    confirmed: List[Tuple[int, int]] = []
+    unparseable: List[Tuple[int, int]] = []
     i = 0
     n = len(text)
     while i < n:
         ch = text[i]
+        if ch == "\\" and text.startswith("begin{", i + 1):
+            name_start = i + len("\\begin{")
+            name_end = text.find("}", name_start)
+            if name_end != -1 and text[name_start:name_end] in _MATH_ENVIRONMENTS:
+                name = text[name_start:name_end]
+                close_tag = "\\end{" + name + "}"
+                close_at = text.find(close_tag, name_end + 1)
+                if close_at == -1:
+                    unparseable.append((i, n))
+                    break
+                confirmed.append((i, close_at + len(close_tag)))
+                i = close_at + len(close_tag)
+                continue
+            # Not a recognized math environment (or a malformed
+            # "\begin{" with no closing brace for the name) -- falls
+            # through to the generic backslash-escape handling below, so
+            # this "\" is simply consumed as an ordinary character.
         if ch == "\\" and i + 1 < n and text[i + 1] in "([":
             closer = ")" if text[i + 1] == "(" else "]"
             end = text.find("\\" + closer, i + 2)
             if end == -1:
-                i += 2
-                continue
-            spans.append((i, end + 2))
+                unparseable.append((i, n))
+                break
+            confirmed.append((i, end + 2))
             i = end + 2
             continue
         if ch == "\\":
@@ -153,19 +212,39 @@ def _math_spans(text: str) -> List[Tuple[int, int]]:
             i += 2
             continue
         if ch == "$":
+            if i + 1 < n and text[i + 1] == "$":
+                end = text.find("$$", i + 2)
+                if end == -1:
+                    unparseable.append((i, n))
+                    break
+                confirmed.append((i, end + 2))
+                i = end + 2
+                continue
             end = text.find("$", i + 1)
             if end == -1:
-                i += 1
-                continue
-            spans.append((i, end + 1))
+                unparseable.append((i, n))
+                break
+            confirmed.append((i, end + 1))
             i = end + 1
             continue
         i += 1
-    return spans
+    return confirmed, unparseable
 
 
 def _is_within_math_span(pos: int, spans: List[Tuple[int, int]]) -> bool:
-    return any(start <= pos < end for start, end in spans)
+    """``pos`` (a ``match.end()``) counts as inside ``(start, end)`` when
+    ``start <= pos <= end`` -- inclusive on the right, unlike a normal
+    half-open slice range. An ``unparseable`` span's ``end`` is exactly
+    ``len(text)``, and a restated number can legitimately be the very
+    last characters of ``text`` (``"$n = 2"``, no closing delimiter and
+    nothing trailing at all) -- with a strict ``<``, ``match.end() ==
+    len(text) == end`` would read as NOT inside the span, silently
+    exempting exactly the "nothing follows, so there's nothing to reject"
+    case an unparseable span exists to catch unconditionally. A real
+    CONFIRMED span's own ``end`` is always one past an actual delimiter
+    character, which a number match can never advance into, so this
+    inclusive check never wrongly pulls in a different, later match."""
+    return any(start <= pos <= end for start, end in spans)
 
 
 def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
@@ -258,12 +337,18 @@ def find_symbol_value_occurrences(text: str, symbol: str) -> List[SharedValueOcc
     checked via ``_is_continuation_at`` immediately after the matched
     number -- is discarded here rather than reported as a truncated-prefix
     value; no backtracking/retry with fewer digits is attempted, so e.g.
-    ``n = 10.5.3`` yields zero occurrences, never a fallback ``10``)."""
+    ``n = 10.5.3`` yields zero occurrences, never a fallback ``10``). A
+    match found inside an ``unparseable`` math span (an opening ``$``/
+    ``\\(``/``\\[``/math-environment delimiter this module could not find
+    a matching close for) is discarded unconditionally, regardless of
+    what follows it -- see ``_math_spans``."""
     pattern = _occurrence_pattern(symbol)
-    spans = _math_spans(text)
+    confirmed_spans, unparseable_spans = _math_spans(text)
     occurrences: List[SharedValueOccurrence] = []
     for match in pattern.finditer(text):
-        in_math = _is_within_math_span(match.end(), spans)
+        if _is_within_math_span(match.end(), unparseable_spans):
+            continue
+        in_math = _is_within_math_span(match.end(), confirmed_spans)
         if _is_continuation_at(text, match.end(), in_math):
             continue
         line = text.count("\n", 0, match.start()) + 1

@@ -503,3 +503,92 @@ def test_an_escaped_dollar_sign_is_not_mistaken_for_an_opening_math_delimiter():
     occurrences = find_symbol_value_occurrences(r"The price is \$5. n = 2 x is a separate variable", "n")
     assert len(occurrences) == 1
     assert occurrences[0].value == 2.0
+
+
+def test_display_math_dollar_dollar_is_recognized_as_one_span_not_two_empty_ones():
+    # Regression: "$$n = 2 x$$" used to read as two EMPTY math spans (one
+    # "$$" pair treated as its own span, then the content "n = 2 x"
+    # treated as ordinary, non-math prose, then the closing "$$" treated
+    # as a second empty span) -- the real content sat entirely outside
+    # any detected math span, so the space-separated "x" wrongly read as
+    # prose and the restatement wrongly PASSed.
+    occurrences = find_symbol_value_occurrences("$$n = 2 x$$", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="$$n = 2 x$$", target_text="$$n = 2 y$$",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_math_environment_is_recognized_as_math_mode():
+    # Regression: \begin{equation}...\end{equation} was never recognized
+    # as a math region at all, so "n = 2 x" inside it read as ordinary
+    # prose and wrongly PASSed.
+    text = r"\begin{equation} n = 2 x \end{equation}"
+    occurrences = find_symbol_value_occurrences(text, "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text=text, target_text=r"\begin{equation} n = 2 y \end{equation}",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_an_unrecognized_latex_environment_is_not_treated_as_math():
+    # The environment check must not become too aggressive: a \begin{...}
+    # whose name isn't in the known math set should not change behavior
+    # at all (the content inside is still checked under ordinary rules --
+    # note the restatement here is NOT immediately followed by "\end{...}"
+    # with only a space in between, since ANY backslash right after a
+    # number is already rejected outright by round 4's unrelated blanket
+    # rule, regardless of math-environment recognition).
+    text = r"\begin{itemize} n = 10 is fine \end{itemize}"
+    occurrences = find_symbol_value_occurrences(text, "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 10.0
+
+
+def test_a_glued_curly_brace_right_hand_side_is_not_truncated_to_its_first_token():
+    # Regression: "n = 2{3}" used to read as n=2, discarding "{3}"
+    # entirely -- the same bug class as "(" (round 5) and "[" (round 6).
+    occurrences = find_symbol_value_occurrences("n = 2{3}", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 2{3}", target_text="n = 2{4}",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_an_unterminated_math_delimiter_discards_the_restatement_entirely():
+    # Regression: an opening "$" with no matching close used to be
+    # silently skipped, letting whatever followed it (here, "n = 2 x")
+    # fall back to ordinary non-math rules -- where the space-separated
+    # "x" read as harmless prose and the restatement wrongly PASSed.
+    # Once a delimiter's boundary can't be resolved at all, nothing
+    # after it should be trusted as a confirmed value either.
+    occurrences = find_symbol_value_occurrences("$n = 2 x", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="$n = 2 x", target_text="$n = 2 y",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_an_unterminated_math_delimiter_discards_a_restatement_even_with_nothing_trailing():
+    # The unparseable-span rejection is unconditional -- unlike the
+    # ordinary in_math letter rule, it must reject a bare number with
+    # NOTHING after it too, since the reason for distrust is "we don't
+    # know where this formula ends," not "something specific follows."
+    occurrences = find_symbol_value_occurrences("$n = 2", "n")
+    assert occurrences == []

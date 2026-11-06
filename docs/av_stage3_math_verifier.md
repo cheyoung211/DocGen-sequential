@@ -624,6 +624,82 @@ negative counterpart, the escaped-`\$` negative case, the glued bracket, and
 the close-bracket-is-fine negative case) -- plus every prior round's existing
 test re-confirmed unchanged under the new code. Full suite 1211 passed / 50
 failed, same pre-existing failures confirmed byte-identical via `git stash`.
+`pyflakes`-clean. **Committed as `de7036d` "stage3 revision6"** (discovered
+after the fact -- same pattern as every prior round).
+
+## 5.7. Review round 7 (2026-11-06, on top of `de7036d`, uncommitted) -- 4 more real bugs found, all variants of "the math boundary itself was never actually confirmed"
+
+A seventh review found 4 more ways the same underlying class of defect
+survives: `_math_spans`/`_is_continuation_at` correctly handle the math
+delimiters they recognize, but a math boundary the detector gets WRONG --
+mis-segmented, unrecognized, mis-parsed, or simply never resolved -- still
+let the content inside fall back to being read as a confirmed plain value.
+The user's own fix direction named this precisely: "수식의 우변 전체가 허용된
+숫자 리터럴인지 확인하고, 수식 경계나 구문을 해석하지 못하면 UNKNOWN으로
+처리해야 합니다... 파싱 실패한 수식이 본문 처리로 넘어가 PASS하는 경로도
+막아야 합니다."
+
+1. **`$$n = 2 x$$` (display math) was parsed as TWO empty math spans, not
+   one.** `_math_spans` paired each `$` with the very NEXT `$` it found --
+   for `$$...$$`, that is the adjacent second `$` of the SAME opening pair,
+   producing an empty confirmed span covering just `$$`, then (after the
+   real content) another empty span for the closing `$$` -- the actual
+   `n = 2 x` content sat entirely OUTSIDE any detected span, so it was
+   checked under ordinary (non-math) rules and the space-separated `x`
+   read as harmless prose. Fixed: when a `$` is immediately followed by a
+   second `$`, search for the next `$$` (not the next single `$`) to
+   close it, treating the whole thing as one display-math span.
+2. **`\begin{equation}...\end{equation}` (and other math environments)
+   were never recognized as math regions at all.** `_math_spans` only
+   ever looked for `$`/`\(`/`\[` -- a `\begin{equation}` block's content
+   fell back to ordinary rules entirely, letting `n = 2 x` read as prose
+   the same way the `$$` case did. Fixed: added environment-delimiter
+   recognition (`\begin{name}...\end{name}`) for a short, explicit list of
+   common math environments (`_MATH_ENVIRONMENTS`: equation, align,
+   gather, multline, eqnarray, math, displaymath, and their starred
+   variants) -- deliberately NOT every environment LaTeX has (e.g.
+   `array`/`matrix` are excluded on purpose: those normally nest inside an
+   already-recognized OUTER math region, so this module doesn't need to
+   know them on their own). An unrecognized environment name changes
+   nothing, confirmed by a dedicated test.
+3. **`$n = 2{3}$` (a glued curly-brace group) still truncated to `n=2`.**
+   The small ASCII-exception set already had `(` (round 5) and `[` (round
+   6) for the identical reason -- `{` (same Unicode category "Ps") was
+   simply the one bracket type not yet added. Added `{` to
+   `_NON_SM_CONTINUATION_CHARS`; the matching close brace `}` stays
+   unrejected, same reasoning as `)`/`]`.
+4. **An unterminated math delimiter (`$n = 2 x` with no closing `$`) let
+   its content fall through to ordinary, non-math rules -- exactly the
+   "parse-failed formula falls through to body-text processing and
+   PASSes" path the user named directly.** The PREVIOUS version of
+   `_math_spans` treated a failed search for a closing delimiter as "not
+   math after all" and simply moved on -- which is itself the bug, not a
+   safe default: not being able to find where a formula ends is not the
+   same fact as "this was never a formula." Fixed with a second category
+   of span, `unparseable` (returned alongside the existing `confirmed`
+   spans) -- an opening delimiter with no resolvable close creates a span
+   from that opener to the END of the text (scanning stops there; nothing
+   after an unresolved delimiter can be trusted to be outside it either),
+   and `find_symbol_value_occurrences` discards ANY match found inside an
+   `unparseable` span UNCONDITIONALLY, regardless of what character
+   follows it -- unlike the ordinary `in_math` rule, this rejection does
+   not depend on what trails the number, since the whole reason for
+   distrust is "we don't know where this formula ends," not "something
+   specific follows." Self-caught edge case while writing this fix's own
+   test for "nothing trails the number at all" (`$n = 2`, no closing `$`
+   and nothing after): `_is_within_math_span`'s original `start <= pos <
+   end` check is a half-open range, so `match.end() == len(text) == end`
+   (the number IS the last characters of the whole string) read as NOT
+   inside the span -- fixed by making the right boundary inclusive
+   (`pos <= end`), verified safe for `confirmed` spans too (whose `end` is
+   always one past a real delimiter character a number match can never
+   advance into).
+
+All 4 fixes (plus the self-caught boundary edge case) reproduced directly
+against the actual code before being fixed, including the `$$` case through
+the full `BasicConstraintChecker` dependency-check path. 6 new regression
+tests in `test_shared_value_registry.py`. Full suite 1217 passed / 50 failed,
+same pre-existing failures confirmed byte-identical via `git stash`.
 `pyflakes`-clean.
 
 ## 6. Regression
@@ -636,8 +712,9 @@ must_be_consistent_with wiring) -> 1165 passed. §5.1: +22 -> 66 new, 1187
 passed. §5.2: +8 -> 74 new, 1195 passed. §5.3: +4 -> 78 new, 1199 passed.
 §5.4: +3 -> 81 new, 1202 passed. §5.5: +4 (all in `test_shared_value_
 registry.py`) -> 85 new, 1206 passed. §5.6: +5 (all in `test_shared_value_
-registry.py`) -> 90 new tests total, 1211 passed, all passing. The exact same
+registry.py`) -> 90 new, 1211 passed. §5.7: +6 (all in `test_shared_value_
+registry.py`) -> 96 new tests total, 1217 passed, all passing. The exact same
 50 pre-existing unrelated failures confirmed byte-identical (not just count)
-via `git stash` before/after comparison, across all six rounds -- same
+via `git stash` before/after comparison, across all seven rounds -- same
 discipline every prior stage in this revision has applied. `pyflakes`-clean
 throughout.
