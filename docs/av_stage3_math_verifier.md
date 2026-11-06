@@ -510,6 +510,73 @@ Both fixes reproduced directly against the actual code before being fixed. 3
 new regression tests (2 in `test_shared_value_registry.py`, 1 in
 `test_math_claims.py`); full suite 1202 passed / 50 failed, same pre-existing
 failures confirmed byte-identical via `git stash`. `pyflakes`-clean.
+**Committed as `c3ae480` "stage3 revision4"** (discovered after the fact --
+same pattern as every prior round).
+
+## 5.5. Review round 5 (2026-11-06, on top of `c3ae480`, uncommitted) -- 3 more real bugs found, fixed with a structural rewrite instead of one more blacklist entry
+
+A fifth review found the SAME underlying bug surfacing through 3 more
+right-hand-side shapes: `n = 2(3)` (implied multiplication via a glued
+parenthetical), `n = 10x` (a letter glued directly to the number, no space --
+an exponent/variable shorthand), and `n = 10 × 2` (the Unicode multiplication
+sign, distinct from the ASCII `*` round 3 already rejected). The user's own
+fix direction named the root cause explicitly: "현재처럼 제외할 연산자를
+하나씩 추가하는 방식은 같은 오류를 계속 남깁니다" ("adding excluded operators
+one at a time, as done so far, keeps leaving the same error behind") -- after
+four straight rounds of extending the same blacklist (bare ASCII operator,
+spaced ASCII operator, LaTeX commands via a backslash blanket rule, now
+Unicode operators), the right fix is structural, not one more character
+class entry.
+
+**Rewrite**: `_occurrence_pattern`'s regex no longer tries to encode "is the
+whole right-hand side a bare literal" via trailing lookaheads at all -- it
+now only captures the number itself (`-?\d+(?:\.\d+)?`), greedily, with no
+suffix condition. A new `_is_continuation_at(text, pos)` runs AFTER each
+regex match, in plain Python (not regex), and decides whether what follows
+(skipping only plain spaces/tabs, never a newline) means the match is just a
+truncated PREFIX of a larger expression rather than the whole right-hand
+side:
+
+- a digit, or a `.` immediately followed by a digit (the number itself was
+  truncated);
+- a backslash (any LaTeX command -- round 4's blanket rule, unchanged);
+- an arithmetic/grouping symbol, decided CATEGORICALLY
+  (`unicodedata.category(ch) in ("Sm", "Sk")`) rather than by name -- this
+  one change is what makes `×`/`÷`/`±`/the Unicode minus sign/the dot
+  operator all rejected together, including ones never explicitly tested
+  for, closing the Unicode-operator whack-a-mole in one step instead of
+  adding `×` and waiting for the next report to add `÷`. A small
+  `_NON_SM_CONTINUATION_CHARS` set (`/ * ( - ^ ·`) covers the few ordinary
+  ASCII arithmetic/grouping characters Unicode itself does NOT classify as
+  "Sm" (verified empirically via `unicodedata.category()`, not assumed:
+  `/` and `*` are "Po", `(` is "Ps", `-` is "Pd", and the middle dot `·`, a
+  common plain-text stand-in for `\cdot`, is "Po" too -- `^` IS already
+  "Sk" and so is covered by the categorical check without needing to be
+  in this set) -- this is the one place enumeration remains, kept as
+  small as verified necessary rather than growing indefinitely;
+- a letter immediately GLUED to the number with zero whitespace (`10x`,
+  `10kg`) -- ambiguous by construction (exponent shorthand, variable, or a
+  unit with no delimiter), never guessed at. A letter separated from the
+  number by at least one space (`n = 5 for this example`, `n = 10 kg`) is
+  explicitly NOT a continuation -- this distinction (`glued` in the new
+  function) is what keeps the project's existing "ordinary prose after a
+  clean number" behavior intact.
+
+No backtracking/retry is attempted when a continuation is detected -- the
+match is discarded outright, so e.g. `n = 10.5.3` (round 2's own case) still
+yields zero occurrences, never a fallback `10`. Re-verified every prior
+round's fix (fraction, exponent, double-decimal, spaced operators, LaTeX
+operators, sentence-ending period, the next-line markdown-bullet case, the
+backslash-symbol test) still behaves identically under the rewrite -- none of
+their existing tests needed changing.
+
+Reproduced directly against the real code before fixing, including the
+`\(2(3)\)` case through the full `BasicConstraintChecker` dependency-check
+path. 5 new regression tests (paren, glued-letter, Unicode `×`, plus one
+Unicode operator -- `÷` -- never previously named in this test file, added
+specifically to prove the fix is categorical and not just "× works now").
+Full suite 1206 passed / 50 failed, same pre-existing failures confirmed
+byte-identical via `git stash`. `pyflakes`-clean.
 
 ## 6. Regression
 

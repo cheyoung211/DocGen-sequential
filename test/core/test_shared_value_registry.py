@@ -390,3 +390,60 @@ def test_a_latex_cdot_right_hand_side_is_not_truncated_to_its_first_factor():
         config=_config(relevant_symbols=["n"]),
     )
     assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_glued_parenthetical_right_hand_side_is_not_truncated_to_its_first_token():
+    # Regression: "n = 2(3)" (implied multiplication, no space before the
+    # "(") used to read as n=2, discarding "(3)" entirely.
+    occurrences = find_symbol_value_occurrences("n = 2(3)", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 2(3)", target_text="n = 2(4)",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_letter_glued_directly_to_the_number_is_not_truncated_to_the_number():
+    # Regression: "n = 10x" (no space -- an exponent/variable shorthand or
+    # a glued unit, genuinely ambiguous) used to read as n=10, discarding
+    # the "x". A letter SEPARATED by a space is still accepted prose --
+    # see test_finds_a_simple_symbol_value_occurrence and others above,
+    # which already rely on exactly that ("n = 10 here", "n = 5 for this
+    # example").
+    occurrences = find_symbol_value_occurrences("n = 10x", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10x", target_text="n = 10y",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_unicode_multiplication_sign_right_hand_side_is_not_truncated_to_its_first_factor():
+    # Regression: "n = 10 × 2" (Unicode multiplication sign, not the
+    # ASCII "*" already rejected) used to read as n=10. Caught by a
+    # CATEGORICAL check (Unicode category "Sm"), not by naming "×"
+    # specifically -- this is the fix for the whack-a-mole pattern #102/
+    # #105/#107 already named three times over for this exact function.
+    occurrences = find_symbol_value_occurrences("n = 10 × 2", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 10 × 2", target_text="n = 10 × 3",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_previously_untested_unicode_math_symbol_is_also_rejected_categorically():
+    # The categorical fix's whole point: a Unicode math operator this
+    # test file never explicitly names before now (division sign) must
+    # still be rejected, because it is caught by category, not by name.
+    occurrences = find_symbol_value_occurrences("n = 10 ÷ 2", "n")
+    assert occurrences == []

@@ -53,6 +53,7 @@ Deliberately narrow, deterministic, and explicit rather than inferential:
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel, Field
@@ -77,6 +78,86 @@ class SharedValueOccurrence(BaseModel):
     line: int
 
 
+#: Punctuation that signals an arithmetic/grouping continuation but is NOT
+#: classified under Unicode category "Sm" (Math Symbol) -- "/" and "*" are
+#: "Po" (Other Punctuation), "(" is "Ps" (Open Punctuation), "-" (ASCII
+#: hyphen-minus) is "Pd" (Dash Punctuation), and "·" (middle dot, a common
+#: plain-text stand-in for \cdot) is "Po" too. "^" is NOT listed here --
+#: it is already category "Sk" (Modifier Symbol), so the categorical check
+#: below covers it without enumeration. Verified empirically via
+#: ``unicodedata.category()``, not assumed.
+_NON_SM_CONTINUATION_CHARS = frozenset("/*(-·")
+
+
+def _is_arithmetic_continuation_char(ch: str) -> bool:
+    """True if ``ch`` is a character that, found right after a restated
+    number, means the right-hand side continues into a larger expression
+    rather than ending at that number. A CATEGORICAL check
+    (``unicodedata.category(ch) in ("Sm", "Sk")``) rather than a
+    per-operator blacklist -- "Sm"/"Sk" cover ``+``, ``=``, ``^``, and
+    every common Unicode math operator this function has been asked to
+    reject one at a time across several rounds (``×``, ``÷``, ``±``, the
+    Unicode minus sign ``−``, the dot operator ``⋅``), plus any FUTURE
+    math symbol never explicitly tested for -- the whole point after three
+    straight rounds of "add one more operator" (bare ASCII, then spaced
+    ASCII, then LaTeX commands, then Unicode symbols) is to stop
+    enumerating members of an open-ended set. ``_NON_SM_CONTINUATION_CHARS``
+    only exists because a handful of ordinary ASCII arithmetic/grouping
+    characters are, empirically, NOT classified as math symbols by
+    Unicode itself (see that set's own comment) -- this is the one place
+    enumeration is unavoidable, kept as small as verified necessary."""
+    return ch in _NON_SM_CONTINUATION_CHARS or unicodedata.category(ch) in ("Sm", "Sk")
+
+
+def _is_continuation_at(text: str, pos: int) -> bool:
+    """True if the right-hand side number ending at ``pos`` does NOT stand
+    alone -- i.e. the ENTIRE right-hand side is not a plain literal, so
+    this restatement must not be read as a clean value at all (this
+    function's caller then discards the occurrence instead of reporting
+    a truncated-prefix value, e.g. reading ``n = 2(3)`` as ``n=2`` or
+    ``n = 10x`` as ``n=10``).
+
+    Skips a run of plain spaces/tabs (never a newline -- a markdown ``-``
+    bullet starting the NEXT line must never be misread as a continuation
+    of THIS line's number) starting at ``pos``, then inspects the next
+    character, if any:
+
+    - a digit, or a ``.`` immediately followed by a digit (the number
+      itself was truncated -- an already-consumed-prefix problem);
+    - a backslash (ANY LaTeX command -- blanket rejection, not specific
+      operator names; see ``_occurrence_pattern``'s own history for why);
+    - an arithmetic/grouping symbol or operator, by category (see
+      ``_is_arithmetic_continuation_char``);
+    - a letter immediately GLUED to the number with NO space at all
+      (``10x``, ``10kg``) -- genuinely ambiguous (a variable-multiplication
+      shorthand, an exponent, or a unit with no delimiter), never guessed
+      at. A letter separated from the number by at least one space is
+      ordinary prose (``n = 5 for this example``, ``n = 10 kg``) and is
+      NOT a continuation -- this distinction is why ``glued`` matters.
+
+    End of string/line, a comma, a sentence-ending period with nothing
+    (or a non-digit) after it, or an ordinary space-separated word are all
+    "not a continuation" -- the number is the whole right-hand side."""
+    i = pos
+    while i < len(text) and text[i] in " \t":
+        i += 1
+    glued = i == pos
+    if i >= len(text):
+        return False
+    ch = text[i]
+    if ch.isdigit():
+        return True
+    if ch == "." and i + 1 < len(text) and text[i + 1].isdigit():
+        return True
+    if ch == "\\":
+        return True
+    if _is_arithmetic_continuation_char(ch):
+        return True
+    if glued and ch.isalpha():
+        return True
+    return False
+
+
 def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
     """A regex anchored to this exact literal symbol spelling -- never a
     fuzzy/substring match. A backslash-led LaTeX command (``\\alpha``) only
@@ -84,42 +165,12 @@ def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
     left boundary); a plain identifier (``n``, ``n_0``, ``R_g``) needs both
     boundaries, so ``n`` never matches inside ``n_0`` or ``xn``.
 
-    The value side only matches when the ENTIRE right-hand side is a plain
-    (optionally signed, optionally decimal) literal -- the trailing
-    lookahead rejects a following digit (an already-consumed-prefix
-    problem), a following ``/`` (a fraction, e.g. ``1/2``), a following
-    ``e``/``E`` plus sign/digit (scientific notation, e.g. ``1e3``), and a
-    following ``.`` plus digit (a second decimal point). Without this, a
-    naive ``\\d+(?:\\.\\d+)?`` would silently match just the leading ``1``
-    of ``n = 1/2`` or ``n = 1e3`` and misreport the wrong value as a clean
-    restatement -- this module's own docstring already promises "a
-    right-hand side that isn't a plain... literal number is simply not
-    matched, never guessed at"; a sentence-ending period with no following
-    digit (``n = 10.``) is NOT rejected, since that is not a continuation
-    of the number at all.
-
-    A SEPARATE lookahead additionally rejects an arithmetic continuation
-    separated from the number by plain spaces/tabs (never a newline, so a
-    markdown ``-`` bullet starting the NEXT line is never mistaken for a
-    continuation of THIS line's number) -- a following digit, one of
-    ``/ * + - ^``, or a backslash. Without this, ``n = 1 / 2`` and
-    ``n = 10 * 2`` would still silently read as ``n=1``/``n=10`` (the
-    digit-adjacency checks above only catch an operator with NO space
-    before it). The backslash case is deliberately a BLANKET rejection
-    rather than naming specific LaTeX operator commands (``\\times``,
-    ``\\cdot``, ``\\div``, ``\\pm``, ...): enumerating operator names one
-    at a time is exactly the whack-a-mole this function has already been
-    through twice (bare operator, then spaced operator) -- any backslash
-    immediately following the number (with only plain spaces/tabs, if
-    anything, in between) means the right-hand side is not a bare literal,
-    full stop, so it reads as "this symbol's source/target restatement
-    could not be confirmed" (UNKNOWN) rather than risk silently accepting
-    some future LaTeX operator command never explicitly tested for. This
-    also means a LaTeX unit annotation with no delimiter of its own
-    (``n = 10 \\text{m}``) reads UNKNOWN rather than a confirmed ``10`` --
-    an accepted, deliberate loss of recall in exchange for never risking a
-    false PASS on an actual operator, consistent with this module's
-    standing "never guess" discipline."""
+    Captures a plain (optionally signed, optionally decimal) number
+    greedily -- whether the ENTIRE right-hand side is actually just that
+    bare literal (vs. continuing into a larger expression) is decided
+    separately, by ``_is_continuation_at`` on the matched text, not by
+    this pattern itself; see that function for why, and ``find_symbol_
+    value_occurrences`` for how the two combine."""
     escaped = re.escape(symbol)
     if symbol.startswith("\\"):
         left_boundary = ""
@@ -130,7 +181,6 @@ def _occurrence_pattern(symbol: str) -> "re.Pattern[str]":
     return re.compile(
         left_boundary + escaped + right_boundary
         + r"\s*=\s*(?P<value>-?\d+(?:\.\d+)?)"
-        + r"(?![\d/]|[eE][+-]?\d|\.\d)(?![ \t]*[\d/*+^\\-])"
     )
 
 
@@ -139,10 +189,17 @@ def find_symbol_value_occurrences(text: str, symbol: str) -> List[SharedValueOcc
     with its own 1-indexed line and raw snippet. Deterministic regex scan
     over rendered LaTeX/content text -- not a general expression parser;
     a right-hand side that isn't a plain (optionally signed, optionally
-    decimal) literal number is simply not matched, never guessed at."""
+    decimal) literal number is simply not matched, never guessed at (a
+    match whose right-hand side continues into a larger expression --
+    checked via ``_is_continuation_at`` immediately after the matched
+    number -- is discarded here rather than reported as a truncated-prefix
+    value; no backtracking/retry with fewer digits is attempted, so e.g.
+    ``n = 10.5.3`` yields zero occurrences, never a fallback ``10``)."""
     pattern = _occurrence_pattern(symbol)
     occurrences: List[SharedValueOccurrence] = []
     for match in pattern.finditer(text):
+        if _is_continuation_at(text, match.end()):
+            continue
         line = text.count("\n", 0, match.start()) + 1
         line_start = text.rfind("\n", 0, match.start()) + 1
         line_end = text.find("\n", match.end())
