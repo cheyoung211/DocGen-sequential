@@ -700,7 +700,57 @@ against the actual code before being fixed, including the `$$` case through
 the full `BasicConstraintChecker` dependency-check path. 6 new regression
 tests in `test_shared_value_registry.py`. Full suite 1217 passed / 50 failed,
 same pre-existing failures confirmed byte-identical via `git stash`.
-`pyflakes`-clean.
+`pyflakes`-clean. **Committed as `9e20d7a` "stage3 revision7"** (discovered
+after the fact -- same pattern as every prior round).
+
+## 5.8. Review round 8 (2026-11-06, on top of `9e20d7a`, uncommitted) -- 1 more real bug found: a newline inside math mode was treated as the right-hand side's end
+
+An eighth review found round 6's `in_math` check still had a gap: it decided
+whether a letter counts as a continuation based on math-mode context, but
+the WHITESPACE-SKIPPING step that runs before that decision (`_is_
+continuation_at`'s leading loop) only ever skipped spaces/tabs -- never a
+newline, inside math mode or not. Round 3 had deliberately made that choice
+for a real reason (a markdown `-` bullet starting the next line, OUTSIDE any
+math delimiters, must never read as a subtraction continuation of the
+previous line's number) -- but that reasoning is specific to ORDINARY prose,
+and round 6 already established that prose rules and math-mode rules are
+not the same rules.
+
+**Bug**: inside a confirmed math span, LaTeX treats a newline as ordinary
+whitespace -- `n = 2\n+ 3` inside `\begin{equation}...\end{equation}` means
+exactly `n = 2 + 3`, the same formula as if it were all on one line. But
+`_is_continuation_at` stopped at the newline itself (not in `" \t"`), found
+a character (`\n`) that matches none of its rejection rules, and returned
+"not a continuation" -- so `n = 2` read as a clean, standalone value with the
+following `+ 3`/`+ 4` on the next line invisible to the check entirely, and
+source/target differing only in that second line's number still PASSed.
+Confirmed through the full `BasicConstraintChecker` dependency-check path too.
+
+**Fix**: the leading whitespace-skip in `_is_continuation_at` now skips
+newlines too, but ONLY when `in_math` is true -- `whitespace_chars = " \t\n"
+if in_math else " \t"`. Outside math mode, the skip set is unchanged, so
+round 3's markdown-bullet case is unaffected (re-confirmed by its own
+existing test, plus a new one specifically pinning this down against the
+newline-skip change). A second new test confirms the fix isn't overly
+aggressive: a restatement followed by a newline and then the formula's own
+closing delimiter (nothing arithmetic in between, e.g. `$n = 2\n$`) still
+reads as a clean value -- "newline is whitespace in math" does not mean "any
+multi-line formula is automatically rejected." (A related, pre-existing,
+already-accepted conservative behavior was re-confirmed rather than
+"fixed": a one-line formula like `\begin{equation}\nn = 2\n\end{equation}`
+with nothing between the number and the environment's own `\end{equation}`
+tag reads UNKNOWN, not PASS -- because round 4's blanket "any backslash is a
+continuation" rule fires on the closing tag itself once the newline before
+it is skipped. This is the same recall-for-safety tradeoff round 4 already
+named explicitly, not a new regression introduced here, and was not changed
+-- adding a special case for "the span's own known closing delimiter"
+specifically would be new, unrequested scope, not what this round's report
+asked for.)
+
+Reproduced directly against the actual code before being fixed, including
+the dependency-check path. 3 new regression tests in `test_shared_value_
+registry.py`. Full suite 1220 passed / 50 failed, same pre-existing failures
+confirmed byte-identical via `git stash`. `pyflakes`-clean.
 
 ## 6. Regression
 
@@ -713,8 +763,9 @@ passed. §5.2: +8 -> 74 new, 1195 passed. §5.3: +4 -> 78 new, 1199 passed.
 §5.4: +3 -> 81 new, 1202 passed. §5.5: +4 (all in `test_shared_value_
 registry.py`) -> 85 new, 1206 passed. §5.6: +5 (all in `test_shared_value_
 registry.py`) -> 90 new, 1211 passed. §5.7: +6 (all in `test_shared_value_
-registry.py`) -> 96 new tests total, 1217 passed, all passing. The exact same
+registry.py`) -> 96 new, 1217 passed. §5.8: +3 (all in `test_shared_value_
+registry.py`) -> 99 new tests total, 1220 passed, all passing. The exact same
 50 pre-existing unrelated failures confirmed byte-identical (not just count)
-via `git stash` before/after comparison, across all seven rounds -- same
+via `git stash` before/after comparison, across all eight rounds -- same
 discipline every prior stage in this revision has applied. `pyflakes`-clean
 throughout.

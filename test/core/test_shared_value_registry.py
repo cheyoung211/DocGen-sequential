@@ -592,3 +592,44 @@ def test_an_unterminated_math_delimiter_discards_a_restatement_even_with_nothing
     # know where this formula ends," not "something specific follows."
     occurrences = find_symbol_value_occurrences("$n = 2", "n")
     assert occurrences == []
+
+
+def test_a_newline_inside_a_math_environment_does_not_hide_a_continuation():
+    # Regression: inside a confirmed math span, a newline is ordinary
+    # LaTeX whitespace -- "n = 2\n+ 3" inside \begin{equation}...
+    # \end{equation} means "n = 2 + 3", not "n = 2" followed by an
+    # unrelated new line. The old code only ever skipped spaces/tabs
+    # (never a newline, anywhere) before checking what followed the
+    # number, so the "+ 3" on the NEXT line was invisible to that check
+    # and "n = 2" read as a clean, standalone restatement.
+    src = "\\begin{equation}\nn = 2\n+ 3\n\\end{equation}"
+    tgt = "\\begin{equation}\nn = 2\n+ 4\n\\end{equation}"
+    assert find_symbol_value_occurrences(src, "n") == []
+    assert find_symbol_value_occurrences(tgt, "n") == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text=src, target_text=tgt,
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_newline_inside_math_mode_with_nothing_problematic_after_it_still_matches():
+    # The newline-as-whitespace rule must not become "any multi-line math
+    # is automatically rejected" -- a restatement immediately followed by
+    # a newline and then the formula's own closing delimiter (nothing
+    # arithmetic in between) still reads as a clean value.
+    occurrences = find_symbol_value_occurrences("$n = 2\n$", "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 2.0
+
+
+def test_a_newline_outside_math_mode_is_still_never_skipped():
+    # The in_math gate must not leak into ordinary prose: a markdown "-"
+    # bullet on the NEXT line, outside any math delimiters, is still not
+    # mistaken for a same-formula continuation (round 3's own case,
+    # re-confirmed here specifically against the newline-skip change).
+    occurrences = find_symbol_value_occurrences("n = 10\n- some bullet point", "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 10.0

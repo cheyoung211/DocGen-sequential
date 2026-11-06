@@ -255,10 +255,9 @@ def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
     a truncated-prefix value, e.g. reading ``n = 2(3)`` as ``n=2`` or
     ``n = 10x`` as ``n=10``).
 
-    Skips a run of plain spaces/tabs (never a newline -- a markdown ``-``
-    bullet starting the NEXT line must never be misread as a continuation
-    of THIS line's number) starting at ``pos``, then inspects the next
-    character, if any:
+    Skips a run of plain spaces/tabs starting at ``pos`` -- and, ONLY when
+    ``in_math`` is true, newlines too -- then inspects the next character,
+    if any:
 
     - a digit, or a ``.`` immediately followed by a digit (the number
       itself was truncated -- an already-consumed-prefix problem);
@@ -277,12 +276,23 @@ def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
       ``n = 5 for this example``) is algebraic multiplication inside it,
       and must not be read as a clean, standalone value either.
 
-    End of string/line, a comma, a sentence-ending period with nothing
-    (or a non-digit) after it, or an ordinary space-separated word OUTSIDE
-    math mode are all "not a continuation" -- the number is the whole
+    OUTSIDE math mode, a newline is NEVER skipped -- a markdown ``-``
+    bullet starting the NEXT line must never be misread as a continuation
+    of THIS line's number (this is also why that case is checked with
+    ``in_math=False`` even though it happens to share a character with an
+    operator). INSIDE a confirmed math span, a newline is just ordinary
+    whitespace to LaTeX -- ``n = 2\\n+ 3`` inside ``\\begin{equation}...
+    \\end{equation}`` means ``n = 2 + 3``, the same formula as if it were
+    all on one line, so a continuation on the NEXT line must be detected
+    exactly as if it were space-separated on the SAME line.
+
+    End of string, a comma, a sentence-ending period with nothing (or a
+    non-digit) after it, or an ordinary space-separated word OUTSIDE math
+    mode are all "not a continuation" -- the number is the whole
     right-hand side."""
+    whitespace_chars = " \t\n" if in_math else " \t"
     i = pos
-    while i < len(text) and text[i] in " \t":
+    while i < len(text) and text[i] in whitespace_chars:
         i += 1
     glued = i == pos
     if i >= len(text):
