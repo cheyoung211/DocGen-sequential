@@ -81,12 +81,16 @@ class SharedValueOccurrence(BaseModel):
 #: Punctuation that signals an arithmetic/grouping continuation but is NOT
 #: classified under Unicode category "Sm" (Math Symbol) -- "/" and "*" are
 #: "Po" (Other Punctuation), "(" is "Ps" (Open Punctuation), "-" (ASCII
-#: hyphen-minus) is "Pd" (Dash Punctuation), and "·" (middle dot, a common
-#: plain-text stand-in for \cdot) is "Po" too. "^" is NOT listed here --
-#: it is already category "Sk" (Modifier Symbol), so the categorical check
-#: below covers it without enumeration. Verified empirically via
-#: ``unicodedata.category()``, not assumed.
-_NON_SM_CONTINUATION_CHARS = frozenset("/*(-·")
+#: hyphen-minus) is "Pd" (Dash Punctuation), "[" is "Ps" too, and "·"
+#: (middle dot, a common plain-text stand-in for \cdot) is "Po". "^" is
+#: NOT listed here -- it is already category "Sk" (Modifier Symbol), so
+#: the categorical check below covers it without enumeration. Verified
+#: empirically via ``unicodedata.category()``, not assumed. The matching
+#: CLOSE brackets (")", "]") are deliberately NOT included -- a close
+#: bracket right after a number reads as ending a parenthetical remark
+#: (``"(as shown, n = 10)"``), not continuing an expression, the same way
+#: a trailing comma or period is not rejected either.
+_NON_SM_CONTINUATION_CHARS = frozenset("/*([-·")
 
 
 def _is_arithmetic_continuation_char(ch: str) -> bool:
@@ -109,7 +113,62 @@ def _is_arithmetic_continuation_char(ch: str) -> bool:
     return ch in _NON_SM_CONTINUATION_CHARS or unicodedata.category(ch) in ("Sm", "Sk")
 
 
-def _is_continuation_at(text: str, pos: int) -> bool:
+def _math_spans(text: str) -> List[Tuple[int, int]]:
+    """Every ``(start, end)`` span of ``text`` delimited by ``$...$``,
+    ``\\(...\\)``, or ``\\[...\\]`` -- used only to decide whether a
+    ``symbol = number`` restatement sits inside a LaTeX formula, where a
+    space-separated letter right after the number is algebraic
+    multiplication (``$n = 2 x$`` means ``n = 2 * x``, not "n is 2, for
+    some reason named x") rather than ordinary prose (``n = 10 kg`` is
+    not inside math delimiters at all). A ``\\$`` is never treated as an
+    opening/closing delimiter (an escaped dollar sign is literal text, the
+    same escape-awareness `src/agents/latex_assembler.py`'s own math-span
+    handling already established was necessary -- re-implemented locally
+    here, deliberately NOT imported from that module, since ``src/core``
+    does not depend on ``src/agents`` and this module only needs this one
+    narrow fact, not that module's full literal/texttt masking). Not a
+    LaTeX parser: an unterminated delimiter is simply skipped rather than
+    treated as opening an unbounded span to the end of the text (under-
+    detecting math here only falls back to this module's existing,
+    already-reviewed non-math behavior for that position, never a new
+    false PASS)."""
+    spans: List[Tuple[int, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in "([":
+            closer = ")" if text[i + 1] == "(" else "]"
+            end = text.find("\\" + closer, i + 2)
+            if end == -1:
+                i += 2
+                continue
+            spans.append((i, end + 2))
+            i = end + 2
+            continue
+        if ch == "\\":
+            # Any other backslash escape, including "\$" -- skip as a
+            # two-character unit so an escaped dollar sign is never
+            # misread as an opening/closing "$" below.
+            i += 2
+            continue
+        if ch == "$":
+            end = text.find("$", i + 1)
+            if end == -1:
+                i += 1
+                continue
+            spans.append((i, end + 1))
+            i = end + 1
+            continue
+        i += 1
+    return spans
+
+
+def _is_within_math_span(pos: int, spans: List[Tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in spans)
+
+
+def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
     """True if the right-hand side number ending at ``pos`` does NOT stand
     alone -- i.e. the ENTIRE right-hand side is not a plain literal, so
     this restatement must not be read as a clean value at all (this
@@ -131,13 +190,18 @@ def _is_continuation_at(text: str, pos: int) -> bool:
     - a letter immediately GLUED to the number with NO space at all
       (``10x``, ``10kg``) -- genuinely ambiguous (a variable-multiplication
       shorthand, an exponent, or a unit with no delimiter), never guessed
-      at. A letter separated from the number by at least one space is
-      ordinary prose (``n = 5 for this example``, ``n = 10 kg``) and is
-      NOT a continuation -- this distinction is why ``glued`` matters.
+      at;
+    - a letter separated from the number by a space, but ONLY when
+      ``in_math`` is true (``$n = 2 x$``) -- inside a LaTeX formula there
+      is no such thing as a space-separated "prose word," so the SAME
+      shape that is safely ordinary prose outside math (``n = 10 kg``,
+      ``n = 5 for this example``) is algebraic multiplication inside it,
+      and must not be read as a clean, standalone value either.
 
     End of string/line, a comma, a sentence-ending period with nothing
-    (or a non-digit) after it, or an ordinary space-separated word are all
-    "not a continuation" -- the number is the whole right-hand side."""
+    (or a non-digit) after it, or an ordinary space-separated word OUTSIDE
+    math mode are all "not a continuation" -- the number is the whole
+    right-hand side."""
     i = pos
     while i < len(text) and text[i] in " \t":
         i += 1
@@ -153,7 +217,7 @@ def _is_continuation_at(text: str, pos: int) -> bool:
         return True
     if _is_arithmetic_continuation_char(ch):
         return True
-    if glued and ch.isalpha():
+    if ch.isalpha() and (glued or in_math):
         return True
     return False
 
@@ -196,9 +260,11 @@ def find_symbol_value_occurrences(text: str, symbol: str) -> List[SharedValueOcc
     value; no backtracking/retry with fewer digits is attempted, so e.g.
     ``n = 10.5.3`` yields zero occurrences, never a fallback ``10``)."""
     pattern = _occurrence_pattern(symbol)
+    spans = _math_spans(text)
     occurrences: List[SharedValueOccurrence] = []
     for match in pattern.finditer(text):
-        if _is_continuation_at(text, match.end()):
+        in_math = _is_within_math_span(match.end(), spans)
+        if _is_continuation_at(text, match.end(), in_math):
             continue
         line = text.count("\n", 0, match.start()) + 1
         line_start = text.rfind("\n", 0, match.start()) + 1

@@ -447,3 +447,59 @@ def test_a_previously_untested_unicode_math_symbol_is_also_rejected_categoricall
     # still be rejected, because it is caught by category, not by name.
     occurrences = find_symbol_value_occurrences("n = 10 ÷ 2", "n")
     assert occurrences == []
+
+
+def test_a_space_separated_letter_inside_math_delimiters_is_algebraic_multiplication():
+    # Regression: "$n = 2 x$" used to read as n=2 -- the space-separated-
+    # letter exception (correct for ordinary prose like "n = 5 for this
+    # example") does not hold INSIDE a LaTeX formula, where a space
+    # between a number and a letter means multiplication, not prose.
+    occurrences = find_symbol_value_occurrences("$n = 2 x$", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="$n = 2 x$", target_text="$n = 2 y$",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_the_same_space_separated_letter_outside_math_delimiters_still_passes():
+    # The math-mode gate must not become too aggressive: the identical
+    # shape OUTSIDE any $...$/\(...\)/\[...\] span is still ordinary prose.
+    occurrences = find_symbol_value_occurrences("n = 2 x is a separate variable", "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 2.0
+
+
+def test_a_glued_square_bracket_right_hand_side_is_not_truncated_to_its_first_token():
+    # Regression: "n = 2[3]" used to read as n=2, discarding "[3]"
+    # entirely -- the same bug class as round 5's "(" fix, for "[".
+    occurrences = find_symbol_value_occurrences("n = 2[3]", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 2[3]", target_text="n = 2[4]",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_close_bracket_right_after_the_number_is_not_treated_as_a_continuation():
+    # Mirrors round 5's ")" decision: a CLOSE bracket right after a
+    # number ends a parenthetical remark, it doesn't continue an
+    # expression -- only the OPEN bracket "[" is rejected.
+    occurrences = find_symbol_value_occurrences("see item [n = 10] above", "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 10.0
+
+
+def test_an_escaped_dollar_sign_is_not_mistaken_for_an_opening_math_delimiter():
+    # _math_spans must not treat "\$" as toggling math mode -- otherwise
+    # ordinary prose after a literal dollar amount would be wrongly
+    # treated as being inside a formula.
+    occurrences = find_symbol_value_occurrences(r"The price is \$5. n = 2 x is a separate variable", "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 2.0

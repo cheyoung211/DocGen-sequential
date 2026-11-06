@@ -576,23 +576,68 @@ path. 5 new regression tests (paren, glued-letter, Unicode `×`, plus one
 Unicode operator -- `÷` -- never previously named in this test file, added
 specifically to prove the fix is categorical and not just "× works now").
 Full suite 1206 passed / 50 failed, same pre-existing failures confirmed
-byte-identical via `git stash`. `pyflakes`-clean.
+byte-identical via `git stash`. `pyflakes`-clean. **Committed as `a793768`
+"stage3 revision5"** (discovered after the fact -- same pattern as every
+prior round).
+
+## 5.6. Review round 6 (2026-11-06, on top of `a793768`, uncommitted) -- 2 more real bugs found
+
+A sixth review found round 5's categorical rewrite still had two gaps: one
+semantic (the "glued vs. spaced" letter distinction, correct for ordinary
+prose, does not hold inside a LaTeX formula), one a plain missing bracket
+type.
+
+1. **A space-separated letter inside math delimiters is multiplication, not
+   prose -- `_is_continuation_at` only ever checked whether the letter was
+   GLUED (no space) to the number, treating any space-separated letter as
+   ordinary prose regardless of context.** `$n = 2 x$` still read as `n=2`,
+   discarding `x` entirely, because "2 x" has a space and the function's
+   only letter-rejection rule required zero whitespace. Confirmed through
+   the full `BasicConstraintChecker` path too. The fix adds LaTeX math-mode
+   awareness: a new `_math_spans(text)` detects `$...$`/`\(...\)`/`\[...\]`
+   delimited regions (with `\$`-escape awareness, so a literal dollar
+   amount in prose never toggles math mode by accident), and
+   `_is_continuation_at` gained an `in_math` parameter -- when true, EVERY
+   letter following the number is a continuation, glued or not, since
+   there is no such thing as a space-separated prose word inside a
+   formula. Outside any detected math span, the existing glued-only rule
+   is unchanged (`n = 10 kg`, `n = 5 for this example` still read as clean
+   restatements). Deliberately NOT reused from `src/agents/latex_
+   assembler.py`'s own, more complete `_literal_or_math_mask` (built for a
+   different purpose -- Markdown-emphasis masking, with `\texttt{}`
+   literal-span handling this module has no need for) -- `src/core` does
+   not depend on `src/agents`, and importing across that boundary for one
+   narrow fact would be a real layering violation, not a convenience.
+2. **`n = 2[3]` (square bracket, glued) still truncated to `n=2`** -- round
+   5's fix added `(` to the small ASCII exception set but not its `[`
+   sibling (both category "Ps", confirmed via `unicodedata.category()`).
+   Added `[` to `_NON_SM_CONTINUATION_CHARS`. The matching close brackets
+   (`)`, `]`) are deliberately still NOT included, mirroring round 5's own
+   reasoning for `)`: a close bracket right after a number ends a
+   parenthetical remark rather than continuing an expression (verified
+   with a dedicated regression test, `see item [n = 10] above`).
+
+Both fixes reproduced directly against the actual code before being fixed
+(including the dependency-check path for bug 1). 5 new regression tests in
+`test_shared_value_registry.py` (the math-mode case, its non-math-mode
+negative counterpart, the escaped-`\$` negative case, the glued bracket, and
+the close-bracket-is-fine negative case) -- plus every prior round's existing
+test re-confirmed unchanged under the new code. Full suite 1211 passed / 50
+failed, same pre-existing failures confirmed byte-identical via `git stash`.
+`pyflakes`-clean.
 
 ## 6. Regression
 
+Pre-existing baseline (before any of B1-B3 existed): 1121 passed / 50 failed.
 First pass: 44 new tests (`test_shared_value_registry.py` 14, `test_math_claims.py`
 6, `test_dependency_verifier.py` +6, `test_dependency_constraint_provider.py` +2,
 `test_constraint_checks.py` +11 B2 operations +3 DEPENDENCY must_reuse/
-must_be_consistent_with wiring). After §5.1's review-fix round: 22 more (10 in
-`test_shared_value_registry.py`, 3 in `test_math_claims.py`, 9 in
-`test_constraint_checks.py`), 66 new tests. After §5.2's second review-fix
-round: 8 more (4 in `test_shared_value_registry.py`, 2 in `test_math_claims.py`,
-2 in `test_constraint_checks.py`), 74 new tests. After §5.3's third review-fix
-round: 4 more (3 in `test_shared_value_registry.py`, 1 in `test_math_claims.py`),
-78 new tests. After §5.4's fourth review-fix round: 3 more (2 in
-`test_shared_value_registry.py`, 1 in `test_math_claims.py`), 81 new tests
-total, all passing. Full suite: 1202 passed / 50 failed, the exact same 50
-pre-existing unrelated failures confirmed byte-identical (not just count) via
-`git stash` before/after comparison, across all five rounds -- same
+must_be_consistent_with wiring) -> 1165 passed. §5.1: +22 -> 66 new, 1187
+passed. §5.2: +8 -> 74 new, 1195 passed. §5.3: +4 -> 78 new, 1199 passed.
+§5.4: +3 -> 81 new, 1202 passed. §5.5: +4 (all in `test_shared_value_
+registry.py`) -> 85 new, 1206 passed. §5.6: +5 (all in `test_shared_value_
+registry.py`) -> 90 new tests total, 1211 passed, all passing. The exact same
+50 pre-existing unrelated failures confirmed byte-identical (not just count)
+via `git stash` before/after comparison, across all six rounds -- same
 discipline every prior stage in this revision has applied. `pyflakes`-clean
 throughout.
