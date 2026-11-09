@@ -633,3 +633,79 @@ def test_a_newline_outside_math_mode_is_still_never_skipped():
     occurrences = find_symbol_value_occurrences("n = 10\n- some bullet point", "n")
     assert len(occurrences) == 1
     assert occurrences[0].value == 10.0
+
+
+def test_a_crlf_line_ending_inside_math_mode_does_not_hide_a_continuation():
+    # Regression: round 8's whitespace-skip only recognized a bare "\n",
+    # not "\r" (or CRLF's "\r\n" pair) -- a CRLF-terminated line inside a
+    # confirmed math span stopped the skip at the un-recognized "\r"
+    # before ever reaching the "+ 3"/"+ 4" on the next line.
+    src = "\\begin{equation}\r\nn = 2\r\n+ 3\r\n\\end{equation}"
+    tgt = "\\begin{equation}\r\nn = 2\r\n+ 4\r\n\\end{equation}"
+    assert find_symbol_value_occurrences(src, "n") == []
+    assert find_symbol_value_occurrences(tgt, "n") == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text=src, target_text=tgt,
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_non_breaking_space_inside_math_mode_does_not_hide_a_continuation():
+    # Regression: the same enumeration mistake as CRLF, for NBSP -- a
+    # non-breaking space (U+00A0) between the number and an operator was
+    # never in the old hand-picked skip set either.
+    src = "$n = 2\u00A0+\u00A03$"
+    tgt = "$n = 2\u00A0+\u00A04$"
+    assert find_symbol_value_occurrences(src, "n") == []
+    assert find_symbol_value_occurrences(tgt, "n") == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text=src, target_text=tgt,
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_latex_comment_after_the_number_is_rejected_not_parsed():
+    # Regression: "n = 2 % comment\n+ 3" hid the real continuation behind
+    # a LaTeX comment -- "%" was never in any rejection rule, so the scan
+    # simply stopped there without realizing the rest of the line (and
+    # thus whatever logically continues the formula past it) was hidden.
+    # Rejected unconditionally, the same "can't verify it, don't guess"
+    # response as the existing backslash rule -- never an attempt to
+    # actually skip past the comment to see what's on the next line.
+    src = "\\begin{equation}\nn = 2 % comment\n+ 3\n\\end{equation}"
+    tgt = "\\begin{equation}\nn = 2 % comment\n+ 4\n\\end{equation}"
+    assert find_symbol_value_occurrences(src, "n") == []
+    assert find_symbol_value_occurrences(tgt, "n") == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text=src, target_text=tgt,
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_an_escaped_dollar_inside_a_formula_does_not_close_its_span_early():
+    # Regression: "_math_spans"'s CLOSING-delimiter search used a plain
+    # str.find, which has no escape-awareness -- an escaped "\$" INSIDE a
+    # real formula could be mistaken for that formula's own closing "$",
+    # ending the span early and leaving the rest of the real formula
+    # (here, "n = 2 x"/"n = 2 y") to be read as ordinary prose, where the
+    # space-separated letter wrongly passed as harmless narration.
+    src = r"$\text{price} = \$5, n = 2 x$"
+    tgt = r"$\text{price} = \$5, n = 2 y$"
+    assert find_symbol_value_occurrences(src, "n") == []
+    assert find_symbol_value_occurrences(tgt, "n") == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text=src, target_text=tgt,
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN

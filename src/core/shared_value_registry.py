@@ -131,6 +131,31 @@ def _is_arithmetic_continuation_char(ch: str) -> bool:
     return ch in _NON_SM_CONTINUATION_CHARS or unicodedata.category(ch) in ("Sm", "Sk")
 
 
+def _find_unescaped(text: str, needle: str, start: int) -> int:
+    """Like ``text.find(needle, start)``, but never matches ``needle``
+    where it would actually be part of a backslash escape -- i.e. never
+    inside a ``\\X`` two-character unit, for any ``X``. Used by
+    ``_math_spans`` to search for a math span's CLOSING delimiter: the
+    main scan loop already treats ``\\$`` as literal text (never an
+    opening/closing ``$``) while walking FORWARD through ``text``, but an
+    earlier version of this function searched for the closing delimiter
+    with a plain ``str.find`` call, which has no such escape-awareness --
+    so an escaped ``\\$`` appearing INSIDE a span (e.g. a literal dollar
+    amount inside a formula) could be mistaken for that span's own
+    closing delimiter, ending it early and leaving the REST of the actual
+    formula to be read as ordinary, non-math text."""
+    i = start
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if text.startswith(needle, i):
+            return i
+        i += 1
+    return -1
+
+
 def _math_spans(text: str) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
     """Scans ``text`` for LaTeX math delimiters -- ``$...$``, ``$$...$$``,
     ``\\(...\\)``, ``\\[...\\]``, and a known math environment's
@@ -170,9 +195,16 @@ def _math_spans(text: str) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]
     necessary -- re-implemented locally here, deliberately NOT imported
     from that module, since ``src/core`` does not depend on ``src/agents``
     and this module only needs this one narrow fact, not that module's
-    full literal/texttt masking). Not a LaTeX parser -- a best-effort
-    delimiter scan, not a validator of what's actually well-formed LaTeX
-    inside a span it does confirm."""
+    full literal/texttt masking). This applies to BOTH directions: the
+    main scan loop below never treats an escaped ``\\$`` as opening a new
+    span, and the CLOSING-delimiter search (``_find_unescaped``) never
+    treats one as closing an already-open span either -- an earlier
+    version only got the first direction right, so a literal ``\\$``
+    appearing inside a real formula could prematurely end that formula's
+    own span right there, leaving the rest of it to be read as ordinary
+    text. Not a LaTeX parser -- a best-effort delimiter scan, not a
+    validator of what's actually well-formed LaTeX inside a span it does
+    confirm."""
     confirmed: List[Tuple[int, int]] = []
     unparseable: List[Tuple[int, int]] = []
     i = 0
@@ -213,14 +245,14 @@ def _math_spans(text: str) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]
             continue
         if ch == "$":
             if i + 1 < n and text[i + 1] == "$":
-                end = text.find("$$", i + 2)
+                end = _find_unescaped(text, "$$", i + 2)
                 if end == -1:
                     unparseable.append((i, n))
                     break
                 confirmed.append((i, end + 2))
                 i = end + 2
                 continue
-            end = text.find("$", i + 1)
+            end = _find_unescaped(text, "$", i + 1)
             if end == -1:
                 unparseable.append((i, n))
                 break
@@ -247,6 +279,36 @@ def _is_within_math_span(pos: int, spans: List[Tuple[int, int]]) -> bool:
     return any(start <= pos <= end for start, end in spans)
 
 
+#: Characters whose Unicode "whitespace-ness" carries newline/paragraph
+#: semantics (a new logical line), as opposed to merely visual spacing
+#: within one line. ``str.isspace()`` is True for both kinds -- this set
+#: is what lets ``_should_skip_whitespace`` tell them apart.
+_NEWLINE_CHARS = frozenset("\n\r")
+
+
+def _should_skip_whitespace(ch: str, in_math: bool) -> bool:
+    """Whether ``_is_continuation_at`` should skip over ``ch`` while
+    looking for the first non-whitespace character after a restated
+    number. CATEGORICAL (``str.isspace()``), not a hand-picked set of
+    specific characters -- a prior version only ever recognized the
+    exact ASCII/control characters a specific bug report happened to
+    name (`` ``, ``\\t``, then ``\\n``), which is the identical
+    enumeration mistake this module's own regex rules were already
+    rewritten away from once (see ``_is_arithmetic_continuation_char``'s
+    docstring) -- so CRLF (``\\r``) and non-breaking spaces (and any
+    other Unicode space separator) were silently NOT skipped, hiding
+    whatever followed them from this function's checks entirely, the
+    exact same shape of bug as the un-skipped bare ``\\n`` round 8 fixed.
+    A newline character specifically (``\\n`` or ``\\r``, tracked
+    separately via ``_NEWLINE_CHARS`` since ``str.isspace()`` does not
+    distinguish them from ordinary spacing) is skipped ONLY when
+    ``in_math`` is true -- see ``_is_continuation_at``'s own docstring for
+    why that distinction still matters outside math mode."""
+    if ch in _NEWLINE_CHARS:
+        return in_math
+    return ch.isspace()
+
+
 def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
     """True if the right-hand side number ending at ``pos`` does NOT stand
     alone -- i.e. the ENTIRE right-hand side is not a plain literal, so
@@ -255,14 +317,24 @@ def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
     a truncated-prefix value, e.g. reading ``n = 2(3)`` as ``n=2`` or
     ``n = 10x`` as ``n=10``).
 
-    Skips a run of plain spaces/tabs starting at ``pos`` -- and, ONLY when
-    ``in_math`` is true, newlines too -- then inspects the next character,
-    if any:
+    Skips leading whitespace at ``pos`` CATEGORICALLY (``str.isspace()``,
+    not a hand-enumerated character set -- this already covers CRLF
+    (``\\r``), NBSP, and every other Unicode space separator, closing a
+    class of gap the same enumeration-by-hand mistake kept reopening for
+    this function's earlier rounds) -- except a newline character
+    (``\\n``/``\\r``) is skipped ONLY when ``in_math`` is true; see
+    ``_should_skip_whitespace``. Then inspects the next character, if any:
 
     - a digit, or a ``.`` immediately followed by a digit (the number
       itself was truncated -- an already-consumed-prefix problem);
     - a backslash (ANY LaTeX command -- blanket rejection, not specific
       operator names; see ``_occurrence_pattern``'s own history for why);
+    - a ``%`` (a LaTeX comment -- everything from here to the end of the
+      line is hidden from this deterministic scan, so this function
+      cannot know what the right-hand side actually continues into;
+      blanket rejection, the same "don't try to parse it, just admit we
+      can't verify it" response as the backslash rule, never an attempt
+      to actually skip/interpret the comment's content);
     - an arithmetic/grouping symbol or operator, by category (see
       ``_is_arithmetic_continuation_char``);
     - a letter immediately GLUED to the number with NO space at all
@@ -290,9 +362,8 @@ def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
     non-digit) after it, or an ordinary space-separated word OUTSIDE math
     mode are all "not a continuation" -- the number is the whole
     right-hand side."""
-    whitespace_chars = " \t\n" if in_math else " \t"
     i = pos
-    while i < len(text) and text[i] in whitespace_chars:
+    while i < len(text) and _should_skip_whitespace(text[i], in_math):
         i += 1
     glued = i == pos
     if i >= len(text):
@@ -303,6 +374,8 @@ def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
     if ch == "." and i + 1 < len(text) and text[i + 1].isdigit():
         return True
     if ch == "\\":
+        return True
+    if ch == "%":
         return True
     if _is_arithmetic_continuation_char(ch):
         return True

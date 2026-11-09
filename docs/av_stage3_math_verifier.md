@@ -750,7 +750,77 @@ asked for.)
 Reproduced directly against the actual code before being fixed, including
 the dependency-check path. 3 new regression tests in `test_shared_value_
 registry.py`. Full suite 1220 passed / 50 failed, same pre-existing failures
-confirmed byte-identical via `git stash`. `pyflakes`-clean.
+confirmed byte-identical via `git stash`. `pyflakes`-clean. **Committed as
+`90362cc` "stage3 revision8"** (discovered after the fact -- same pattern as
+every prior round).
+
+## 5.9. Review round 9 (2026-11-09, on top of `90362cc`, uncommitted) -- 3 reported issues, 4 concrete bugs: two more instances of the SAME enumeration mistake round 8 already named, plus one escape-awareness gap
+
+A ninth review found 3 reported issues resolving to 4 concrete code-level
+bugs (the first report bundled CRLF and NBSP together as one row, but they
+are two separate gaps in the same function): two were the exact
+"hand-enumerated character set instead of a categorical check" mistake
+pattern #113 already named for round 8's own newline fix (just for a
+different whitespace character this time), and two were new escape-awareness
+and unrecognized-syntax gaps.
+
+1. **CRLF line endings inside math mode still hid a continuation.**
+   Round 8's fix added `\n` to the math-mode whitespace-skip set, but not
+   `\r` -- a CRLF-terminated line (`n = 2\r\n+ 3`) stopped the skip at the
+   un-recognized `\r` before ever reaching the operator on the next line,
+   the identical failure shape round 8 had just fixed for bare `\n`.
+2. **A non-breaking space (NBSP, U+00A0) between the number and an
+   operator had the same problem** -- `n = 2 + 3` inside a
+   confirmed math span stopped at the NBSP, which was never in the
+   hand-picked `" \t\n"` set either.
+
+   Both fixed the SAME way, this time categorically rather than by naming
+   `\r` and NBSP individually (stopping the enumeration pattern rather
+   than extending it a third time, the lesson pattern #107/#109/#111
+   already established for the operator-character side of this function,
+   now applied to its whitespace-skipping side too): a new
+   `_should_skip_whitespace(ch, in_math)` uses `str.isspace()` -- which is
+   already True for CRLF, NBSP, and every other Unicode space separator --
+   with newline characters (`\n`/`\r`, tracked separately via
+   `_NEWLINE_CHARS` since `isspace()` does not distinguish a newline from
+   ordinary spacing) still gated on `in_math`, preserving round 3's and
+   round 8's own reasoning for why a newline specifically is treated
+   differently outside math mode. Confirmed through the full
+   `BasicConstraintChecker` path too.
+3. **A LaTeX comment (`%`) right after the number let whatever followed
+   it on the next line slip through undetected.** `n = 2 % comment\n+ 3`
+   -- the `%` starts a comment that hides everything to the end of that
+   line, so this deterministic character-scan genuinely cannot know what
+   the formula continues into past it; the old code had no rule for `%`
+   at all, so it simply read "2" as a clean value with the comment (and
+   whatever real continuation hides behind it) invisible to the check.
+   Fixed with a blanket rejection, the same "can't verify it, don't
+   guess" response as the existing backslash rule -- deliberately NOT an
+   attempt to actually parse/skip the comment to see what's on the next
+   line (the user's own two offered options were "handle the comment, or
+   just call it UNKNOWN"; the simpler, more conservative option was
+   chosen, consistent with every other ambiguous-syntax decision in this
+   function).
+4. **An escaped `\$` INSIDE a real formula could prematurely close that
+   formula's own math span.** `_math_spans`'s main scan loop already
+   treated `\$` as literal text when deciding whether a bare `$` OPENS a
+   new span (round 6's own escape-awareness) -- but the separate search
+   for a span's CLOSING delimiter still used a plain `str.find("$", ...)`
+   call, which has no escape-awareness at all, so an escaped `\$`
+   appearing inside the formula (e.g. `$\text{price} = \$5, n = 2 x$`)
+   could be mistaken for that formula's own closing `$`, ending the span
+   right there and leaving the REAL remainder of the formula (`5, n = 2
+   x$`) to be read as ordinary prose, where the space-separated `x`
+   wrongly passed as narration. Fixed with a new `_find_unescaped(text,
+   needle, start)` helper (walks forward exactly like the main scan loop
+   already does, skipping `\X` two-character units) used for both the
+   single-`$` and double-`$$` closing searches.
+
+Reproduced directly against the actual code before being fixed, all four
+confirmed through the full `BasicConstraintChecker` dependency-check path.
+4 new regression tests in `test_shared_value_registry.py`. Full suite 1224
+passed / 50 failed, same pre-existing failures confirmed byte-identical via
+`git stash`. `pyflakes`-clean.
 
 ## 6. Regression
 
@@ -764,8 +834,9 @@ passed. §5.2: +8 -> 74 new, 1195 passed. §5.3: +4 -> 78 new, 1199 passed.
 registry.py`) -> 85 new, 1206 passed. §5.6: +5 (all in `test_shared_value_
 registry.py`) -> 90 new, 1211 passed. §5.7: +6 (all in `test_shared_value_
 registry.py`) -> 96 new, 1217 passed. §5.8: +3 (all in `test_shared_value_
-registry.py`) -> 99 new tests total, 1220 passed, all passing. The exact same
-50 pre-existing unrelated failures confirmed byte-identical (not just count)
-via `git stash` before/after comparison, across all eight rounds -- same
-discipline every prior stage in this revision has applied. `pyflakes`-clean
-throughout.
+registry.py`) -> 99 new, 1220 passed. §5.9: +4 (all in `test_shared_value_
+registry.py`) -> 103 new tests total, 1224 passed, all passing. The exact
+same 50 pre-existing unrelated failures confirmed byte-identical (not just
+count) via `git stash` before/after comparison, across all nine rounds --
+same discipline every prior stage in this revision has applied.
+`pyflakes`-clean throughout.
