@@ -709,3 +709,62 @@ def test_an_escaped_dollar_inside_a_formula_does_not_close_its_span_early():
         config=_config(relevant_symbols=["n"]),
     )
     assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_glued_factorial_right_hand_side_is_not_truncated_to_its_operand():
+    # Regression: "$n = 3!$" used to read as n=3, discarding the "!"
+    # (factorial) entirely -- the same bug class as "(" (round 5) and "["
+    # (round 6), just for a punctuation mark Unicode doesn't classify as
+    # a math symbol ("!" is category "Po", not "Sm"/"Sk").
+    occurrences = find_symbol_value_occurrences("$n = 3!$", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="$n = 3!$", target_text="$n = 3$",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_thousands_separator_comma_is_not_truncated_to_the_first_group():
+    # Regression: "n = 1,000" used to read as n=1, discarding ",000" --
+    # the regex only ever captured plain "\d+" (never comma-grouped
+    # digits), and a bare comma wasn't checked for a following digit.
+    # A comma used as an ORDINARY separator between two different
+    # symbols' definitions on one line ("n = 10, m = 5", relied on
+    # throughout this file's own earlier tests) must still work --
+    # the fix only rejects a comma immediately followed by a DIGIT.
+    occurrences = find_symbol_value_occurrences("n = 1,000", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="n = 1,000", target_text="n = 1,999",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN
+
+
+def test_a_comma_separating_two_symbols_on_one_line_still_works():
+    occurrences = find_symbol_value_occurrences("n = 10, m = 5", "n")
+    assert len(occurrences) == 1
+    assert occurrences[0].value == 10.0
+
+
+def test_a_glued_subscript_right_hand_side_is_not_truncated_to_its_base():
+    # Regression: "$n = 3_0$" used to read as n=3, discarding the "_0"
+    # LaTeX subscript entirely -- "_" is the subscript sibling of "^"
+    # (superscript, already rejected as Unicode category "Sk"), but "_"
+    # itself is "Pc" (Connector Punctuation), not a math/modifier symbol,
+    # so it needed its own entry rather than falling out of the
+    # categorical check for free.
+    occurrences = find_symbol_value_occurrences("$n = 3_0$", "n")
+    assert occurrences == []
+    record = check_shared_value_consistency(
+        dependency_id="d1", relation=DependencyRelation.MUST_BE_CONSISTENT_WITH,
+        source_section_id="a", target_section_id="b",
+        source_text="$n = 3_0$", target_text="$n = 3_1$",
+        config=_config(relevant_symbols=["n"]),
+    )
+    assert record.outcome == CheckOutcome.UNKNOWN

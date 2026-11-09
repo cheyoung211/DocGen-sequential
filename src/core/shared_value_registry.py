@@ -81,16 +81,22 @@ class SharedValueOccurrence(BaseModel):
 #: Punctuation that signals an arithmetic/grouping continuation but is NOT
 #: classified under Unicode category "Sm" (Math Symbol) -- "/" and "*" are
 #: "Po" (Other Punctuation), "(" is "Ps" (Open Punctuation), "-" (ASCII
-#: hyphen-minus) is "Pd" (Dash Punctuation), "[" and "{" are "Ps" too, and
-#: "·" (middle dot, a common plain-text stand-in for \cdot) is "Po". "^" is
-#: NOT listed here -- it is already category "Sk" (Modifier Symbol), so
-#: the categorical check below covers it without enumeration. Verified
-#: empirically via ``unicodedata.category()``, not assumed. The matching
-#: CLOSE brackets (")", "]", "}") are deliberately NOT included -- a close
-#: bracket right after a number reads as ending a parenthetical remark
-#: (``"(as shown, n = 10)"``), not continuing an expression, the same way
-#: a trailing comma or period is not rejected either.
-_NON_SM_CONTINUATION_CHARS = frozenset("/*([{-·")
+#: hyphen-minus) is "Pd" (Dash Punctuation), "[" and "{" are "Ps" too, "!"
+#: (factorial, e.g. "3!") is "Po", and "_" (LaTeX subscript, e.g. "3_0") is
+#: "Pc" (Connector Punctuation) -- "^" (superscript) is NOT listed here
+#: since it is already category "Sk" (Modifier Symbol), covered by the
+#: categorical check below without enumeration; "_" has no such categorical
+#: home (connector punctuation is not a math/modifier symbol), so it is
+#: enumerated here instead, the same way "^"'s own sibling notation would
+#: be if Unicode classified it the same way. Verified empirically via
+#: ``unicodedata.category()``, not assumed. The matching CLOSE brackets
+#: (")", "]", "}") are deliberately NOT included -- a close bracket right
+#: after a number reads as ending a parenthetical remark (``"(as shown,
+#: n = 10)"``), not continuing an expression, the same way a bare trailing
+#: comma or period (one NOT immediately followed by a digit -- see
+#: ``_is_continuation_at``'s own separate check for a thousands-separator
+#: comma like ``1,000``) is not rejected either.
+_NON_SM_CONTINUATION_CHARS = frozenset("/*([{!_-·")
 
 #: LaTeX environment names (``\begin{name}...\end{name}``) this module
 #: recognizes as math mode -- the common display-math environments, plus
@@ -358,10 +364,11 @@ def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
     all on one line, so a continuation on the NEXT line must be detected
     exactly as if it were space-separated on the SAME line.
 
-    End of string, a comma, a sentence-ending period with nothing (or a
-    non-digit) after it, or an ordinary space-separated word OUTSIDE math
-    mode are all "not a continuation" -- the number is the whole
-    right-hand side."""
+    End of string, a BARE comma (one not immediately followed by a
+    digit -- see the thousands-separator check below), a sentence-ending
+    period with nothing (or a non-digit) after it, or an ordinary
+    space-separated word OUTSIDE math mode are all "not a continuation" --
+    the number is the whole right-hand side."""
     i = pos
     while i < len(text) and _should_skip_whitespace(text[i], in_math):
         i += 1
@@ -372,6 +379,17 @@ def _is_continuation_at(text: str, pos: int, in_math: bool) -> bool:
     if ch.isdigit():
         return True
     if ch == "." and i + 1 < len(text) and text[i + 1].isdigit():
+        return True
+    if ch == "," and i + 1 < len(text) and text[i + 1].isdigit():
+        # A comma immediately followed by a digit is a thousands-
+        # separator attempt ("1,000") -- an unsupported numeric literal
+        # format this module does not parse, never a continuation of a
+        # SEPARATE value the way "10, m = 5" (comma then a space, used
+        # throughout this module's own tests to separate two different
+        # symbols' definitions on one line) is. The regex already
+        # captured only "1" from "1,000" (it is not part of ``\d+``), so
+        # without this check the truncated "1" would silently read as a
+        # clean value instead of "this notation is not supported."
         return True
     if ch == "\\":
         return True

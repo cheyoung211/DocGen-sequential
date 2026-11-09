@@ -820,7 +820,76 @@ Reproduced directly against the actual code before being fixed, all four
 confirmed through the full `BasicConstraintChecker` dependency-check path.
 4 new regression tests in `test_shared_value_registry.py`. Full suite 1224
 passed / 50 failed, same pre-existing failures confirmed byte-identical via
-`git stash`. `pyflakes`-clean.
+`git stash`. `pyflakes`-clean. **Committed as `1181007` "stage3 revision9"**
+(discovered after the fact -- same pattern as every prior round).
+
+## 5.10. Review round 10 (2026-11-09, on top of `1181007`, uncommitted) -- 3 more real bugs found, plus a self-caught flaw in this session's OWN manual verification scripts
+
+A tenth review found 3 more right-hand-side shapes that still truncate to a
+numeric prefix: factorial (`!`), a thousands-separator comma (`1,000`), and
+a LaTeX subscript (`_0`). While re-confirming these through the full
+`BasicConstraintChecker` path (the same manual-script step every prior round
+used), the factorial fix appeared to still fail that path specifically --
+investigating why surfaced a real mistake in the verification SCRIPT itself,
+not the code; see the note at the end of this section.
+
+1. **`$n = 3!$` (factorial) still truncated to `n=3`.** `!` is Unicode
+   category "Po" (Other Punctuation), not "Sm"/"Sk", so it was never
+   caught by the categorical operator check -- the same shape as `(`/`[`/
+   `{` before it. Added `!` to `_NON_SM_CONTINUATION_CHARS`.
+2. **`n = 1,000` (a thousands-separator comma) still truncated to `n=1`.**
+   The value regex only ever captures plain `\d+` (never comma-grouped
+   digits), and a bare comma was never checked for what follows it --
+   this module has no intention of actually PARSING `"1,000"` as `1000`
+   (that would be the general-computation support explicitly out of scope
+   for this stage), only of refusing to silently misread it as `1`. Fixed
+   with a new, narrowly-scoped check: a comma immediately followed by a
+   DIGIT is a continuation (the thousands-separator attempt); a comma
+   followed by anything else (a space, then a letter) is unaffected --
+   this is deliberately narrower than treating every comma as ambiguous,
+   since `"n = 10, m = 5"` (comma as an ordinary separator between two
+   different symbols' definitions on one line) is relied on throughout
+   this module's OWN existing test suite and must keep working.
+3. **`$n = 3_0$` (LaTeX subscript) still truncated to `n=3`.** `_` is the
+   subscript sibling of `^` (superscript, already rejected for free via
+   its Unicode category "Sk") -- but `_` itself is category "Pc"
+   (Connector Punctuation), not a math/modifier symbol, so it needed its
+   own entry rather than falling out of the same categorical check.
+   Added `_` to `_NON_SM_CONTINUATION_CHARS` alongside `!`.
+
+All 3 reproduced directly against the actual code before being fixed, and
+re-confirmed through the full `BasicConstraintChecker` dependency-check path
+with a CORRECTED verification script (see below). 4 new regression tests in
+`test_shared_value_registry.py` (one per bug, plus a dedicated test pinning
+down that `"n = 10, m = 5"`'s comma-as-separator usage is unaffected). Full
+suite 1228 passed / 50 failed, same pre-existing failures confirmed
+byte-identical via `git stash`. `pyflakes`-clean.
+
+**Self-caught: this session's own manual "confirm through the full
+BasicConstraintChecker path" verification scripts had been wired
+incorrectly since whichever round first introduced them.** Every such
+script in this session built `Constraint(..., applies_to=[target_ref], ...)`
+-- but `_check_dependency`'s must_reuse/must_be_consistent_with branch
+(`constraint_checks.py`) reads the SOURCE artifact from
+`constraint.applies_to[0]` specifically (confirmed against the real
+provider, `dependency_constraint_provider.py:117`, and the existing,
+correctly-wired test fixtures in `test_constraint_checks.py`, both of which
+use `applies_to=[source_ref]`). With `target_ref` passed there instead,
+every one of those manual scripts was unknowingly comparing the TARGET
+artifact's content against ITSELF (not against the intended, different
+source content) -- for every PRIOR round's bug, both "sides" of that
+accidental self-comparison shared the identical defective notation, so the
+script still printed the expected UNKNOWN; for round 10's factorial case,
+the target content (`$n = 3$`, no `"!"`) is clean on its own, so comparing
+it against itself trivially PASSed, which is what first exposed the
+mistake. This affected only this session's OWN ad-hoc confirmation scripts,
+never the actual fix, the direct `check_shared_value_consistency` calls, or
+the pytest suite -- `test_constraint_checks.py`'s own must_reuse/must_be_
+consistent_with tests have always used the correct `applies_to=[source_ref]`
+wiring, so the dependency-check path's real correctness was never actually
+in doubt; this was a narrower verification-script bug, not a code
+regression, and is now fixed in this round's own manual checks (and noted
+here so it doesn't recur in a future round's script either).
 
 ## 6. Regression
 
@@ -835,8 +904,9 @@ registry.py`) -> 85 new, 1206 passed. §5.6: +5 (all in `test_shared_value_
 registry.py`) -> 90 new, 1211 passed. §5.7: +6 (all in `test_shared_value_
 registry.py`) -> 96 new, 1217 passed. §5.8: +3 (all in `test_shared_value_
 registry.py`) -> 99 new, 1220 passed. §5.9: +4 (all in `test_shared_value_
-registry.py`) -> 103 new tests total, 1224 passed, all passing. The exact
+registry.py`) -> 103 new, 1224 passed. §5.10: +4 (all in `test_shared_value_
+registry.py`) -> 107 new tests total, 1228 passed, all passing. The exact
 same 50 pre-existing unrelated failures confirmed byte-identical (not just
-count) via `git stash` before/after comparison, across all nine rounds --
+count) via `git stash` before/after comparison, across all ten rounds --
 same discipline every prior stage in this revision has applied.
 `pyflakes`-clean throughout.
